@@ -86,8 +86,10 @@ before anything registers.
 ```ts
 agent.input(input)      // THE door — a PURE SIGNAL. Never starts a loop, never flips state.
                         // sync = drained by loop 1 under the block flag; async = fire-and-forget
-agent.run()             // THE TWO CLOCKS — starts loop 1 + loop 2; resolves ONLY on terminate()
-                        // (without it, the process is shut down at the app layer, e.g. process.exit)
+agent.run()             // THE TWO CLOCKS — starts loop 1 + loop 2 AND processes whatever
+                        // messages exist right now; resolves ONLY on terminate()
+agent.run({ startState: "idle" })  // starts the clocks but does NOT process — sits idle,
+                        // ignoring everything, until an input/follow-up/wake kicks it
 agent.wake()            // pure "keep going" signal — sets wakeRequested, nothing else
 agent.stop()            // GENTLE request — finish the step, land at the next boundary
 agent.pause()           // GENTLE request — same family, land after the current message commits
@@ -101,6 +103,35 @@ agent.setState(key, value) / setCwd(path) / setActivity(text)
 agent.merge(fn)         // silent mass-write (restore/checkpoint) — ONE `merged` event
 agent.onFilter(cb) / agent.onCycle(cb)  // meta-callbacks, NOT filters
 ```
+
+### What `run()` actually does — and how the loop ends
+
+`agent.run()` starts the two clocks (loop 1 = supervisor, loop 2 = worker) and
+**immediately processes whatever messages exist** — no calculation, no opinion:
+
+- any non-empty message array is work from the very first tick
+  (`lastResponse` begins at `-1` — nothing is pre-answered)
+- a **zero-message** `run()` **throws** — an empty array is a wiring bug, not a
+  silent idle
+- `run({ startState: "idle" })` is the opt-out: it starts the clocks but does
+  **NOT** process — it sits idle, ignoring everything, until something kicks it
+  (an input, a follow-up, `wake()`). It may legitimately boot empty.
+
+**The clocks are eternal.** `run()` never resolves by itself — the heartbeat
+keeps ticking, so the process stays alive forever unless something ends it.
+Two ways to end it:
+
+1. **The extension** — install a lifecycle plugin and the process exits on its
+   own when work runs out:
+   - `createQuitOnEndPlugin()` — process exits the moment the agent lands idle
+     with no work (batch/cron/CI shape: work done → die)
+   - `createKeepOpenPlugin()` — the opposite: keeps breathing after each job
+     (service/daemon shape)
+   - (see `docs/reference/extensions.md` — one import + one install line)
+2. **The off switch** — `agent.terminate(reason?)` stops the heartbeat and
+   `run()` **resolves** (await it for a clean join). Fire-and-forget safe,
+   idempotent. Without either, the process is shut down at the app layer
+   (e.g. `process.exit`).
 
 ## Filter — listen and mutate
 
