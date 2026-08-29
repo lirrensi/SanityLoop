@@ -77,13 +77,13 @@ export function createObserverPlugin(opts: ObserverOptions = {}): Plugin {
 		[
 			EVENTS.thinkingDelta,
 			2,
-			(_ctx, event) => { const sd = (event as any)?.streamDelta; return sd?.type === "thinkingDelta" ? `[thinking] ${sd.delta}` : ""; },
+			(_ctx, event) => { const sd = (event as any)?.streamDelta; return sd?.type === "thinkingDelta" ? sd.delta : ""; },
 		],
 		[EVENTS.thinkingEnd, 2, () => ""],
 		[
 			EVENTS.toolcallDelta,
 			2,
-			(_ctx, event) => { const sd = (event as any)?.streamDelta; return sd?.type === "toolcallDelta" ? `[toolcall] ${sd.delta}` : ""; },
+			(_ctx, event) => { const sd = (event as any)?.streamDelta; return sd?.type === "toolcallDelta" ? sd.delta : ""; },
 		],
 		[EVENTS.messageAdded, 2, (agent) => `message: ${messageType(agent)}`],
 		[
@@ -105,10 +105,19 @@ export function createObserverPlugin(opts: ObserverOptions = {}): Plugin {
 					fn: async (agent, payload) => {
 						const d = detail(agent, payload);
 						if (!d) return;
-						// the raw stream prints verbatim (a stream viewer); everything else is prefixed
-						if (event === EVENTS.textDelta) write(d);
-						else if (event === EVENTS.textEnd) write("\n");
-						else write(`[${event}] ${d}`);
+						// STREAM deltas go straight to stdout CONTIGUOUSLY — the text,
+						// thinking, and tool JSON assemble live (OpenCode-style, no
+						// per-token lines). Lifecycle lines go through `write`.
+						if (
+							event === EVENTS.textDelta ||
+							event === EVENTS.thinkingDelta ||
+							event === EVENTS.toolcallDelta ||
+							event === EVENTS.textEnd
+						) {
+							process.stdout.write(d);
+						} else {
+							write(`[${event}] ${d}`);
+						}
 					},
 				});
 			}
