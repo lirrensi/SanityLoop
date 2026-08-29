@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 # npm trusted publishing uses GitHub's short-lived OIDC identity.
 permissions:
