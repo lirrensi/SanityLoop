@@ -1,0 +1,6 @@
+{
+  "id": "admin",
+  "description": "the commander — full admin tools over the swarm",
+  "file": "./admin.ts",
+  "mode": "admin"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@sanityloop/ram",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "The agent's own scratch RAM — ram_get / ram_set / ram_delete / ram_keys over any JSON-able value."
+}

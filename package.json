@@ -1,0 +1,25 @@
+{
+  "name": "sanityloop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "an agent loop and agent SDK that does not make you insane",
+  "workspaces": ["packages/*", "packages/extras/*"],
+  "scripts": {
+    "dev": "node --experimental-strip-types templates/simple-agent.ts",
+    "dev:repl": "node --experimental-strip-types templates/repl-agent.ts",
+    "swarm": "node --experimental-strip-types --experimental-transform-types packages/swarm/src/server/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm test --workspaces --if-present",
+    "test:e2e": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\"",
+    "test:all": "npm test && npm run test:e2e",
+    "package:bun": "bun run scripts/bun-package.ts templates/repl-agent.ts dist/repl-agent",
+    "bundle": "node --experimental-strip-types --experimental-transform-types scripts/bundle.ts",
+    "publish:dry": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run",
+    "publish": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

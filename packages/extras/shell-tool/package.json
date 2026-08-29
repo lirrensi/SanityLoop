@@ -1,0 +1,25 @@
+{
+  "name": "@sanityloop/shell-tool",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/util": "^0.1.0",
+    "strip-ansi": "^7.2.0",
+    "tinyglobby": "^0.2.17"
+  },
+  "devDependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "The bash tool — configurable factory: shell discovery (pwsh7-first on Windows), env policy, output capture, graceful kill."
+}

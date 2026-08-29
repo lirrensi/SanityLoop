@@ -1,0 +1,27 @@
+{
+  "name": "@sanityloop/hash-fs-tools",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "diff": "^9.0.0",
+    "file-type": "^22.0.2",
+    "xxhash-wasm": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "The hashline edit factory — anchored edits by 3-char line hash, no store, no regex guessing."
+}

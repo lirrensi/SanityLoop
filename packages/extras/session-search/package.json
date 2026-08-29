@@ -1,0 +1,27 @@
+{
+  "name": "@sanityloop/session-search",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0"
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "Search THIS session's full transcript — compactions included, hits tagged active/archived, every field searchable."
+}

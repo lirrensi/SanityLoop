@@ -1,0 +1,23 @@
+{
+  "name": "@sanityloop/pi-model",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@earendil-works/pi-ai": "^0.84.2"
+  },
+  "devDependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "PiAdapterModel — drive a pi agent through the SimpleModel contract, with errorFacts parity on failures."
+}

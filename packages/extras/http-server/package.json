@@ -1,0 +1,25 @@
+{
+  "name": "@sanityloop/http-server",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/snapshot": "^0.1.0",
+    "@elysia/node": "^1.4.6",
+    "elysia": "^1.4.29"
+  },
+  "devDependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "The external channel — REST + SSE + WS input, streaming and control over HTTP on one Elysia server."
+}

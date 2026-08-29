@@ -1,0 +1,6 @@
+{
+  "id": "worker",
+  "description": "a minimal swarm worker — reports, receives, persists",
+  "file": "./worker.ts",
+  "mode": "worker"
+}

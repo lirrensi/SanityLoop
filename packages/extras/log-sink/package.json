@@ -1,0 +1,28 @@
+{
+  "name": "@sanityloop/log-sink",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/util": "^0.1.0"
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "Consumers of the shared log channel — file and console sinks for emitLog(), one subscribe catches every plugin."
+}

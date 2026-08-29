@@ -1,0 +1,24 @@
+{
+  "name": "@sanityloop/agents-md-loader",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/util": "^0.1.0",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "AGENTS.md auto-loading — walk cwd and ancestors at agent start, inject as one system message; read-traversal loading on every file read."
+}

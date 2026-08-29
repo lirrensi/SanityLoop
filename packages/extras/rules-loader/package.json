@@ -1,0 +1,27 @@
+{
+  "name": "@sanityloop/rules-loader",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/util": "^0.1.0",
+    "picomatch": "^4.0.5",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/picomatch": "^4.0.3"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": ".mdc rule bundles — YAML-frontmatter rule files (description / globs / alwaysApply) loaded per scope."
+}

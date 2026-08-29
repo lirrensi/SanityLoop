@@ -1,0 +1,23 @@
+{
+  "name": "@sanityloop/basic-fs-tools",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/util": "^0.1.0"
+  },
+  "devDependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "The simple file suite — read plain text, edit by exact string replace, write full files. Boring on purpose."
+}

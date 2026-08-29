@@ -1,0 +1,38 @@
+name: CI
+
+# Gate, not a museum. Runs on every push/PR to main.
+# 1. typecheck the whole monorepo (catches the breakage class we hit repeatedly)
+# 2. unit tests across workspaces (no provider keys needed)
+# 3. e2e smoke — ONLY when a provider key is present, so fork PRs stay green
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Job-level so the `if` below can see it.
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (clean, reproducible)
+        run: npm ci
+
+      - name: Typecheck (whole monorepo)
+        run: npm run typecheck
+
+      - name: Unit tests (workspaces)
+        run: npm test
+
+      - name: E2E smoke (only when a provider key is present)
+        if: ${{ env.OPENAI_API_KEY != '' }}
+        run: npm run test:e2e

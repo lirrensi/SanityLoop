@@ -1,0 +1,13 @@
+node_modules/
+dist/
+private/
+.playwright-mcp/
+.publish/
+.pubtest/
+private/
+.rect/
+pi/
+opencode/
+.rect
+.agents
+.ruff_cache

@@ -1,0 +1,24 @@
+{
+  "name": "@sanityloop/sandbox-docker",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "docker micro-sandbox RunTarget for SanityLoop — mounts your project, runs the agent isolated",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/sandbox": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@sanityloop/sandbox",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "sandbox launch contract for SanityLoop agents — run the whole agent inside an isolated target",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {},
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  }
+}

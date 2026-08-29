@@ -1,0 +1,28 @@
+{
+  "name": "@sanityloop/swarm",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "the swarm — a dumb daemon hub + the join extension agents import. One package: without the join there's no hub to talk to, without the hub there's nothing to join.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/server/index.ts",
+    "./join": "./src/join/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  }
+}

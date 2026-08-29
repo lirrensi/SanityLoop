@@ -1,0 +1,27 @@
+{
+  "name": "@sanityloop/subagents",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "wrap agent-builders as one-shot tools - a sub-agent is just an Agent nobody ran yet",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.1.0"
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  }
+}

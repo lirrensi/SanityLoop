@@ -1,0 +1,25 @@
+{
+  "name": "@sanityloop/mcp",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/snapshot": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "MCP adapter — stdio and remote HTTP MCP servers become native tools. Nothing in core knows MCP exists."
+}
