@@ -23,35 +23,61 @@ import { estimateInputTokens, estimateOutputTokens } from "./token-estimate.ts";
 // ============================================================================
 // normalizeForAlternation — the SIMPLE model's own message-shaping strategy.
 // Role alternation is a model concern: llama.cpp 400s on consecutive same-role
-// messages / dangling toolCalls / a trailing assistant. Applied right before
-// the provider call (SimpleModelOptions.normalizeMessages), and shared with the
-// compaction extras so rebuilt STORED lists stay legal too. Cross-provider
-// adapters (PiAdapterModel) shape messages their own way and override
-// callNextTurn — they never pass through here. Idempotent: running it twice
-// is safe.
+// messages / dangling toolCalls / a trailing assistant — and its Qwen template
+// wants the first message to be system, so the LEADING run of consecutive
+// system messages (simple + compound) merges into ONE head. Systems sitting
+// mid-array are NEVER moved — order is truth, producers own placement.
+// Applied right before the provider call (SimpleModelOptions.normalizeMessages),
+// and shared with the compaction extras so rebuilt STORED lists stay legal too.
+// Cross-provider adapters (PiAdapterModel) shape messages their own way and
+// override callNextTurn — they never pass through here. Idempotent: running it
+// twice is safe.
 // ============================================================================
 
+/** Strip the "-compound" flavor suffix — compound is OUR dynamic-fragment convenience; the wire wants the base type. */
+function baseType(type: string): string {
+  return type.endsWith("-compound") ? type.slice(0, -"-compound".length) : type;
+}
+
+/** Flatten any message content to a wire string — text blocks, compound fragments, tool faces. */
+function toWireText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (typeof b === "object" && b !== null && "content" in b ? String((b as { content: unknown }).content) : ""))
+      .join("\n");
+  }
+  if (typeof content === "object" && content !== null && "answer" in content) {
+    return String((content as { answer: unknown }).answer);
+  }
+  return String(content ?? "");
+}
+
 /**
- * Enforce strict role alternation on a message list. Rules:
- *  - a toolCall is kept only with its matching toolResult(s) immediately after
- *  - orphaned toolResults (no preceding toolCall) are dropped
- *  - consecutive same-role user/assistant messages collapse (earlier dropped)
- *  - the list must NOT end with an assistant or a dangling toolCall (the
- *    resumed turn's response will follow)
+ * Order-preserving message shaping. RULE ONE — order is absolute:
+ *  - NO message ever changes position / index / order. Never hoisted, never
+ *    reordered, never deleted.
+ *  - Alternation is achieved ONLY by merging consecutive same-base-type text
+ *    messages (system/user/assistant, simple or compound) IN PLACE — the first
+ *    keeps its id + position, later content appends. Merging never reorders.
+ *  - Tools ALWAYS pair by ID: a toolCall is kept only with its matching
+ *    toolResult(s) immediately after; anything not matched by ID is NOT
+ *    included (orphaned results, dangling calls).
+ *  - compound flavors count as their base type (user-compound == user, …).
  */
 export function normalizeForAlternation(list: Message[]): Message[] {
   const out: Message[] = [];
   for (let i = 0; i < list.length; i++) {
     const m = list[i];
-    if (m.type === "system") {
-      out.push(m);
-      continue;
-    }
-    if (m.type === "toolCall") {
+    if (!m.enabled) continue; // not in context — never contributes, never merges
+    const base = baseType(m.type);
+    if (base === "toolCall") {
+      // tools ALWAYS pair by ID — a call is kept only with its matching
+      // results immediately after; anything unmatched is not included
       const callIds = new Set(((m.content as { stored?: { id?: string }[] }).stored ?? []).map((c) => c.id));
       const results: Message[] = [];
       let j = i + 1;
-      while (j < list.length && list[j].type === "toolResult") {
+      while (j < list.length && baseType(list[j].type) === "toolResult") {
         const rid = (list[j] as ToolResultMessage).toolCallId;
         if (rid && callIds.has(rid)) {
           callIds.delete(rid);
@@ -63,17 +89,27 @@ export function normalizeForAlternation(list: Message[]): Message[] {
         out.push(m, ...results);
         i = j - 1;
       }
-      continue; // dangling toolCall (no matching result) → dropped
+      continue; // dangling toolCall (no matching result) → not included
     }
-    if (m.type === "toolResult") continue; // orphaned result → dropped
+    if (base === "toolResult") continue; // orphaned result (no matching call) → not included
 
     const last = out[out.length - 1];
-    if (last && last.type === m.type) out.pop(); // collapse consecutive same-role
-    out.push(m);
-  }
-  // end must be non-assistant so the resumed turn's response is legal
-  while (out.length > 0 && (out[out.length - 1].type === "assistant" || out[out.length - 1].type === "toolCall")) {
-    out.pop();
+    if (
+      last &&
+      baseType(last.type) === base &&
+      (base === "system" || base === "user" || base === "assistant")
+    ) {
+      // alternation via merge — consecutive same-type fold IN PLACE. The first
+      // keeps its id + position, later content appends. Never mutates the input.
+      const prev = toWireText(last.content);
+      const next = toWireText(m.content);
+      out[out.length - 1] = {
+        ...last,
+        content: [{ type: "text", content: [prev, next].filter((s) => s.length > 0).join("\n\n") }],
+      };
+    } else {
+      out.push(m);
+    }
   }
   return out;
 }
@@ -89,11 +125,13 @@ export interface SimpleModelOptions {
   maxContext?: number;
   /**
    * Normalization strategy applied to the message list RIGHT BEFORE the provider
-   * call. Default: normalizeForAlternation (strict role alternation — llama.cpp
-   * 400s on consecutive same-role / trailing assistant). Pass (m) => m to
-   * disable. The strategy is the SIMPLE model's own concern — cross-provider
-   * adapters (PiAdapterModel) shape messages their own way and override
-   * callNextTurn, so they never pass through here.
+   * call. Default: normalizeForAlternation (strict role alternation; the LEADING
+   * run of consecutive system messages merges into one head — llama.cpp 400s on
+   * consecutive same-role / trailing assistant / any list that doesn't start
+   * with system). Mid-array systems are never moved. Pass (m) => m to disable.
+   * The strategy is the SIMPLE model's own concern — cross-provider adapters
+   * (PiAdapterModel) shape messages their own way and override callNextTurn, so
+   * they never pass through here.
    */
   normalizeMessages?: (messages: Message[]) => Message[];
 }
@@ -400,11 +438,15 @@ export class SimpleModel {
   // Light transform — private, inside the class, never leaks
   // ==========================================================================
   protected toApiMessage(m: Message): unknown {
-    switch (m.type) {
+    // compound flavors are OUR dynamic-fragment convenience — on the wire they
+    // collapse to their base type's normal role/shape (system-compound → system,
+    // user-compound → user, …)
+    const base = baseType(m.type);
+    switch (base) {
       case "system":
       case "user":
       case "assistant":
-        return { role: m.type, content: this.toText(m.content) };
+        return { role: base, content: this.toText(m.content) };
       case "toolCall": {
         const face = m.content as { answer: string; stored: ToolCallRecord[] };
         // canonical stored shape { id, type, name, parameters } → OpenAI wire
@@ -433,15 +475,6 @@ export class SimpleModel {
   }
 
   protected toText(content: unknown): string {
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content
-        .map((b) => (typeof b === "object" && b !== null && "content" in b ? String((b as { content: unknown }).content) : ""))
-        .join("\n");
-    }
-    if (typeof content === "object" && content !== null && "answer" in content) {
-      return String((content as { answer: unknown }).answer);
-    }
-    return String(content ?? "");
+    return toWireText(content);
   }
 }

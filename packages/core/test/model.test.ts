@@ -35,29 +35,55 @@ test("SimpleModel constructor defaults are sane", () => {
     ], "disabled messages drop; simple types map to roles");
 });
 
-test("normalizeForAlternation: orphan results dropped, dangling toolCall dropped, trailing assistant popped, same-role collapsed", () => {
+test("normalizeForAlternation: order absolute — same-type merges in place, tools pair by ID, unmatched excluded", () => {
     const msg = (id: string, type: Message["type"], extra: Record<string, unknown> = {}): Message =>
         ({ id, enabled: true, type, content: [], ...extra }) as Message;
+    const text = (id: string, type: Message["type"], content: string, extra: Record<string, unknown> = {}): Message =>
+        ({ id, enabled: true, type, content: [{ type: "text", content }], ...extra }) as Message;
 
-    // orphaned toolResult (no preceding toolCall) → dropped
-    let out = normalizeForAlternation([msg("u1", "user"), msg("r1", "toolResult", { toolCallId: "nope" })]);
-    assert.deepEqual(out.map((m) => m.id), ["u1"]);
+    // RULE ONE — a lone mid-array system passes through as the ORIGINAL object, in place
+    const midSys = text("s-mid", "system", "mid rules", { committedAt: 7 });
+    let out = normalizeForAlternation([text("u1", "user", "hi"), midSys, text("u2", "user", "ho")]);
+    assert.deepEqual(out.map((m) => m.id), ["u1", "s-mid", "u2"], "order preserved, nothing hoisted");
+    assert.ok(out[1] === midSys, "lone system is the ORIGINAL object, untouched");
 
-    // consecutive same-role user messages collapse (earlier dropped)
-    out = normalizeForAlternation([msg("u1", "user"), msg("u2", "user")]);
-    assert.deepEqual(out.map((m) => m.id), ["u2"]);
+    // alternation via MERGE — consecutive same-type fold in place, first id wins, content appends
+    out = normalizeForAlternation([text("u1", "user", "one"), text("u2", "user", "two")]);
+    assert.deepEqual(out.map((m) => m.id), ["u1"], "merged, first keeps position + id");
+    assert.deepEqual(out[0].content, [{ type: "text", content: "one\n\ntwo" }], "content appended, nothing dropped");
 
-    // list must NOT end with an assistant or a dangling toolCall
-    out = normalizeForAlternation([msg("u1", "user"), msg("a1", "assistant")]);
-    assert.deepEqual(out.map((m) => m.id), ["u1"]);
+    // consecutive systems (compound + simple) merge into ONE head — no content lost
+    out = normalizeForAlternation([
+        { id: "system", enabled: true, type: "system-compound", content: [{ id: "a", content: "alpha" }, { id: "b", content: "beta" }] },
+        text("s-cat", "system", "catalog"),
+        text("s-pre", "system", "preload"),
+        text("u1", "user", "go"),
+    ]);
+    assert.deepEqual(out.map((m) => m.id), ["system", "u1"], "head = merged systems, then user");
+    assert.deepEqual(out[0].content, [{ type: "text", content: "alpha\nbeta\n\ncatalog\n\npreload" }], "all system text merged");
 
-    // toolCall kept only with its MATCHING result immediately after
+    // a trailing assistant STAYS — order is absolute, never popped
+    out = normalizeForAlternation([text("u1", "user", "go"), text("a1", "assistant", "done")]);
+    assert.deepEqual(out.map((m) => m.id), ["u1", "a1"], "trailing assistant preserved");
+
+    // tools pair by ID — matched kept together, unmatched NOT included
     out = normalizeForAlternation([
         msg("c1", "toolCall", { content: { answer: "", stored: [{ id: "call-9", type: "function", name: "x", parameters: {} }] } }),
         msg("r-ok", "toolResult", { toolCallId: "call-9" }),
         msg("r-orphan", "toolResult", { toolCallId: "call-404" }),
     ]);
-    assert.deepEqual(out.map((m) => m.id), ["c1", "r-ok"]);
+    assert.deepEqual(out.map((m) => m.id), ["c1", "r-ok"], "call + matching result kept, orphan result excluded");
+
+    // dangling toolCall (no matching result) → NOT included
+    out = normalizeForAlternation([
+        msg("u1", "user"),
+        msg("c-dangling", "toolCall", { content: { answer: "", stored: [{ id: "call-x", type: "function", name: "x", parameters: {} }] } }),
+    ]);
+    assert.deepEqual(out.map((m) => m.id), ["u1"], "dangling toolCall excluded");
+
+    // orphaned toolResult (no preceding toolCall) → NOT included
+    out = normalizeForAlternation([msg("u1", "user"), msg("r1", "toolResult", { toolCallId: "nope" })]);
+    assert.deepEqual(out.map((m) => m.id), ["u1"], "orphan toolResult excluded");
 });
 
 test("callNextTurn receives THE whole agent (identity, not a copy)", async () => {
