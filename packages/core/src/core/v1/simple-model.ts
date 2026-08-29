@@ -39,6 +39,9 @@ function baseType(type: string): string {
   return type.endsWith("-compound") ? type.slice(0, -"-compound".length) : type;
 }
 
+/** A message that may carry the model's thinking — only attached when keepReasoning is on. */
+type ReasonedMessage = Message & { reasoningContent?: string };
+
 /** Flatten any message content to a wire string — text blocks, compound fragments, tool faces. */
 function toWireText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -134,6 +137,14 @@ export interface SimpleModelOptions {
    * they never pass through here.
    */
   normalizeMessages?: (messages: Message[]) => Message[];
+  /**
+   * PRESERVE the model's thinking (reasoning_content) in history and replay it
+   * on subsequent requests. Default false: thinking is streamed to the console
+   * so the loop looks alive, then DISCARDED — the next request never carries it
+   * (minimal wire, no multi-turn surprises). Set true for providers/templates
+   * that want thinking replayed on every assistant message.
+   */
+  preserveThinking?: boolean;
 }
 
 export class SimpleModel {
@@ -147,6 +158,8 @@ export class SimpleModel {
   maxContext?: number;
   /** The strategy applied before the provider call (see options). */
   normalizeMessages: (messages: Message[]) => Message[];
+  /** Whether thinking (reasoning_content) is kept in history + replayed (see options). */
+  preserveThinking: boolean;
   /** The runtime's open bag — satisfies ModelContract's index signature. */
   [key: string]: unknown;
 
@@ -161,6 +174,7 @@ export class SimpleModel {
     this.maxOutputTokens = opts.maxOutputTokens;
     this.maxContext = opts.maxContext;
     this.normalizeMessages = opts.normalizeMessages ?? normalizeForAlternation;
+    this.preserveThinking = opts.preserveThinking ?? false;
   }
 
   // ==========================================================================
@@ -262,6 +276,7 @@ export class SimpleModel {
     let buffer = "";
     let malformedChunks = 0;
     let content = "";
+    let reasoning = "";
     let finishReason: string | undefined;
     let usage: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
     const toolCalls: Record<number, { id: string; name: string; args: string }> = {};
@@ -287,6 +302,21 @@ export class SimpleModel {
           if (delta?.content) {
             content += delta.content;
             sink.emit({ type: "textDelta", delta: delta.content });
+          }
+          // Qwen/llama.cpp stream thinking as delta.reasoning_content; some
+          // OpenAI-compatible endpoints use delta.reasoning / delta.reasoning_text.
+          // Take the FIRST non-empty field — providers can send the same thinking
+          // under two names (double-processing). Always emit it so the console
+          // shows life; PRESERVING it is the preserveThinking flag's job.
+          const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+          const deltaRec = delta as Record<string, unknown>;
+          const thinkingField = reasoningFields.find(
+            (f) => typeof deltaRec[f] === "string" && (deltaRec[f] as string).length > 0,
+          );
+          if (thinkingField) {
+            const rd = deltaRec[thinkingField] as string;
+            reasoning += rd;
+            sink.emit({ type: "textDelta", delta: rd });
           }
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls as {
@@ -328,6 +358,7 @@ export class SimpleModel {
         {
           message: {
             content: content || null,
+            reasoning_content: reasoning || undefined,
             tool_calls: toolCallList.length ? toolCallList : undefined,
           },
           finish_reason: finishReason,
@@ -342,7 +373,7 @@ export class SimpleModel {
   // ==========================================================================
   protected parseResponse(response: unknown, inputMessages?: Message[]): TurnResult {
     const completion = response as {
-      choices?: { message?: { content?: string | null; tool_calls?: unknown[] }; finish_reason?: string }[];
+      choices?: { message?: { content?: string | null; tool_calls?: unknown[]; reasoning_content?: string }; finish_reason?: string }[];
       // OpenAI standard: prompt_tokens (input), completion_tokens (output), total_tokens.
       // Pi-style providers / extensions can add cached_tokens, reasoning_tokens, ...
       usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cached_tokens?: number; reasoning_tokens?: number; cost?: number };
@@ -362,8 +393,9 @@ export class SimpleModel {
 
     const content = choice?.message?.content ?? "";
     const toolCalls = choice?.message?.tool_calls;
+    const reasoningContent = choice?.message?.reasoning_content;
 
-    const message: Message = toolCalls?.length
+    const message: ReasonedMessage = toolCalls?.length
       ? {
           id: `runtime-${crypto.randomUUID().slice(0, 8)}`,
           enabled: true,
@@ -372,12 +404,15 @@ export class SimpleModel {
             answer: content,
             stored: this.parseToolCalls(toolCalls),
           },
+          // thinking is preserved ONLY on demand — default: streamed then discarded
+          ...(this.preserveThinking && reasoningContent ? { reasoningContent } : {}),
         }
       : {
           id: `runtime-${crypto.randomUUID().slice(0, 8)}`,
           enabled: true,
           type: "assistant",
           content: [{ type: "text", content }],
+          ...(this.preserveThinking && reasoningContent ? { reasoningContent } : {}),
         };
 
     const usage = completion.usage;
@@ -386,7 +421,7 @@ export class SimpleModel {
     const completionTokens = usage?.completion_tokens ?? estimateOutputTokens(content);
     const totalTokens = usage?.total_tokens ?? promptTokens + completionTokens;
     const cachedTokens = usage?.cached_tokens ?? 0;
-    const reasoningTokens = usage?.reasoning_tokens ?? 0;
+    const reasoningTokens = usage?.reasoning_tokens ?? (reasoningContent ? estimateOutputTokens(reasoningContent) : 0);
     return {
       message,
       stats: {
@@ -445,8 +480,19 @@ export class SimpleModel {
     switch (base) {
       case "system":
       case "user":
-      case "assistant":
         return { role: base, content: this.toText(m.content) };
+      case "assistant": {
+        const reasoned = m as ReasonedMessage;
+        return {
+          role: "assistant",
+          content: this.toText(m.content),
+          // replay thinking ONLY when preserveThinking is on and the message
+          // actually carries it — default: the next request never sees it
+          ...(this.preserveThinking && reasoned.reasoningContent
+            ? { reasoning_content: reasoned.reasoningContent }
+            : {}),
+        };
+      }
       case "toolCall": {
         const face = m.content as { answer: string; stored: ToolCallRecord[] };
         // canonical stored shape { id, type, name, parameters } → OpenAI wire
@@ -457,7 +503,15 @@ export class SimpleModel {
           type: c.type,
           function: { name: c.name, arguments: JSON.stringify(c.parameters ?? {}) },
         }));
-        return { role: "assistant", content: face.answer, tool_calls: toolCalls };
+        const reasoned = m as ReasonedMessage;
+        return {
+          role: "assistant",
+          content: face.answer,
+          tool_calls: toolCalls,
+          ...(this.preserveThinking && reasoned.reasoningContent
+            ? { reasoning_content: reasoned.reasoningContent }
+            : {}),
+        };
       }
       case "toolResult": {
         const face = m.content as ToolResultContent | null;
