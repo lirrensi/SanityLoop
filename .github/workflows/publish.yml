@@ -1,0 +1,40 @@
+name: Publish packages
+
+on:
+  push:
+    branches:
+      - main
+
+# npm trusted publishing uses GitHub's short-lived OIDC identity.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish core + extras
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify the publish artifacts
+        run: npm run publish:dry
+
+      - name: Publish core and extras
+        run: npm run publish
