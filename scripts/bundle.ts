@@ -161,9 +161,13 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 	for (const b of bricks) exports[`./${b.short}`] = { default: `./${b.short}/${b.entry.replace(/^\.\//, "")}` };
 	exports["."] = { default: "./index.ts" };
 	const corePackage = json(join(ROOT, "packages", "core", "package.json"));
+	const extrasVersion = readFileSync(join(ROOT, "packages", "extras", "VERSION"), "utf8").trim();
+	if (!/^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$/.test(extrasVersion)) {
+		throw new Error(`invalid extras version: ${extrasVersion}`);
+	}
 	const pkg = {
 		name: "@sanityloop/extras",
-		version: String(corePackage.version),
+		version: extrasVersion,
 		license: "MIT",
 		description: "The shelf - every optional SanityLoop module as a subpath import. Only light libs (~2MB) ride as dependencies; the heavy worlds (mcp, pi-model, http-server) load lazily and declare their own needs.",
 		repository: {

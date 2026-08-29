@@ -41,25 +41,29 @@ jobs:
         id: release
         shell: bash
         run: |
-          old_version="$(git show HEAD^:packages/core/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
-          new_version="$(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json', 'utf8')).version")"
-          echo "old_version=$old_version"
-          echo "new_version=$new_version"
-          if [ "$old_version" != "$new_version" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Explicit release version change detected."
+          old_core="$(git show HEAD^:packages/core/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
+          new_core="$(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json', 'utf8')).version")"
+          old_extras="$(git show HEAD^:packages/extras/VERSION)"
+          new_extras="$(cat packages/extras/VERSION)"
+          packages=""
+          if [ "$old_core" != "$new_core" ]; then packages="core"; fi
+          if [ "$old_extras" != "$new_extras" ]; then packages="${packages:+$packages,}extras"; fi
+          echo "core: $old_core → $new_core"
+          echo "extras: $old_extras → $new_extras"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          if [ -n "$packages" ]; then
+            echo "Explicit release version change detected: $packages"
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No explicit version change; skipping publish."
+            echo "No explicit package version change; skipping publish."
           fi
 
       - name: Verify the publish artifacts
-        if: steps.release.outputs.changed == 'true'
-        run: npm run publish:dry
+        if: steps.release.outputs.packages != ''
+        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run --only "${{ steps.release.outputs.packages }}"
 
       - name: Publish core and extras
-        if: steps.release.outputs.changed == 'true'
-        run: npm run publish
+        if: steps.release.outputs.packages != ''
+        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts --only "${{ steps.release.outputs.packages }}"
         env:
           # Bootstrap with an npm granular automation token that has publish
           # access and bypass-2FA enabled. Store it as repository secret NPM_TOKEN.

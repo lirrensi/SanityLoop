@@ -26,6 +26,10 @@ import { join } from "node:path";
 const ROOT = process.cwd();
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes("--dry-run");
+const ONLY = (() => {
+	const idx = args.indexOf("--only");
+	return idx >= 0 ? new Set((args[idx + 1] ?? "").split(",").map((s) => s.trim()).filter(Boolean)) : new Set(["core", "extras"]);
+})();
 const OTP = (() => {
   const idx = args.indexOf("--otp");
   return idx >= 0 ? args[idx + 1] : undefined;
@@ -120,6 +124,13 @@ function packAndCheck(dir: string, name: string): void {
 }
 
 function main(): void {
+	if (![...ONLY].every((name) => name === "core" || name === "extras")) {
+		throw new Error(`--only accepts core, extras; received ${[...ONLY].join(", ")}`);
+	}
+	if (ONLY.size === 0) throw new Error("--only selected no packages");
+	const wantsCore = ONLY.has("core");
+	const wantsExtras = ONLY.has("extras");
+
   // 1. bundle
   console.log("bundle: staging .publish/pkgs ...");
 	run(sh(["node", "--experimental-strip-types", "--experimental-transform-types", BUNDLE_SCRIPT, "--clean"]));
@@ -127,31 +138,33 @@ function main(): void {
   // 2. GATE - staged shelf, only core resolvable
   const gateTsconfig = join(STAGE, "extras", "tsconfig.json");
   if (!existsSync(gateTsconfig)) throw new Error("gate tsconfig missing - did bundle.ts run?");
-  console.log("gate: staged shelf typecheck (only @sanityloop/core external)...");
-	run(sh(["node", TSC, "-p"], [gateTsconfig]));
-  console.log("gate: PASS");
+	if (wantsExtras) {
+		console.log("gate: staged shelf typecheck (only @sanityloop/core external)...");
+		run(sh(["node", TSC, "-p"], [gateTsconfig]));
+		console.log("gate: PASS");
+	}
 
   // 3. verify + pack-check
-  verifyPkgJson(join(STAGE, "core"), "@sanityloop/core");
-  verifyPkgJson(join(STAGE, "extras"), "@sanityloop/extras");
-  console.log("verify: core + extras pass\n");
-  packAndCheck(join(STAGE, "core"), "@sanityloop/core");
-  packAndCheck(join(STAGE, "extras"), "@sanityloop/extras");
+	if (wantsCore) verifyPkgJson(join(STAGE, "core"), "@sanityloop/core");
+	if (wantsExtras) verifyPkgJson(join(STAGE, "extras"), "@sanityloop/extras");
+	console.log(`verify: ${[...ONLY].join(" + ")} pass\n`);
+	if (wantsCore) packAndCheck(join(STAGE, "core"), "@sanityloop/core");
+	if (wantsExtras) packAndCheck(join(STAGE, "extras"), "@sanityloop/extras");
 
   if (DRY_RUN) {
     console.log("\ndry-run complete - nothing published. Remove --dry-run to publish.");
     return;
   }
 
-  // 4. publish, dependency order: core first, then the shelf
+	// 4. publish, dependency order: core first, then the shelf
   const publishDir = (dir: string): void => {
     const otpArg = OTP ? ["--otp", OTP] : [];
     console.log(`\n→ publishing ${dir}`);
     run(sh(["npm", "publish", "--access", "public", ...otpArg], [dir]));
     console.log("  ✓ published");
   };
-  publishDir(join(STAGE, "core"));
-  publishDir(join(STAGE, "extras"));
+	if (wantsCore) publishDir(join(STAGE, "core"));
+	if (wantsExtras) publishDir(join(STAGE, "extras"));
   console.log("\nall published.");
 }
 
