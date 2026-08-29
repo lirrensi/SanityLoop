@@ -43,8 +43,8 @@ jobs:
         run: |
           old_core="$(git show HEAD^:packages/core/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
           new_core="$(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json', 'utf8')).version")"
-          old_extras="$(git show HEAD^:packages/extras/VERSION)"
           new_extras="$(cat packages/extras/VERSION)"
+          old_extras="$(git show HEAD^:packages/extras/VERSION 2>/dev/null || printf '%s' "$new_extras")"
           packages=""
           if [ "$old_core" != "$new_core" ]; then packages="core"; fi
           if [ "$old_extras" != "$new_extras" ]; then packages="${packages:+$packages,}extras"; fi
