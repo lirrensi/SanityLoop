@@ -77,7 +77,7 @@ test("constructor honors id / description / cwd / messages overrides", () => {
     assert.equal(agent.description, "does things");
     assert.equal(agent.cwd, "/tmp/wherever");
     assert.equal(agent.messages.length, 1);
-    assert.equal(agent.lastResponse, 0, "lastResponse initialized to last message index");
+    assert.equal(agent.lastResponse, -1, "THE LAW: nothing is pre-answered — run() starts from whatever messages exist");
 });
 
 test("stats start as flat empty Stats (exact keys)", () => {
@@ -262,8 +262,9 @@ test("THE LITERAL BLOCK FLAG: pending awaits pin the worker (blocked=true) until
         },
     });
 
+    // THE LAW: run() needs messages — seed before the driver starts it.
+    seedUserMessage(agent, "go");
     await withDriver(agent, async () => {
-        seedUserMessage(agent, "go");
         agent.input({ type: "__test_kick__" });
 
         // the gate parks → loop 1 raises the literal flag, loop 2 freezes

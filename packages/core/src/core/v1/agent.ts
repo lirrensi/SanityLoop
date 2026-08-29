@@ -363,7 +363,12 @@ export class Agent implements GodObject {
         this.model = opts.model;
         this.messages = opts.messages ?? [];
         this.state = opts.state ?? {};
-        this.lastResponse = this.messages.length - 1;
+        // THE LAW — run() CALCULATES NOTHING. It starts with whatever messages
+        // exist, whatever their structure, and calls immediately. lastResponse
+        // begins at -1: no message is pre-answered, so any non-empty array is
+        // work on the very first tick. The ONLY opt-out is run({ startState:
+        // "idle" }) — arrives idle and does not tick.
+        this.lastResponse = -1;
         // Fail loudly on duplicate tool names in the creation array — same
         // invariant as addTool, since this bulk path bypasses it. A backend
         // template passing two tools of the same name must not silently win.
@@ -792,6 +797,16 @@ export class Agent implements GodObject {
     async run(opts?: { startState?: "idle" }): Promise<void> {
         if (this.runDriven || this.terminated) return this.runPromise;
         if (opts?.startState === "idle") this.armed = false;
+        // THE LAW — a DEFAULT run() with ZERO messages is a HARD ERROR, not a
+        // silent idle: run() is a work call, and an empty array is a wiring bug
+        // that must scream. An idle-start (startState:"idle") may legitimately
+        // boot empty — it ignores everything until manually kicked (input,
+        // follow-up, wake).
+        if (this.messages.length === 0 && opts?.startState !== "idle") {
+            throw new Error(
+                "[sanity] run() with zero messages — no system prompt, no user message, nothing to send. Seed messages before run().",
+            );
+        }
         this.runDriven = true;
         this.runPromise = (async () => {
             await Promise.all([this.loop1(), this.loop2()]);

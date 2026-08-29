@@ -70,9 +70,10 @@ test("PARK END-TO-END: a beforeTool gate that parks → loopState awaiting at BR
         },
     });
 
+    // THE LAW: run() needs messages — seed before the driver starts it.
+    seedUserMessage(agent, "go");
     // Endless driver for the whole scenario — deterministic park AND resume.
     await withDriver(agent, async () => {
-        seedUserMessage(agent, "go");
         agent.input({ type: "__test_kick__" });
         await awaitAwaiting(agent);
 

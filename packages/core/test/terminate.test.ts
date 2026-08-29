@@ -59,7 +59,8 @@ test("run() resolves after terminate() — the promise finally settles", async (
 });
 
 test("fire-and-forget terminate() still stops the heart", async () => {
-    const { agent } = makeAgent({ script: [] });
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi"); // THE LAW: run() needs messages to start
     agent.run(); // never awaited — the fire-and-forget life
     void agent.terminate(); // nobody holds this promise
     await waitUntil(() => agent.loopState === "terminated", {
