@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
-  "description": "the core agent loop + SDK — zero dependencies",
+  "description": "the core agent loop + SDK - zero dependencies",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lirrensi/SanityLoop.git"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./v1": "./src/core/v1/index.ts",

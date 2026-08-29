@@ -164,7 +164,11 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 		name: "@sanityloop/extras",
 		version: "0.1.0",
 		license: "MIT",
-		description: "The shelf — every optional SanityLoop module as a subpath import. Only light libs (~2MB) ride as dependencies; the heavy worlds (mcp, pi-model, http-server) load lazily and declare their own needs.",
+		description: "The shelf - every optional SanityLoop module as a subpath import. Only light libs (~2MB) ride as dependencies; the heavy worlds (mcp, pi-model, http-server) load lazily and declare their own needs.",
+		repository: {
+			type: "git",
+			url: "https://github.com/lirrensi/SanityLoop.git",
+		},
 		type: "module",
 		exports,
 		dependencies: collectDeps(bricks),
