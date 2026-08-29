@@ -156,6 +156,20 @@ import { /* swarm APIs */ } from "@sanityloop/extras/swarm";
 Every push to `main` runs the verification gate and publishes only `core` and
 `extras`, in that order.
 
+Publishing is deliberately gated by an explicit version change. To release a
+new version, update the version in `packages/core/package.json` and push it:
+
+```sh
+npm version patch --workspace packages/core --no-git-tag-version
+git add packages/core/package.json package-lock.json
+git commit -m "release: v0.1.1"
+git push origin main
+```
+
+The workflow detects that version change, uses the core version for both
+packages, and publishes them. Ordinary code, documentation, or workflow pushes
+run no npm publish.
+
 ## What you can build
 
 Same blocks, different shapes:
