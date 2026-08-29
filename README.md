@@ -125,6 +125,37 @@ Nothing is forced on you either. You define where stuff is stored, whether it's 
 
 Zero surprises.
 
+## Source layout vs published packages
+
+The repository is a monorepo, so its development folders do not map one-to-one
+to npm packages. The source is kept in separate folders for focused development
+and testing; the GitHub Actions publish workflow curates those folders into the
+two public packages:
+
+```text
+packages/
+├── core/        → @sanityloop/core
+├── extras/      → optional bricks, bundled into @sanityloop/extras
+├── swarm/       → developed separately, bundled as @sanityloop/extras/swarm
+└── test-kit/    → private development/test helper; not published
+```
+
+Install the published packages with:
+
+```sh
+npm install @sanityloop/core @sanityloop/extras
+```
+
+Although `swarm` lives at `packages/swarm` in the source tree, its published
+import path is:
+
+```ts
+import { /* swarm APIs */ } from "@sanityloop/extras/swarm";
+```
+
+Every push to `main` runs the verification gate and publishes only `core` and
+`extras`, in that order.
+
 ## What you can build
 
 Same blocks, different shapes:
