@@ -10,7 +10,7 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "@sanityloop/core": "^0.1.0"
+    "@sanityloop/core": "^0.2.0"
   },
   "private": true
 }
