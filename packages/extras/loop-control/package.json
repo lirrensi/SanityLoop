@@ -7,10 +7,15 @@
     ".": "./index.ts"
   },
   "dependencies": {
-    "@sanityloop/core": "^0.1.0",
+    "@sanityloop/core": "^0.2.0",
     "@sanityloop/util": "^0.1.0"
   },
-  "devDependencies": {},
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
   "files": [
     "**/*.ts",
     "!test",

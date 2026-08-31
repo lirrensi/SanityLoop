@@ -18,10 +18,13 @@ import {
     denyAll,
     allowAll,
     fsPathGate,
+    bashGate,
     classicResolve,
     recordDenial,
     matchEntry,
     globMatch,
+    canonicalizeCommand,
+    isCompoundCommand,
     PERMISSION_AWAIT,
     PERMISSION_ANSWER,
     CLASSIC_CHOICES,
@@ -428,4 +431,164 @@ test("globMatch semantics: * one segment, ** anything, ? one char, case-insensit
 
 test("CLASSIC_CHOICES vocabulary is stable", () => {
     assert.deepEqual([...CLASSIC_CHOICES], ["once", "session", "no", "no_explain"]);
+});
+
+// ---------------------------------------------------------------------------
+// bashGate — canonical commands + compound-command safety
+// ---------------------------------------------------------------------------
+
+function makeBashAgent(script: Array<() => TurnResult>, opts: { rules?: Record<string, unknown> } = {}) {
+    const executed: string[] = [];
+    const tool = Tool.define({
+        name: "bash",
+        description: "shell",
+        inputSchema: {
+            type: "object",
+            properties: { command: { type: "string" }, workdir: { type: "string" } },
+            required: ["command"],
+        },
+        async execute(params) {
+            executed.push(String((params as { command?: string }).command));
+            return { answer: "ran" };
+        },
+    });
+    const model = new StubModel(script);
+    const agent = new Agent({ model, tools: [tool], agentId: "bash-gate-test" });
+    agent.install(createPermissions({
+        rules: opts.rules ?? {},
+        tools: { bash: { gate: bashGate } },
+        defaults: { resolve: classicResolve },
+    }));
+    const seedAndKick = () => {
+        agent.messages.push({
+            id: `u-${Math.random().toString(36).slice(2, 8)}`,
+            enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+    };
+    return { agent, executed, seedAndKick };
+}
+
+test("canonicalizeCommand: whitespace + quotes collapse to one form", () => {
+    assert.equal(canonicalizeCommand("  git  status "), "git status");
+    assert.equal(canonicalizeCommand('"git status"'), "git status");
+    assert.equal(canonicalizeCommand("npm   run  check"), "npm run check");
+});
+
+test("isCompoundCommand: chains and substitutions detected; plain commands safe", () => {
+    assert.equal(isCompoundCommand("git status"), false);
+    assert.equal(isCompoundCommand("npm run check -- --filter x"), false);
+    assert.equal(isCompoundCommand("git; rm -rf /"), true);
+    assert.equal(isCompoundCommand("git status && make deploy"), true);
+    assert.equal(isCompoundCommand("cat a | grep x"), true);
+    assert.equal(isCompoundCommand("echo `id`"), true);
+    assert.equal(isCompoundCommand("echo $(whoami)"), true);
+});
+
+test("bashGate: blacklisted command denied WITHOUT executing", async () => {
+    const { agent, executed, seedAndKick } = makeBashAgent([
+        () => toolCallTurn([callTo("bash", { command: "rm -rf /tmp/x" }, "b-1")]),
+        () => assistantTurn("ok"),
+    ], { rules: { commands: { blacklist: ["rm -rf **"] } } });
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitLanded(agent);
+    });
+    assert.equal(executed.length, 0);
+    const result = lastToolResult(agent);
+    assert.equal(result.content!.error, true);
+    assert.match(result.content!.answer!, /blacklisted/);
+});
+
+test("bashGate: a `git *` approval NEVER covers a compound command — it asks", async () => {
+    const { agent, executed, seedAndKick } = makeBashAgent([
+        () => toolCallTurn([callTo("bash", { command: "git; rm -rf /" }, "c-1")]),
+        () => assistantTurn("ok"),
+    ]);
+    // the broad approval exists — and MUST NOT silently cover the compound
+    (agent.state as Record<string, unknown>).permission = {
+        approvals: [{ tool: "bash", cmd: "git *", createdAt: Date.now() }],
+    };
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitAwaiting(agent, { what: "compound command must ask" });
+        assert.equal(executed.length, 0, "compound command did NOT run on a wildcard approval");
+        assert.equal(agent.pendingAwaits.length, 1);
+        const schema = agent.pendingAwaits[0].schema as { title?: string; detail?: { command?: string } };
+        assert.match(schema.title ?? "", /compound command/i);
+        assert.equal(schema.detail?.command, "git; rm -rf /");
+    });
+});
+
+test("bashGate: simple command + matching session approval passes silently; canonical form matches", async () => {
+    const { agent, executed, seedAndKick } = makeBashAgent([
+        () => toolCallTurn([callTo("bash", { command: "git   status" }, "s-1")]),
+        () => assistantTurn("ok"),
+    ]);
+    // approval stored under the CANONICAL form — the raw `git   status` matches it
+    (agent.state as Record<string, unknown>).permission = {
+        approvals: [{ tool: "bash", cmd: "git status", createdAt: Date.now() }],
+    };
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitLanded(agent);
+    });
+    assert.deepEqual(executed, ["git   status"], "approved simple command executes for real");
+    assert.equal(agent.pendingAwaits.length, 0, "no ask");
+});
+
+test("bashGate: compound command with an EXACT canonical approval passes silently", async () => {
+    const { agent, executed, seedAndKick } = makeBashAgent([
+        () => toolCallTurn([callTo("bash", { command: "git status && git log -1" }, "x-1")]),
+        () => assistantTurn("ok"),
+    ]);
+    (agent.state as Record<string, unknown>).permission = {
+        approvals: [{ tool: "bash", cmd: "git status && git log -1", createdAt: Date.now() }],
+    };
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitLanded(agent);
+    });
+    assert.deepEqual(executed, ["git status && git log -1"], "exact compound approval passes");
+});
+
+test("classicResolve 'session' on a command tool remembers the CANONICAL command", async () => {
+    const { agent, executed, seedAndKick } = makeBashAgent([
+        () => toolCallTurn([callTo("bash", { command: "npm run check && echo done" }, "n-1")]),
+        () => assistantTurn("t1 done"),
+        () => toolCallTurn([callTo("bash", { command: "npm   run  check && echo done" }, "n-2")]),
+        () => assistantTurn("t2 done"),
+    ]);
+    // deterministic ask counter: runs AFTER bashGate (priority 100)
+    let asks = 0;
+    agent.addFilter({
+        event: "beforeTool", id: "test/count-asks", priority: 200,
+        fn: async (a, e) => {
+            const id = (e?.call as { id?: string })?.id;
+            if (id && a.pendingAwaits.some((w) => w.type === PERMISSION_AWAIT && w.id === id)) asks++;
+        },
+    });
+    await withDriver(agent, async () => {
+        // TURN 1 — compound command, no exact approval → asks; answer "session"
+        seedAndKick();
+        await awaitAwaiting(agent, { what: "compound command asks first" });
+        assert.equal(agent.pendingAwaits.length, 1);
+        const ref = agent.pendingAwaits[0].id;
+        agent.input({ type: PERMISSION_ANSWER, ref, answer: { choice: "session" } });
+        await awaitLanded(agent);
+
+        // TURN 2 — same command, messier spacing: canonical approval covers it
+        seedAndKick();
+        await awaitLanded(agent);
+    });
+    assert.deepEqual(
+        executed,
+        ["npm run check && echo done", "npm   run  check && echo done"],
+        "both turns ran",
+    );
+    assert.equal(asks, 1, "only the FIRST turn asked — canonical approval covered the messy spacing");
+    const st = agent.state.permission as { approvals?: Array<{ tool?: string; cmd?: string }> };
+    assert.equal(st.approvals?.[0]?.cmd, "npm run check && echo done", "approval stored canonical");
+    assert.equal(st.approvals?.length, 1, "only one approval — spacing didn't duplicate it");
 });

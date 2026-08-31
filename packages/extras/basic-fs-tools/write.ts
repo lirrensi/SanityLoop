@@ -22,6 +22,13 @@ export function createWriteTool() {
       "Write a file with the given content — creates it or overwrites entirely. " +
       "Creates parent directories. For a NEW file or a full rewrite; " +
       "for surgical changes use edit. Call read() before overwriting a file you care about.",
+    promptSnippet: "Create or overwrite files",
+    promptGuidelines: [
+      "Use write only for new files or complete rewrites; for surgical changes use edit.",
+      "Call read() before overwriting a file you care about.",
+      "A trailing \\n in content ends the file with a newline — most text files should end with one.",
+    ],
+    executionMode: "sequential",
     inputSchema: writeSchema,
     async execute(params, agent) {
       const { path: p, content } = params as { path: string; content: string };

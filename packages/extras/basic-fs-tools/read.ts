@@ -25,9 +25,16 @@ export function createReadTool(opts: BasicReadOptions = {}) {
     return Tool.define({
         name: "read",
         description:
-            "Read a file as plain text with line numbers. " +
-            "Paged: large files return a chunk plus an offset hint to continue. " +
-            "Use this BEFORE edit to see exact current content.",
+            `Read a file as plain text with line numbers. ` +
+            `Paged: output is capped at ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever hits first); ` +
+            `the result ends with a hint like [Showing lines X-Y of N. Use offset=Z to continue.] — follow it until the file is fully read. ` +
+            `Call read() BEFORE edit/write to see the exact current content.`,
+        promptSnippet: "Read file contents with line numbers",
+        promptGuidelines: [
+            "Use read to examine files instead of cat or sed.",
+            "Large files are paged — keep following the offset hint until the file is fully read.",
+            "Call read() before edit/write so you edit against the exact current content.",
+        ],
         inputSchema: readSchema,
         async execute(params, agent) {
             const { path: p, offset, limit } = params as { path: string; offset?: number; limit?: number };

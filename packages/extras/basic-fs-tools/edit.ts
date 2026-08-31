@@ -27,6 +27,13 @@ export function createEditTool() {
     description:
       "Edit a file by exact string replacement. Call read() first to see exact content. " +
       "Errors if old_string is not found, or matches multiple times (pass multiple:true to replace all).",
+    promptSnippet: "Edit a file by exact string replacement",
+    promptGuidelines: [
+      "Call read() first — old_string must match the current content exactly.",
+      "If old_string matches multiple times, use a more specific old_string; pass multiple:true only when replacing every occurrence is intended.",
+      "For surgical changes prefer edit over write (write is a full-file rewrite).",
+    ],
+    executionMode: "sequential",
     inputSchema: editSchema,
     async execute(params, agent) {
       const { path: p, old_string, new_string, multiple } = params as {

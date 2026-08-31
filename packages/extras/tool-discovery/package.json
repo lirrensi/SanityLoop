@@ -1,17 +1,16 @@
 {
-  "name": "@sanityloop/permission",
+  "name": "@sanityloop/tool-discovery",
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./index.ts"
   },
+  "dependencies": {
+    "@sanityloop/core": "^0.2.0"
+  },
   "scripts": {
     "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
-  },
-  "dependencies": {
-    "@sanityloop/core": "^0.2.0",
-    "@sanityloop/util": "^0.1.0"
   },
   "devDependencies": {
     "@sanityloop/test-kit": "^0.1.0"
@@ -24,5 +23,5 @@
   "engines": {
     "node": ">=22.6"
   },
-  "description": "Per-tool permission gates over the core park — allow / deny / ask with a sparse glob-matched config map."
+  "description": "tool_search + enumerate_tools — discover hidden tools by name, paginated."
 }

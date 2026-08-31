@@ -80,7 +80,8 @@ export class PiAdapterModel extends SimpleModel {
 		const base = this.prepareMessages(agent.messages) as PiContext;
 		const context: PiContext = {
 			...base,
-			tools: this.toolsToPi(agent.tools ?? []),
+			// visibleTools() = the wire list — hidden tools stay callable but never reach context
+			tools: this.toolsToPi(agent.visibleTools()),
 		};
 		const response = await this.callApi(context, agent.streamSink, agent);
 		return this.parseResponse(response);

@@ -195,6 +195,14 @@ export function createBashTool(options: BashToolOptions = {}) {
             "Returns combined stdout+stderr. Large output is truncated to the last lines, with the full output saved to a temp file. " +
             "`timeout` is optional (seconds) — no default, commands run to completion unless one is given. " +
             "`description` should say WHY the command is being run (it is logged and shown for approval).",
+        promptSnippet: `Execute a ${shell.label} command`,
+        promptGuidelines: [
+            "Prefer read/edit/write over shell for file inspection and changes.",
+            "Always include a `description` explaining why the command is run.",
+            "One command per call — keep the command narrow; don't chain reads and writes that could race other tools.",
+            "Set `timeout` for commands that might hang (servers, watchers, network calls).",
+        ],
+        executionMode: "sequential",
         inputSchema: {
             type: "object",
             properties: {

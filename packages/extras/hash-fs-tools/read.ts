@@ -174,6 +174,8 @@ export function createReadTool(opts: ReadToolOptions = {}) {
   return Tool.define({
     name: "read",
     description: `${R_DESC}\n\n${readGuide().join("\n")}`,
+    promptSnippet: R_SNIPPET.trim(),
+    promptGuidelines: readGuide(),
     inputSchema: readSchema,
     async execute(params, agent) {
       const { path: rawPath, offset, limit } = params as { path: string; offset?: number; limit?: number };

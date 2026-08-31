@@ -300,6 +300,9 @@ export function createReplaceTool(_opts: EditToolOptions = {}) {
   return Tool.define({
     name: "replace",
     description: `${E_DESC}\n\n${E_GUIDE.join("\n")}`,
+    promptSnippet: E_SNIPPET.trim(),
+    promptGuidelines: E_GUIDE,
+    executionMode: "sequential",
     inputSchema: editToolSchema,
     async execute(params, agent) {
       const canonical = normReq(params);

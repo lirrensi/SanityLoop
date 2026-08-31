@@ -12,7 +12,7 @@
 //     maxTurns: { enabled: true,  cap: 200,     announceLast: true },
 //   }));
 //
-// TWO guards today, both error-gated / honest:
+// FOUR guards today, all error-gated / honest:
 //
 //   A. DOOM-LOOP DETECTION — repeated tool calls that KEEP FAILING.
 //      The discriminator is `content.error === true`, NOT "same call". A monitor /
@@ -28,6 +28,14 @@
 //   B. MAX-TURNS BUDGET — a hard cap on model round-trips (cycles), codex/opencode
 //      style: the model is TOLD a last turn is coming ("isLastStep"), then the loop
 //      stops at the cap. Never a silent crash — always a committed wrap-up.
+//
+//   C. MAX-STEPS BUDGET — a harder cap on machine STEPS (provider round-trips +
+//      committed tool results). Stops at the cap with a committed wrap-up. This is
+//      the "the model just keeps calling tools forever" net.
+//
+//   D. MAX-CONSECUTIVE-TOOLS — the model keeps calling tools WITHOUT producing an
+//      assistant answer. After `cap` consecutive tool results it nudges (default)
+//      or stops. Resets whenever an answer lands.
 //
 // Detection counter per tool lives in plugin closure (hot path, no patch storm);
 // the ACTIONS taken (nudges, asks, stops, budget state) are surfaced on
@@ -87,9 +95,47 @@ export interface MaxTurnsOptions {
 	finalMessage?: string;
 }
 
+export interface MaxStepsOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Hard cap on machine STEPS (provider round-trips + committed tool results).
+	 * Default 0 = unlimited (only meaningful once `enabled`). Default cap 200. */
+	cap?: number;
+	/** Tell the model a last step is coming. Default true. */
+	announceLast?: boolean;
+	/** Optional text pushed on the final budget-exhausted stop. */
+	finalMessage?: string;
+	/** TRUE = a HARD stop at the cap: `agent.abort()` — the turn dies, the
+	 * worker freezes (terminal). The loop CANNOT resume, because gentle stop()
+	 * can't freeze a mid-turn machine (unanswered tool results stay owed work).
+	 * Default false = gentle: push finalMessage + stop(); a cooperative model
+	 * concludes, a runaway one keeps going. */
+	abort?: boolean;
+}
+
+export interface MaxConsecutiveToolsOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Consecutive committed tool results (no assistant answer between them)
+	 * before it trips. Default 10. */
+	cap?: number;
+	/** What to do when it trips: "nudge" (push a message, reset, keep going) or
+	 * "stop". Default "nudge". */
+	reaction?: "nudge" | "stop";
+	/** TRUE = the "stop" reaction becomes a HARD stop (`agent.abort()`) — the
+	 * tool chain is frozen dead. Default false = gentle stop() + message. */
+	abort?: boolean;
+	/** The pushed message on nudge/stop. */
+	message?: string;
+}
+
 export interface LoopControlOptions {
 	doomLoop?: DoomLoopOptions;
 	maxTurns?: MaxTurnsOptions;
+	/** Total-step budget — provider round-trips + committed tool results. */
+	maxSteps?: MaxStepsOptions;
+	/** Consecutive-tool guard — the model keeps calling tools without answering. */
+	maxConsecutiveTools?: MaxConsecutiveToolsOptions;
 	/** Where loop-control activity lives in session state. Default "loopControl". */
 	stateKey?: string;
 }
@@ -118,6 +164,23 @@ const DEFAULT_MAX_TURNS: Required<MaxTurnsOptions> = {
 	finalMessage: "**Budget exhausted.** Stopping here.",
 };
 
+const DEFAULT_MAX_STEPS: Required<MaxStepsOptions> = {
+	enabled: false,
+	cap: 200,
+	announceLast: true,
+	finalMessage: "**Step budget exhausted.** Stopping here.",
+	abort: false,
+};
+
+const DEFAULT_MAX_CONSECUTIVE_TOOLS: Required<MaxConsecutiveToolsOptions> = {
+	enabled: false,
+	cap: 10,
+	reaction: "nudge",
+	abort: false,
+	message:
+		"**[loop-control]** You have made many consecutive tool calls without producing a final answer. Produce your final answer now, or ask a clarifying question.",
+};
+
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
@@ -129,6 +192,9 @@ const NUDGE_TEXT = (tool: string, count: number) =>
 
 const LAST_TURN_TEXT =
 	"**[loop-control]** Budget notice: this is your last turn. Wrap up now — commit any pending work (files, session state) and give your final answer.";
+
+const LAST_STEP_TEXT =
+	"**[loop-control]** Budget notice: this is your last step. Wrap up now — commit any pending work and give your final answer.";
 
 /** Stable stringify — key order independent, so equivalent args hash the same. */
 function stableStringify(value: unknown): string {
@@ -193,6 +259,8 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	const stateKey = opts.stateKey ?? LOOP_CONTROL_STATE_KEY;
 	const doom = { ...DEFAULT_DOOM, ...(opts.doomLoop ?? {}) };
 	const maxTurns = { ...DEFAULT_MAX_TURNS, ...(opts.maxTurns ?? {}) };
+	const maxSteps = { ...DEFAULT_MAX_STEPS, ...(opts.maxSteps ?? {}) };
+	const maxConsTools = { ...DEFAULT_MAX_CONSECUTIVE_TOOLS, ...(opts.maxConsecutiveTools ?? {}) };
 
 	// the hot counters — plugin closure (fast, no patch storm)
 	const counts = new Map<string, number>(); // key → consecutive error count
@@ -202,6 +270,11 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	let turnCount = 0;
 	let announcedLast = false;
 	let stoppedBudget = false;
+	// max-steps + consecutive-tools bookkeeping
+	let stepCount = 0;
+	let announcedLastStep = false;
+	let stoppedStepBudget = false;
+	let consecutiveTools = 0;
 
 	/** Decide what to do for a key that crossed the doom threshold this cycle. */
 	function handleDoom(
@@ -303,6 +376,8 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 
 			// ---- DOOM-LOOP: act at cycleEnd (once per model round-trip, batch-atomic) ----
 			// ---- MAX-TURNS: count cycles + announce last + stop at cap ----
+			// ---- MAX-STEPS: each provider round-trip is one step ----
+			// ---- MAX-CONSECUTIVE-TOOLS: an assistant answer resets the chain ----
 			agent.addFilter({
 				event: EVENTS.cycleEnd,
 				id: "loop-control/cycle",
@@ -335,6 +410,109 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 								at: Date.now(),
 							});
 							agent.stop();
+						}
+					}
+
+					// max-steps — a provider round-trip is a step
+					if (maxSteps.enabled) {
+						stepCount++;
+						if (
+							maxSteps.announceLast &&
+							!announcedLastStep &&
+							stepCount === maxSteps.cap - 1
+						) {
+							announcedLastStep = true;
+							pushUser(agent, LAST_STEP_TEXT);
+						}
+						if (stepCount >= maxSteps.cap) {
+							if (maxSteps.abort) {
+								if (!stoppedStepBudget) {
+									stoppedStepBudget = true;
+									agent.abort(maxSteps.finalMessage);
+								}
+								return;
+							}
+							if (!stoppedStepBudget) {
+								stoppedStepBudget = true;
+								pushUser(agent, maxSteps.finalMessage);
+								record(agent, stateKey, {
+									lastAction: "max-steps",
+									count: stepCount,
+									at: Date.now(),
+								});
+							}
+							agent.stop();
+						}
+					}
+
+					// max-consecutive-tools — an assistant answer breaks the chain
+					if (maxConsTools.enabled) {
+						const last = agent.messages.at(-1);
+						if (last && last.type !== "toolResult") consecutiveTools = 0;
+					}
+				},
+			});
+
+			// ---- MAX-STEPS + MAX-CONSECUTIVE-TOOLS: each committed tool result is a step ----
+			agent.addFilter({
+				event: EVENTS.toolEnd,
+				id: "loop-control/step/tool",
+				priority: 150,
+				fn: async (agent) => {
+					if (maxSteps.enabled) {
+						stepCount++;
+						if (
+							maxSteps.announceLast &&
+							!announcedLastStep &&
+							stepCount === maxSteps.cap - 1
+						) {
+							announcedLastStep = true;
+							pushUser(agent, LAST_STEP_TEXT);
+						}
+						if (stepCount >= maxSteps.cap) {
+							if (maxSteps.abort) {
+								// HARD STOP — the turn dies, the worker freezes. Abort is
+								// idempotent + terminal; nothing can silently resume.
+								if (!stoppedStepBudget) {
+									stoppedStepBudget = true;
+									agent.abort(maxSteps.finalMessage);
+								}
+								return;
+							}
+							if (!stoppedStepBudget) {
+								stoppedStepBudget = true;
+								pushUser(agent, maxSteps.finalMessage);
+								record(agent, stateKey, {
+									lastAction: "max-steps",
+									count: stepCount,
+									at: Date.now(),
+								});
+							}
+							agent.stop(); // gentle — re-requested every step while over cap
+						}
+					}
+					if (maxConsTools.enabled) {
+						consecutiveTools++;
+						if (consecutiveTools >= maxConsTools.cap) {
+							if (maxConsTools.reaction === "stop") {
+								consecutiveTools = 0;
+								pushUser(agent, maxConsTools.message);
+								record(agent, stateKey, {
+									lastAction: "max-consecutive-tools",
+									count: maxConsTools.cap,
+									at: Date.now(),
+								});
+								if (maxConsTools.abort) agent.abort(maxConsTools.message);
+								else agent.stop();
+							} else {
+								consecutiveTools = 0; // a nudge resets the chain — fresh chances
+								pushUser(agent, maxConsTools.message);
+								record(agent, stateKey, {
+									lastAction: "consecutive-tools-nudge",
+									count: maxConsTools.cap,
+									at: Date.now(),
+								});
+							}
 						}
 					}
 				},
@@ -434,6 +612,10 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 			announcedLast = false;
 			stoppedBudget = false;
 			turnCount = 0;
+			announcedLastStep = false;
+			stoppedStepBudget = false;
+			stepCount = 0;
+			consecutiveTools = 0;
 			removeFiltersByPrefix(agent, "loop-control/");
 			agent.removeDeclaredCapability("loop-control");
 			delete agent.state[stateKey];

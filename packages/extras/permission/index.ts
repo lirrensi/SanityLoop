@@ -236,6 +236,29 @@ function normPath(p: string, cwd: string): string {
   return abs.replace(/\\/g, "/");
 }
 
+/**
+ * Normalize a command string for approval matching: trim, collapse whitespace,
+ * strip quotes. Approvals are stored and matched against the CANONICAL form, so
+ * `git  status` / `"git status"` / `git status` are one and the same.
+ */
+export function canonicalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, " ").replace(/["']/g, "");
+}
+
+/**
+ * Does the command chain multiple operations? These are the BYPASS VECTOR for
+ * broad glob approvals: a `git *` approval must NEVER cover `git; rm -rf /`.
+ * Compound commands therefore only pass on an EXACT canonical match (see
+ * bashGate) — never on a wildcard.
+ */
+export function isCompoundCommand(command: string): boolean {
+  const c = command.trim().replace(/^["']|["']$/g, "");
+  if (c.includes(";") || c.includes("&&") || c.includes("||") || c.includes("|")) return true;
+  if (c.includes("`") || c.includes("$(")) return true;
+  if (c.includes("\n")) return true;
+  return false;
+}
+
 /** Globs: only resolve `./` / `../` anchors — `**`-led patterns stay untouched. */
 function normGlob(g: string, cwd: string): string {
   const n = g.replace(/\\/g, "/");
@@ -383,6 +406,15 @@ export function classicResolve(
 
   switch (choice) {
     case "session": {
+      const params = call.parameters as { command?: unknown } | undefined;
+      const command = typeof params?.command === "string" ? params.command : undefined;
+      if (command) {
+        // a COMMAND tool: remember the CANONICAL command, not a raw string —
+        // `git status` and `git  status` approve the same canonical form, and
+        // compound commands only match EXACTLY (bashGate), never via wildcard.
+        addApproval(agent, { tool: call.name, cmd: canonicalizeCommand(command) });
+        return; // silent approval — the resumed batch executes the call
+      }
       const paths = extractPaths(call.parameters);
       if (paths.length > 0)
         for (const p of paths)
@@ -467,6 +499,69 @@ export const fsPathGate: PermissionGate = (agent, rules, call) => {
     title: `Access outside the workspace?`,
     detail: { paths: outside, cwd, tool: call.name },
   });
+};
+
+// ============================================================================
+// SHIPPED STRATEGY — bashGate: the command policy (canonical + compound-safe)
+// ============================================================================
+// rules.commands = {
+//   blacklist: ["rm -rf *", "git push --force"],  // ALWAYS denied
+// }
+//
+// Fate order: blacklist → session approval (canonical) → compound-command
+// safety → allow (simple commands default to allow, matching the workspace
+// posture — path tools ask, simple commands run).
+//
+// THE SECURITY CORE: a broad approval like `git *` must NEVER cover a compound
+// command (`git; rm -rf /`, `git push && make deploy`). Compound commands only
+// pass on an EXACT canonical approval; otherwise they ask.
+
+export interface CommandRules {
+  /** Command globs that ALWAYS win — denied even in the default allow posture. */
+  blacklist?: string[];
+}
+
+export const bashGate: PermissionGate = (agent, rules, call) => {
+  const params = call.parameters as { command?: unknown } | undefined;
+  const raw = typeof params?.command === "string" ? params.command : undefined;
+  if (!raw || raw.trim().length === 0) return; // nothing to judge → allow
+
+  const canonical = canonicalizeCommand(raw);
+  const cfg: CommandRules = (rules.commands as CommandRules | undefined) ?? {};
+
+  // 1) BLACKLIST ALWAYS WINS.
+  for (const g of cfg.blacklist ?? []) {
+    if (globMatch(g, canonical)) {
+      recordDenial(agent, call, `blacklisted command ${canonical}`);
+      call.preResolved = {
+        answer: `blocked: command is blacklisted`,
+        error: true,
+        errorMessage: "command blacklist",
+      };
+      return;
+    }
+  }
+
+  // 2) COMPOUND SAFETY — only an EXACT canonical approval passes silently.
+  if (isCompoundCommand(canonical)) {
+    const exact = approvalsOf(agent).some(
+      (a) =>
+        (a.expiresAt === undefined || a.expiresAt > Date.now()) &&
+        (a.tool === undefined || a.tool === call.name) &&
+        (a.cmd === undefined || a.cmd === canonical),
+    );
+    if (exact) return;
+    classicAsk(agent, call, {
+      title: `Run compound command?`,
+      detail: { command: canonical, tool: call.name },
+    });
+    return;
+  }
+
+  // 3) Simple command — a session approval covering the canonical form passes.
+  if (findApproval(agent, { tool: call.name, cmd: canonical })) return;
+
+  // 4) Default posture: allow (simple commands are the boring case).
 };
 
 // ============================================================================

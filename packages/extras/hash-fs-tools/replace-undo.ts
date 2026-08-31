@@ -97,6 +97,9 @@ export function createUndoTool() {
   return Tool.define({
     name: "undo_last_replace",
     description: `${loadP("./prompts/undo-last-replace.md")}\n\n${loadGuide("./prompts/undo-last-replace-guidelines.md").join("\n")}`,
+    promptSnippet: loadP("./prompts/undo-last-replace-snippet.md"),
+    promptGuidelines: loadGuide("./prompts/undo-last-replace-guidelines.md"),
+    executionMode: "sequential",
     inputSchema: undoSchema,
     async execute(params, agent) {
       const path = (params as { path: string }).path;
