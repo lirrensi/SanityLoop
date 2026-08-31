@@ -251,9 +251,9 @@ test("END-TO-END: the sub tool works inside a REAL parent loop as a plain tool",
         ],
         tools: [subTool],
     });
-    seedUserMessage(parent, "consult the researcher then finish");
+seedUserMessage(parent, "consult the researcher then finish");
 
-    void parent.run();
+    void parent.run(); // pre-seeded — run() sees the message as owed work immediately
     await awaitLanded(parent);
 
     const toolResult = parent.messages.find((m) => m.type === "toolResult") as
@@ -402,7 +402,7 @@ build: () => {
         ],
     });
     parent.install(mgr);
-    void parent.run();
+    void parent.run({ startState: "idle" });
 
     await mgr.tools["spawn"].execute({ sub: "gated", text: "dangerous thing", background: true }, {} as never);
     await waitUntil(() => parent.pendingAwaits.some((w) => w.type === "subagents/pending"), {
@@ -464,7 +464,7 @@ build: () => {
         ],
     });
     parent.install(mgr);
-    void parent.run();
+    void parent.run({ startState: "idle" });
 
     await mgr.tools["spawn"].execute({ sub: "gated", text: "x", background: true }, {} as never);
     await waitUntil(() => {
@@ -603,7 +603,7 @@ test("manager: ORCHESTRATE — ask surfaces to the host, top loop NOT blocked, r
         ],
     });
     parent.install(mgr);
-    void parent.run();
+    void parent.run({ startState: "idle" });
 
     await mgr.tools["spawn"].execute({ sub: "gated", text: "x", background: true }, {} as never);
     await waitUntil(() => asks.length > 0, { what: "ask surfaced to orchestrator" });

@@ -52,4 +52,4 @@ agent.addFilter({
 	},
 });
 
-agent.run();
+agent.run({ startState: "idle" });

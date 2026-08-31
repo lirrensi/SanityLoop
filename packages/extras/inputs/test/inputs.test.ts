@@ -55,7 +55,7 @@ test("install registers the capability + declared inputs", () => {
 
 test("REGRESSION GUARD: followup becomes a USER MESSAGE and starts a turn", async () => {
     const { agent } = inputAgent([() => assistantTurn("the answer")]);
-    agent.run(); // the eternal heartbeat — signals need a ticking driver to be noticed
+    agent.run({ startState: "idle" }); // born-landed — signals need a ticking driver to be noticed
     agent.input({ type: "input_followup", text: "hello cutie" });
     await awaitIdle(agent);
 
@@ -70,7 +70,7 @@ test("REGRESSION GUARD: followup becomes a USER MESSAGE and starts a turn", asyn
     // followup creates no message (and a zero-work signal just sits — the law).
     const { agent: a2 } = inputAgent([() => assistantTurn("x")]);
     seed(a2, "real work");
-    a2.run();
+    a2.run({ startState: "idle" });
     a2.input({ type: "input_followup", text: "ghost", store: false });
     await awaitIdle(a2);
     assert.equal(
@@ -165,7 +165,7 @@ test("abort holds everything immediately and lands terminal", async () => {
         fn: async (a) => void a.pendingAwaits.push({ type: "t/ask", id: "c9" }),
     });
     seed(agent);
-    agent.run(); // eternal heartbeat
+    agent.run({ startState: "idle" }); // eternal heartbeat
     agent.input({ type: "__test_kick__" });
     await awaitAwaiting(agent);
 

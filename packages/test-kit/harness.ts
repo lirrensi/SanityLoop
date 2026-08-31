@@ -56,9 +56,11 @@ export function seedUserMessage(agent: Agent, text: string): void {
  * THE canonical "start work" move under signal-only inputs: signals never
  * start loops, so tests start the eternal heartbeat explicitly (idempotent
  * via the runDriven guard) and kick the standard sync signal.
+ * startState:"idle" = born-landed: run() boots empty and arms on the first
+ * poke — the sanctioned harness ordering (seed AFTER run is legal here).
  */
 export function kick(agent: Agent): void {
-    agent.run();
+    agent.run({ startState: "idle" });
     agent.input({ type: "__test_kick__" });
 }
 
@@ -66,9 +68,10 @@ export function kick(agent: Agent): void {
  * Run the eternal heartbeat for the duration of `fn`, then teardown via the
  * abort flag (which leaves the clock ticking but silent — THE LAW).
  * `run()` never resolves; we never await it.
+ * startState:"idle" = born-landed — the callback seeds messages after boot.
  */
 export async function withDriver<T>(agent: Agent, fn: () => Promise<T>): Promise<T> {
-    agent.run();
+    agent.run({ startState: "idle" });
     try {
         return await fn();
     } finally {

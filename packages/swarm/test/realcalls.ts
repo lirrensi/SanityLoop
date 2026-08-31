@@ -52,7 +52,7 @@ agent.addFilter({
   priority: 0,
   fn: async () => { queueMicrotask(() => process.exit(0)); },
 });
-agent.run();
+agent.run({ startState: "idle" });
 `;
 
 async function main() {
