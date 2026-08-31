@@ -68,7 +68,8 @@ import type {
     DeclaredEvent,
     DeclaredInput,
 } from "./types.ts";
-import { EVENTS, PluginDependencyError, addStats, emptySessionStats } from "./types.ts";
+import { EVENTS, PER_CALL_TELEMETRY_KEYS, PluginDependencyError, addStats, emptySessionStats } from "./types.ts";
+import { validateToolArgs } from "./tool.ts";
 
 /**
  * SEALED-PHASE DEFERRAL — events in this set fire NORMALLY except while the
@@ -522,6 +523,12 @@ export class Agent implements GodObject {
      * Install a plugin: runs its install(agent) — it registers everything under
      * `${plugin.id}/` — then tracks it by id. Duplicate id throws (silent replace
      * would leave zombie registrations).
+     *
+     * FAIL-FAST BY DESIGN: if an install step throws, the error propagates and the
+     * plugin is NOT tracked. We do NOT roll back partial registrations — plugins
+     * are expected not to fail; a half-installed agent is a wiring bug that must
+     * scream, not a state we quietly unwind. Uninstall what you registered when you
+     * are the one handling your own failure.
      */
     install(plugin: Plugin): this {
         if (this.pluginMap.has(plugin.id)) {
@@ -639,7 +646,7 @@ export class Agent implements GodObject {
      * Fires toolUpdate — the per-tool definition-changed event.
      * Cache-friendly: same name, same presence, changed guts.
      */
-    updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode">>): boolean {
+    updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode" | "hidden">>): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
         Object.assign(t, updates);
@@ -662,6 +669,36 @@ export class Agent implements GodObject {
         if (!t) return false;
         t.disabled = false;
         this.fire(EVENTS.toolUpdate, { toolName: name, disabled: false }, true);
+        return true;
+    }
+
+    /** The tools the PROVIDER sees — everything except `hidden`. Hidden tools
+     * stay callable (execute runs when the name is matched) but never reach
+     * context. Model adapters build their wire list from this, NEVER from
+     * `tools` directly. */
+    visibleTools(): Tool[] {
+        return this.tools.filter((t) => !t.hidden);
+    }
+
+    /** HIDE — out of context (the wire prompt), but still callable by name.
+     * DESTRUCTIVE from the provider's view: the visible tool set changed, so
+     * this cache-busts (toolListChanged), like add/remove. */
+    hideTool(name: string): boolean {
+        const t = this.tools.find((t) => t.name === name);
+        if (!t) return false;
+        if (t.hidden) return true; // already hidden — no change, no event
+        t.hidden = true;
+        this.fire(EVENTS.toolListChanged, { hidden: name }, true);
+        return true;
+    }
+
+    /** SHOW — back into context. Cache-busts (toolListChanged) when it changes. */
+    showTool(name: string): boolean {
+        const t = this.tools.find((t) => t.name === name);
+        if (!t) return false;
+        if (!t.hidden) return true; // already visible — no change, no event
+        t.hidden = false;
+        this.fire(EVENTS.toolListChanged, { shown: name }, true);
         return true;
     }
 
@@ -1399,6 +1436,25 @@ export class Agent implements GodObject {
         if (tool.disabled) {
             return { call, result: { answer: `This tool is currently disabled: ${call.name}`, error: true } };
         }
+        // THE SCHEMA WALL — arguments are validated BEFORE execution. A model
+        // that hallucinates bad args gets a structured invalid_arguments result,
+        // not a tool-specific crash. A tool-provided `validate` REPLACES the
+        // default JSON-Schema check (the tool owns its contract fully); an empty
+        // schema or a clean custom check never blocks.
+        const argErrors = tool.validate
+            ? (tool.validate(call.parameters) ?? [])
+            : validateToolArgs(tool.inputSchema, call.parameters);
+        if (argErrors.length > 0) {
+            return {
+                call,
+                result: {
+                    answer: `Invalid arguments for ${call.name}: ${argErrors.join("; ")}`,
+                    error: true,
+                    errorMessage: "invalid_arguments",
+                    stored: { errors: argErrors },
+                },
+            };
+        }
         this.fire(EVENTS.toolStart, { call, tool }, false, true, callMsg);
         try {
             const raw = await tool.execute(call.parameters, this);
@@ -1472,6 +1528,12 @@ export class Agent implements GodObject {
             totals.contextUsage = Math.min(1, latestInput / maxContext);
         }
         this.stats = totals;
+        // Per-call telemetry (tps/latency/timing): LATEST CALL WINS — addStats
+        // never sums these, so overlay the freshest measurement onto the totals.
+        for (const k of PER_CALL_TELEMETRY_KEYS) {
+            const v = stats[k];
+            if (v !== undefined) (totals as Record<string, unknown>)[k] = v;
+        }
         // COMPREHENSIVE payload: per-call + message + totals + delta + context. Observers get everything they need.
         this.fire(EVENTS.usage, { stats, message: last, totals, delta: stats, maxContext, contextUsage: totals.contextUsage }, true);
     }
@@ -1548,8 +1610,8 @@ export class Agent implements GodObject {
                     return this.patchRemover(t, recv, prop as "splice" | "pop" | "shift");
                 }
                 const value = Reflect.get(t, prop, recv);
-                if (value !== null && typeof value === "object") {
-                    return this.observe(value as object, this.childPath(path, prop));
+                if (value !== null && typeof value === "object" && this.isProxyable(value)) {
+                    return this.observe(value, this.childPath(path, prop));
                 }
                 return value;
             },
@@ -1573,6 +1635,18 @@ export class Agent implements GodObject {
 
     private childPath(path: string, prop: string | symbol): string {
         return path ? `${path}.${String(prop)}` : String(prop);
+    }
+
+    /** Should this object be wrapped in the observer Proxy? ONLY plain objects
+     * and arrays. Everything else — Map, Set, Date, RegExp, Promise, Buffer,
+     * streams, and class instances with `#private` fields — is returned RAW.
+     * Proxying exotic types breaks method `this` semantics ("incompatible
+     * receiver") and private-field access with obscure TypeErrors. Keep
+     * `state`/`transient` JSON-shaped and this never bites. */
+    private isProxyable(value: object): boolean {
+        if (Array.isArray(value)) return true;
+        const proto = Object.getPrototypeOf(value);
+        return proto === Object.prototype || proto === null;
     }
 
     /**

@@ -503,7 +503,11 @@ export interface GodObject extends Session {
   enableFilter(event: string, id: string): boolean;
   addTool(tool: Tool): this;
   removeTool(name: string): boolean;
-  updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode">>): boolean;
+  updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode" | "hidden">>): boolean;
+  /** The tools the PROVIDER sees — everything except `hidden`. Hidden tools stay
+   * callable (execute runs) but never reach context. Model adapters MUST build
+   * their wire list from this, never from `tools` directly. */
+  visibleTools(): Tool[];
   model: ModelContract;
   /** The loop hands this to the model so it can emit stream events. */
   streamSink?: StreamSink;
@@ -712,6 +716,21 @@ export function emptySessionStats(): Stats {
 	return { ...emptyStats() };
 }
 /**
+ * Per-call telemetry keys that must NEVER be summed across calls. `tps` is a
+ * rate, `latencyMs`/`ttftMs`/`durationMs`/`stallsMs`/`routerLatencyMs` are
+ * per-call measurements. The session totals keep the LATEST call's values
+ * (agent.recordStats overlays them after the additive pass).
+ */
+export const PER_CALL_TELEMETRY_KEYS = [
+	"ttftMs",
+	"durationMs",
+	"tps",
+	"stallsMs",
+	"latencyMs",
+	"routerLatencyMs",
+] as const;
+
+/**
  * Pure accumulation: `totals` += `stats`. Numeric fields sum; per-call identity /
  * telemetry fields are NOT touched (callers handle "latest wins" themselves for those).
  * Open-index fields: numeric ones sum, everything else leaves alone.
@@ -727,9 +746,12 @@ export function addStats(totals: MessageStats, stats: MessageStats): void {
 	totals.cost.cacheRead += stats.cost.cacheRead;
 	totals.cost.cacheWrite += stats.cost.cacheWrite;
 	totals.cost.total += stats.cost.total;
-	// Sum numeric extension fields (latency totals, custom token totals, ...).
+	// Sum numeric extension fields (custom token totals, extra cost buckets, ...).
+	// Per-call telemetry (tps/latency/timing) is DELIBERATELY excluded — summing a
+	// rate or a per-call latency is nonsense; recordStats overlays the latest instead.
 	for (const k of Object.keys(stats)) {
 		if (k === "input" || k === "output" || k === "cacheRead" || k === "cacheWrite" || k === "totalTokens" || k === "cost") continue;
+		if ((PER_CALL_TELEMETRY_KEYS as readonly string[]).includes(k)) continue;
 		const v = stats[k as keyof MessageStats];
 		if (typeof v === "number") {
 			const cur = totals[k as keyof MessageStats];
@@ -831,12 +853,34 @@ export interface Tool {
   outputSchema?: JsonSchema;
   /** Optional execution mode. */
   executionMode?: "sequential" | "parallel";
+  /** One-liner for the tool menu — what this tool does at a glance (pi's promptSnippet). */
+  promptSnippet?: string;
+  /** Behavioral rules merged into the system prompt — when to use/avoid, how
+   * to call (pi's promptGuidelines). Aggregate with extras/tool-prompt. */
+  promptGuidelines?: string[];
+  /** CUSTOM VALIDATOR — when present, it REPLACES the default JSON-Schema wall.
+   * Receives the raw call params, returns human-readable problems (empty = valid).
+   * Use it for zod/ajv/hand-rolled strictness the cheap wall can't express. */
+  validate?: (params: unknown) => string[];
   /**
    * NON-DESTRUCTIVE off-switch (item 16). Stays in context, stays callable,
    * but execute is skipped → "this tool is currently disabled". Cache-clean.
    * Add/remove = destructive (changes the wire prompt). Disable = light switch.
    */
   disabled?: boolean;
+  /**
+   * VISIBILITY AXIS — independent from `disabled`. Hidden tools stay in the
+   * registry and are FULLY CALLABLE (execute runs when the name is matched),
+   * but they are EXCLUDED from the context sent to the provider
+   * (`agent.visibleTools()` is the wire list). Use with a tool_search /
+   * progressive-disclosure extra: the model discovers hidden tools by name,
+   * then calls them. The 2×2 matrix with `disabled`:
+   *   visible + enabled  = normal tool (in context, callable)
+   *   visible + disabled = in context, execute skipped (current disableTool)
+   *   hidden  + enabled  = not in context, but callable if name matched
+   *   hidden  + disabled = not in context AND execute skipped (dormant)
+   */
+  hidden?: boolean;
 
   /** The side effect. Receives params + the ENTIRE god object. Sync or async. */
   execute(params: unknown, agent: GodObject): Promise<ToolResult> | ToolResult;

@@ -217,8 +217,10 @@ export class SimpleModel {
     // means "length" finish_reason only fires on GENUINE context exhaustion
     // (compaction territory), never on an artificial cap.
     if (this.maxOutputTokens != null) body.max_tokens = this.maxOutputTokens;
-    // tools travel with the request — the model can actually call them now
-    const tools = (agent.tools ?? []).map((t) => ({
+    // tools travel with the request — the model can actually call them now.
+    // visibleTools() = the wire list: hidden tools stay callable but never
+    // reach context (progressive disclosure / tool_search).
+    const tools = agent.visibleTools().map((t) => ({
       type: "function",
       function: { name: t.name, description: t.description, parameters: t.inputSchema },
     }));

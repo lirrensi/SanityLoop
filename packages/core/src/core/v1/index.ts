@@ -8,6 +8,6 @@ export * from "./agent.ts";
 export * from "./simple-model.ts";
 // Tool is BOTH a type (from types.ts) and a value (Tool.define/factory from
 // tool.ts) — export the value explicitly to merge with the type.
-export { Tool, type ToolType, type ToolContract, type ToolDefinition } from "./tool.ts";
+export { Tool, validateToolArgs, type ToolType, type ToolContract, type ToolDefinition } from "./tool.ts";
 export * from "./agent.ts";
 export * from "./simple-model.ts";
