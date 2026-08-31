@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Agent, Tool, addStats, emptyStats, validateToolArgs } from "@sanityloop/core";
-import type { GodObject } from "@sanityloop/core";
+import type { GodObject, Plugin } from "@sanityloop/core";
 import { assistantTurn, callTo, toolCallTurn, StubModel } from "@sanityloop/test-kit/core";
 import { awaitIdle } from "@sanityloop/test-kit";
 import { seedUserMessage, kick } from "@sanityloop/test-kit/core";
@@ -419,4 +419,126 @@ test("updateTool can set hidden on the fly", () => {
     assert.deepEqual(agent.visibleTools().map((t) => t.name), []);
     assert.equal(agent.updateTool("a", { hidden: false }), true);
     assert.deepEqual(agent.visibleTools().map((t) => t.name), ["a"]);
+});
+
+// ---------------------------------------------------------------------------
+// M5 — async install: awaitable, but sync plugins stay synchronous
+// ---------------------------------------------------------------------------
+
+test("install() keeps SYNC plugins synchronous (no await needed)", () => {
+    const agent = new Agent({ model: new StubModel([]), agentId: "sync-install" });
+    let registered = false;
+    const plugin: Plugin = {
+        id: "sync-plugin",
+        install: () => {
+            registered = true;
+        },
+        uninstall() {},
+    };
+    void agent.install(plugin);
+    assert.equal(registered, true, "sync step ran synchronously");
+    assert.ok(agent.plugins.some((x) => x.id === "sync-plugin"), "plugin tracked synchronously");
+});
+
+test("install() AWAITS async plugin steps — plugin tracked only after resolve", async () => {
+    const agent = new Agent({ model: new StubModel([]), agentId: "async-install" });
+    let registered = false;
+    let settled = 0;
+    const plugin: Plugin = {
+        id: "async-plugin",
+        install: async () => {
+            await new Promise((r) => setTimeout(r, 20));
+            settled++;
+            registered = true;
+        },
+        uninstall() {},
+    };
+    const p = agent.install(plugin);
+    assert.equal(settled, 0, "async step still running — not awaited yet");
+    await p;
+    assert.equal(settled, 1);
+    assert.equal(registered, true, "registered after the async step resolved");
+    assert.ok(agent.plugins.some((x) => x.id === "async-plugin"));
+});
+
+test("install() awaits a rejected async step — plugin NOT tracked (fail-fast)", async () => {
+    const agent = new Agent({ model: new StubModel([]), agentId: "async-fail" });
+    const plugin: Plugin = {
+        id: "async-fail-plugin",
+        install: async () => {
+            await new Promise((r) => setTimeout(r, 5));
+            throw new Error("server on fire");
+        },
+        uninstall() {},
+    };
+    await assert.rejects(agent.install(plugin), /server on fire/);
+    assert.ok(!agent.plugins.some((x) => x.id === "async-fail-plugin"), "not tracked after failure");
+});
+
+// ---------------------------------------------------------------------------
+// M2 — cycleDiscarded event (the spin-guard's signal)
+// ---------------------------------------------------------------------------
+
+test("cycleDiscarded fires when a filter vetoes a cycle (endCycle)", async () => {
+    const model = new StubModel([
+        () => assistantTurn("one"),
+        () => assistantTurn("two"),
+    ]);
+    const agent = new Agent({ model, agentId: "discard-test" });
+    const seen: string[] = [];
+    agent.addFilter({
+        event: "cycleDiscarded", id: "test/see", priority: 0,
+        fn: async () => void seen.push("discarded"),
+    });
+    let vetoes = 0;
+    agent.addFilter({
+        event: "afterProviderResponse", id: "test/veto", priority: 0,
+        fn: async (a) => {
+            if (vetoes++ === 0) a.endCycle(); // veto ONCE, then let it commit
+        },
+    });
+    seedUserMessage(agent, "go");
+    kick(agent);
+    await awaitIdle(agent);
+    assert.deepEqual(seen, ["discarded"], "exactly one discarded cycle fired");
+    assert.equal(agent.loopState, "idle");
+});
+
+// ---------------------------------------------------------------------------
+// L1 — hasWork reflects wakeRequested
+// ---------------------------------------------------------------------------
+
+test("hasWork includes wakeRequested (a wake is work)", () => {
+    const agent = new Agent({ model: new StubModel([]), agentId: "haswork-test" });
+    assert.equal(agent.hasWork, false, "empty idle agent has no work");
+    agent.wake();
+    assert.equal(agent.hasWork, true, "wakeRequested is work — the machine is about to move");
+});
+
+// ---------------------------------------------------------------------------
+// M6 — published events mutate transient in place (no full-object spread)
+// ---------------------------------------------------------------------------
+
+test("published events land as transient.currentEvent via an in-place set", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("hi")]), agentId: "transient-test" });
+    const paths: string[] = [];
+    agent.addFilter({
+        event: "patched", id: "test/patched", priority: 0,
+        fn: async (_a, e) => {
+            const p = (e as { change?: { path?: string } }).change?.path;
+            if (p) paths.push(p);
+        },
+    });
+    seedUserMessage(agent, "go");
+    kick(agent);
+    await awaitIdle(agent);
+    assert.ok(
+        paths.some((p) => p === "transient.currentEvent"),
+        "in-place set on the proxied transient fires the same patched event",
+    );
+    // the transient still holds the last published event payload
+    assert.ok(
+        agent.transient.currentEvent && typeof (agent.transient.currentEvent as { type?: string }).type === "string",
+        "transient keeps the last published event",
+    );
 });

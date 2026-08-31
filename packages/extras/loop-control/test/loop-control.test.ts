@@ -139,3 +139,33 @@ test("maxSteps abort=true HARD-stops: the turn dies (aborted), no silent resume"
     });
     assert.deepEqual(executed, ["a", "b"], "aborted after the second tool — never reached c");
 });
+
+test("spinGuard: consecutive DISCARDED cycles trip the guard (stuck veto filter)", async () => {
+    const { agent, seedAndKick } = makeAgent(
+        [
+            () => assistantTurn("1"),
+            () => assistantTurn("2"),
+            () => assistantTurn("3"),
+            () => assistantTurn("4"),
+        ],
+        { spinGuard: { enabled: true, threshold: 3, abort: true, message: "[spin] cycles discarded without committing." } },
+    );
+    // a veto filter discards EVERY cycle — exactly the stuck-filter scenario.
+    // gentle stop() can't win against a filter that vetoes forever, so the
+    // guard's honest reaction is the hard abort.
+    agent.addFilter({
+        event: "afterProviderResponse", id: "test/veto", priority: 0,
+        fn: async (a) => a.endCycle(),
+    });
+    await withDriver(agent, async () => {
+        seedAndKick();
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            if (agent.loopState === "aborted") break;
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.equal(agent.loopState, "aborted", "hard stop — stuck filter frozen, no 100Hz spin");
+    });
+    const st = agent.state.loopControl as { lastAction?: string } | undefined;
+    assert.equal(st?.lastAction, "spin-guard", "spin guard recorded");
+});

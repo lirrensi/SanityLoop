@@ -1,5 +1,5 @@
 // ============================================================================
-// tests/core/events.test.ts — THE 38-event contract (ground truth: types.ts).
+// tests/core/events.test.ts - THE 39-event contract (ground truth: types.ts).
 // ============================================================================
 
 import { test } from "node:test";
@@ -15,23 +15,23 @@ const StubModel = () => ({
     },
 });
 
-test("EVENTS registry has EXACTLY 38 events", () => {
+test("EVENTS registry has EXACTLY 39 events", () => {
     const keys = Object.keys(EVENTS);
-    assert.equal(keys.length, 38, `expected 38 events, got ${keys.length}: ${keys.join(",")}`);
+    assert.equal(keys.length, 39, `expected 39 events, got ${keys.length}: ${keys.join(",")}`);
 });
 
 test("every EVENTS value is unique and self-named (value === key)", () => {
     const values = Object.values(EVENTS);
-    assert.equal(new Set(values).size, 38, "event id strings must be unique");
+    assert.equal(new Set(values).size, 39, "event id strings must be unique");
     for (const [k, v] of Object.entries(EVENTS)) assert.equal(v, k, `EVENTS.${k} should equal its own name`);
 });
 
 test("spot-check: every documented event name exists", () => {
     const expected = [
-        // loop lifecycle (14)
+        // loop lifecycle (15)
         "beforeAgentStart", "agentStart", "agentEnd", "agentSettled", "turnStart",
-        "cycleEnd", "turnEnd", "beforeStop", "stop", "beforeAbort", "abort",
-        "beforeRunEnd", "error", "handlerError",
+        "cycleEnd", "cycleDiscarded", "turnEnd", "beforeStop", "stop", "beforeAbort",
+        "abort", "beforeRunEnd", "error", "handlerError",
         // input (2)
         "inputReceived", "inputProcessed",
         // messages (5)
@@ -49,7 +49,7 @@ test("spot-check: every documented event name exists", () => {
         assert.ok(name in EVENTS, `missing documented event: ${name}`);
         assert.equal(typeof EVENTS[name as keyof typeof EVENTS], "string");
     }
-    assert.equal(expected.length, 38, "doc list itself must be complete");
+    assert.equal(expected.length, 39, "doc list itself must be complete");
 });
 
 test("the blocking walls exist: beforeTool / inputReceived / beforeAgentStart are declared events", () => {
@@ -66,7 +66,7 @@ test("the blocking walls exist: beforeTool / inputReceived / beforeAgentStart ar
     }
 });
 
-test("all 38 core events come PRE-DECLARED on a fresh agent (discovery without imports)", () => {
+test("all 39 core events come PRE-DECLARED on a fresh agent (discovery without imports)", () => {
     const agent = new Agent({ model: StubModel() as never });
     const declared = agent.listDeclaredEvents().map((d) => d.id).sort();
     const builtins = Object.values(EVENTS).sort();

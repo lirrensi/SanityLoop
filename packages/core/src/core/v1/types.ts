@@ -403,7 +403,7 @@ export interface Profile {
 // under `${plugin.id}/` (the id IS the namespace). uninstall() is REQUIRED —
 // a plugin that can't leave cleanly isn't a plugin. No new mechanism: plugins
 // are just addFilter/addTool with a lifecycle wrapper.
-export type InstallStep = (agent: GodObject) => void;
+export type InstallStep = (agent: GodObject) => void | Promise<void>;
 
 /**
  * The install surface. A single function (classic) OR a record of named steps
@@ -421,7 +421,14 @@ export interface Plugin {
   id: string;
   /** Universal ids this plugin NEEDS installed first — checked before install(). */
   requires?: string[];
-  /** Register everything: filters, tools, state keys. Runs once. Sync. */
+  /**
+   * Register everything: filters, tools, state keys. Runs once.
+   * SYNC BY PREFERENCE — do async setup (servers, connections, remote config)
+   * in a FACTORY that returns the plugin; install() then only wires tools that
+   * close over the running resource. A step may return a Promise (install()
+   * awaits it), but that is a BAD PATTERN — see agent.install for the factory
+   * idiom.
+   */
   install: InstallSpec;
   /** REQUIRED — remove everything install added (by prefix). */
   uninstall(agent: GodObject): void;
@@ -515,7 +522,7 @@ export interface GodObject extends Session {
   abortSignal?: AbortSignal;
 
   // ---- plugins (named batches of registrations, observable) ----
-  install(plugin: Plugin): this;
+  install(plugin: Plugin): Promise<this>;
   uninstall(pluginId: string): boolean;
   readonly plugins: Plugin[];
 
@@ -619,6 +626,12 @@ export interface GodObject extends Session {
    * (or returns a NEW one), returns it. NO patches fire — the diff is
    * swallowed; NO tape. ONE `merged` event announces it; listeners re-read
    * the object on it. Universal: any key, any count, no field lists.
+   *
+   * GOTCHA: merge() re-wraps the container in a FRESH Proxy. NEVER cache a
+   * reference into `state`/`messages`/`transient` (e.g. `const st =
+   * agent.state`) across a merge — the cached ref points at the OLD container
+   * and silently goes stale (patches stop, data is orphaned). Hold KEYS, not
+   * the container, and re-read through the agent on `merged`.
    */
   merge(fn: (data: SessionData) => SessionData): void;
 }
@@ -947,11 +960,11 @@ export interface SessionData {
 }
 
 // ============================================================================
-// THE 38 CORE EVENTS (constants — loop-emitted, guaranteed, versioned)
+// THE 39 CORE EVENTS (constants — loop-emitted, guaranteed, versioned)
 // ============================================================================
 
 export const EVENTS = {
-  // ---- loop lifecycle (14) ----
+  // ---- loop lifecycle (15) ----
   beforeAgentStart: "beforeAgentStart",
   agentStart: "agentStart",
   agentEnd: "agentEnd",
@@ -962,6 +975,10 @@ export const EVENTS = {
   // one cycle = one model round-trip; cycleEnd fires after each completed
   // cycle (assistant response committed, or tool batch committed).
   cycleEnd: "cycleEnd",
+  // a cycle was DISCARDED without committing anything (endCycle veto, or a
+  // stop mid-cycle). Consecutive discards = a stuck filter — loop-control's
+  // spin-guard counts these.
+  cycleDiscarded: "cycleDiscarded",
   turnEnd: "turnEnd",
   beforeStop: "beforeStop",
   stop: "stop",

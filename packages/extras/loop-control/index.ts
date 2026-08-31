@@ -129,6 +129,22 @@ export interface MaxConsecutiveToolsOptions {
 	message?: string;
 }
 
+export interface SpinGuardOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Consecutive DISCARDED cycles (a cycle that committed NOTHING — e.g. a
+	 * filter calls endCycle() every time) before it trips. Default 5. Timers /
+	 * watchers that COMMIT results never trip this — a committed cycle fires
+	 * cycleEnd and resets the counter. */
+	threshold?: number;
+	/** "nudge" (push a message, reset, keep going) or "stop". Default "nudge". */
+	reaction?: "nudge" | "stop";
+	/** TRUE = hard stop via abort. Default false. */
+	abort?: boolean;
+	/** The pushed message on nudge/stop. */
+	message?: string;
+}
+
 export interface LoopControlOptions {
 	doomLoop?: DoomLoopOptions;
 	maxTurns?: MaxTurnsOptions;
@@ -136,6 +152,10 @@ export interface LoopControlOptions {
 	maxSteps?: MaxStepsOptions;
 	/** Consecutive-tool guard — the model keeps calling tools without answering. */
 	maxConsecutiveTools?: MaxConsecutiveToolsOptions;
+	/** Spin guard — a filter that discards cycle after cycle (committing
+	 * nothing) means the loop is stuck at 100Hz. Counts consecutive
+	 * `cycleDiscarded` events; resets on any committed cycle. */
+	spinGuard?: SpinGuardOptions;
 	/** Where loop-control activity lives in session state. Default "loopControl". */
 	stateKey?: string;
 }
@@ -179,6 +199,15 @@ const DEFAULT_MAX_CONSECUTIVE_TOOLS: Required<MaxConsecutiveToolsOptions> = {
 	abort: false,
 	message:
 		"**[loop-control]** You have made many consecutive tool calls without producing a final answer. Produce your final answer now, or ask a clarifying question.",
+};
+
+const DEFAULT_SPIN_GUARD: Required<SpinGuardOptions> = {
+	enabled: false,
+	threshold: 5,
+	reaction: "nudge",
+	abort: false,
+	message:
+		"**[loop-control]** The loop discarded several cycles without committing anything — a filter may be stuck in a veto loop. Investigate before continuing.",
 };
 
 // ----------------------------------------------------------------------------
@@ -261,6 +290,7 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	const maxTurns = { ...DEFAULT_MAX_TURNS, ...(opts.maxTurns ?? {}) };
 	const maxSteps = { ...DEFAULT_MAX_STEPS, ...(opts.maxSteps ?? {}) };
 	const maxConsTools = { ...DEFAULT_MAX_CONSECUTIVE_TOOLS, ...(opts.maxConsecutiveTools ?? {}) };
+	const spinGuard = { ...DEFAULT_SPIN_GUARD, ...(opts.spinGuard ?? {}) };
 
 	// the hot counters — plugin closure (fast, no patch storm)
 	const counts = new Map<string, number>(); // key → consecutive error count
@@ -275,6 +305,8 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	let announcedLastStep = false;
 	let stoppedStepBudget = false;
 	let consecutiveTools = 0;
+	// spin-guard counter — consecutive discarded cycles
+	let spinCount = 0;
 
 	/** Decide what to do for a key that crossed the doom threshold this cycle. */
 	function handleDoom(
@@ -518,6 +550,38 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 				},
 			});
 
+			// ---- SPIN-GUARD: consecutive DISCARDED cycles (a stuck veto filter) ----
+			agent.addFilter({
+				event: EVENTS.cycleDiscarded,
+				id: "loop-control/spin/count",
+				priority: 100,
+				fn: async (agent) => {
+					if (!spinGuard.enabled) return;
+					spinCount++;
+					if (spinCount >= spinGuard.threshold) {
+						spinCount = 0; // reset after reacting — fresh chances
+						pushUser(agent, spinGuard.message);
+						record(agent, stateKey, {
+							lastAction: "spin-guard",
+							count: spinGuard.threshold,
+							at: Date.now(),
+						});
+						if (spinGuard.abort) agent.abort(spinGuard.message);
+						else if (spinGuard.reaction === "stop") agent.stop();
+					}
+				},
+			});
+
+			// ---- SPIN-GUARD reset: ANY committed cycle is progress (timers included) ----
+			agent.addFilter({
+				event: EVENTS.cycleEnd,
+				id: "loop-control/spin/reset",
+				priority: 100,
+				fn: async () => {
+					spinCount = 0;
+				},
+			});
+
 			// ---- DOOM-LOOP "ask": renderer on the park (optional) ----
 			if (doom.reaction === "ask" && doom.ask) {
 				const ask = doom.ask;
@@ -616,6 +680,7 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 			stoppedStepBudget = false;
 			stepCount = 0;
 			consecutiveTools = 0;
+			spinCount = 0;
 			removeFiltersByPrefix(agent, "loop-control/");
 			agent.removeDeclaredCapability("loop-control");
 			delete agent.state[stateKey];

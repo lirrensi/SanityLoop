@@ -67,6 +67,7 @@ import type {
     DeclaredCapability,
     DeclaredEvent,
     DeclaredInput,
+    InstallStep,
 } from "./types.ts";
 import { EVENTS, PER_CALL_TELEMETRY_KEYS, PluginDependencyError, addStats, emptySessionStats } from "./types.ts";
 import { validateToolArgs } from "./tool.ts";
@@ -529,26 +530,50 @@ export class Agent implements GodObject {
      * are expected not to fail; a half-installed agent is a wiring bug that must
      * scream, not a state we quietly unwind. Uninstall what you registered when you
      * are the one handling your own failure.
+     *
+     * ASYNC-AWARE: returns Promise<this>. SYNC steps run synchronously — a plugin
+     * that just registers is fully installed by the time install() returns (the
+     * promise is a resolved wrapper; `void agent.install(x)` is fine). A step that
+     * returns a PROMISE (spinning up a server, connecting, loading remote config)
+     * is AWAITED — the plugin is tracked only after it resolves.
+     *
+     * FACTORY PATTERN (the GOOD way) — do async setup BEFORE install, in a factory
+     * that returns a plugin. Start the server / open the connection / load the
+     * config in the factory, then install a SYNC plugin whose tools close over the
+     * running resource:
+     *
+     *   const plugin = await createServerPlugin(); // async work lives HERE
+     *   agent.install(plugin);                     // install stays sync
+     *
+     * Awaiting install() is technically possible but a BAD PATTERN: it couples
+     * install order to readiness, makes boot part of wiring, and blocks the
+     * install site. Prefer the factory. install() supports async steps only so
+     * that a plugin that MUST boot itself still works — not as the default shape.
      */
-    install(plugin: Plugin): this {
+    install(plugin: Plugin): Promise<this> {
         if (this.pluginMap.has(plugin.id)) {
             throw new Error(`[sanity] plugin '${plugin.id}' already installed`);
         }
         this.assertInstallable(plugin);
         const spec = plugin.install;
-        if (typeof spec === "function") {
-            spec.call(plugin, this);
-        } else {
-            // Modular form: run each named step sequentially, as if one body.
-            // Stable key order = insertion order. Null/undefined steps are
-            // skipped — a subclass can null a key to drop a base step.
-            for (const key of Object.keys(spec)) {
-                const step = spec[key];
-                if (typeof step === "function") step.call(plugin, this);
+        const steps: InstallStep[] =
+            typeof spec === "function"
+                ? [spec]
+                : Object.keys(spec)
+                      .filter((k) => typeof spec[k] === "function")
+                      .map((k) => spec[k] as InstallStep);
+        const run = (i: number): Promise<this> => {
+            while (i < steps.length) {
+                const result = steps[i]!.call(plugin, this);
+                if (result && typeof (result as Promise<void>).then === "function") {
+                    return (result as Promise<void>).then(() => run(i + 1));
+                }
+                i++; // sync step — keep going synchronously
             }
-        }
-        this.pluginMap.set(plugin.id, plugin);
-        return this;
+            this.pluginMap.set(plugin.id, plugin);
+            return Promise.resolve(this);
+        };
+        return run(0);
     }
 
     /** Uninstall a plugin by id: its uninstall() removes everything it registered. */
@@ -1117,7 +1142,7 @@ export class Agent implements GodObject {
             // toolExec → fall through to gates; the cursor knows where we were
         }
         if (this.stopRequested || this.pauseRequested) { await this.land(); return "landed"; }
-        if (this.cycleState.ended) this.discardCycle();
+        if (this.cycleState.ended) await this.discardCycle();
 
         const last = this.messages.at(-1);
         // THE OUTSTANDING BATCH — the last toolCall whose calls aren't ALL
@@ -1226,7 +1251,7 @@ export class Agent implements GodObject {
     protected async commitProviderResponse(result: TurnResult): Promise<void> {
         if (this.isTerminal()) return; // an abort landed while the response chains ran
         this.runState = "committing";
-        if (this.cycleState.ended) { this.discardCycle(); return; } // discard, run again
+        if (this.cycleState.ended) { await this.discardCycle(); return; } // discard, run again
         // COMMIT #1: stamp our commit time BEFORE recording stats — this is when WE add it to history.
         const message = result.message;
         message.committedAt = Date.now();
@@ -1240,7 +1265,7 @@ export class Agent implements GodObject {
         this.fire(EVENTS.beforeMessageAdd, { turn: message }, false, true, message);
         // add-lifecycle filters decide the next move — awaited, inline
         await this.bus.run(EVENTS.messageAdded, { turn: message });
-        if (this.stopRequested || this.pauseRequested) { this.discardCycle(); return; }
+        if (this.stopRequested || this.pauseRequested) { await this.discardCycle(); return; }
         if (message.type === "toolCall") {
             this.phase = "GATING"; // gates next — fresh cursor, whole batch gets gated
             this.gateCursor = 0;
@@ -1267,8 +1292,8 @@ export class Agent implements GodObject {
         }
         if (this.isTerminal()) return "landed"; // an abort landed mid-batch
         this.runState = "evaluating";
-        if (this.cycleState.ended) { this.discardCycle(); return "continue"; }
-        if (this.stopRequested || this.pauseRequested) { this.discardCycle(); return "continue"; }
+        if (this.cycleState.ended) { await this.discardCycle(); return "continue"; }
+        if (this.stopRequested || this.pauseRequested) { await this.discardCycle(); return "continue"; }
         // COMMIT #2 lives inside executeToolBatch; here the cycle ends at cycleEnd.
         await this.bus.run(EVENTS.cycleEnd, { turn: this.messages.at(-1) });
         this.closeCycle();
@@ -1347,10 +1372,14 @@ export class Agent implements GodObject {
         this.drainLane(); // SEAM — transcript whole again, held announcements speak
     }
 
-    /** A filter called endCycle() — close the cycle and reset the flag. */
-    protected discardCycle(): void {
+    /** A filter called endCycle() — close the cycle and reset the flag.
+ * Dispatches cycleDiscarded AWAITED (registry lane — the cycle queues are
+ * already cleared) so a guard filter's stop/abort lands BEFORE the worker's
+ * next tick. Fire-and-forget here would let a stuck loop race ahead. */
+    protected async discardCycle(): Promise<void> {
         this.closeCycle();
         this.cycleState = { ended: false };
+        await this.bus.runFromRegistry(EVENTS.cycleDiscarded, { type: EVENTS.cycleDiscarded });
     }
 
     // ---- derivation helpers ----
@@ -1363,7 +1392,12 @@ export class Agent implements GodObject {
 
     /** Observable: is there anything for the machine to do? */
     get hasWork(): boolean {
-        return this.owedResponse() || this.pendingSync.length > 0 || this.pendingAwaits.length > 0;
+        return (
+            this.owedResponse() ||
+            this.pendingSync.length > 0 ||
+            this.pendingAwaits.length > 0 ||
+            this.wakeRequested
+        );
     }
 
     /** Observable: what's in flight right now? */
@@ -1781,8 +1815,10 @@ export class Agent implements GodObject {
     ): void {
         if (turn !== undefined) this.currentTurn = turn;
         if (publish) {
-            // published → lands in the OBSERVED transient (KeyChange → patched → live visibility)
-            this.transient = { ...this.transient, currentEvent: { type: event, ...payload } };
+            // published → lands in the OBSERVED transient (KeyChange → patched → live visibility).
+            // IN-PLACE set on the proxied transient (not a full-object spread) — same
+            // `patched` event, zero copy churn on every published event.
+            this.transient.currentEvent = { type: event, ...payload };
         }
         const argPayload = { type: event, ...payload } as EventPayload;
         if (fromRegistry) this.bus.runFromRegistry(event, argPayload);
@@ -1806,8 +1842,8 @@ export class Agent implements GodObject {
         if (turn !== undefined) this.currentTurn = turn;
         const argPayload = { type: event, ...payload } as EventPayload;
         if (publish) {
-            // published → lands in the OBSERVED transient (KeyChange → patched → live visibility)
-            this.transient = { ...this.transient, currentEvent: { type: event, ...payload } };
+            // in-place set on the proxied transient — no full-object spread
+            this.transient.currentEvent = { type: event, ...payload };
         }
         // SEALED-PHASE DEFERRAL — mid-batch transcript hazards park in THE LANE
         // (held for the seam). The SEALED_DEFER_EVENTS whitelist is the safety:
@@ -1835,6 +1871,12 @@ export class Agent implements GodObject {
      * sync-apply). `fn` receives the RAW container (unwrapped — mutations are
      * SILENT, NO `patched`, NO tape). ONE `merged` event announces it; listeners
      * re-read the object on it.
+     *
+     * GOTCHA: merge() re-wraps the container in a FRESH Proxy. NEVER cache a
+     * reference into `state`/`messages`/`transient` across a merge (e.g.
+     * `const st = agent.state` in a plugin closure) — it goes stale and its
+     * patches vanish. Hold KEYS, not the container; re-read through the agent
+     * on `merged`.
      */
     merge(fn: (data: SessionData) => SessionData): void {
         const raw = (this.rawByProxy.get(this.data) ?? this.data) as SessionData;

@@ -57,9 +57,9 @@ test("declared inputs register / duplicate throws", () => {
     assert.equal(agent.removeDeclaredInput("my/ask"), true);
 });
 
-test("the 38 built-in events are pre-declared; built-ins refuse deletion; custom events manage freely", () => {
+test("the 39 built-in events are pre-declared; built-ins refuse deletion; custom events manage freely", () => {
     const agent = newAgent();
-    assert.equal(agent.listDeclaredEvents().length, 38);
+    assert.equal(agent.listDeclaredEvents().length, 39);
 
     // core events cannot be removed
     for (const builtin of Object.values(EVENTS)) {
