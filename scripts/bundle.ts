@@ -161,7 +161,10 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 	for (const b of bricks) exports[`./${b.short}`] = { default: `./${b.short}/${b.entry.replace(/^\.\//, "")}` };
 	exports["."] = { default: "./index.ts" };
 	const corePackage = json(join(ROOT, "packages", "core", "package.json"));
-	const extrasVersion = readFileSync(join(ROOT, "packages", "extras", "VERSION"), "utf8").trim();
+	// LOCKSTEP — extras ships at core's version. ONE version, ONE tag. To
+	// release: bump packages/core/package.json, commit, `git tag vX.Y.Z`,
+	// push the tag. The publish workflow validates the tag against core.
+	const extrasVersion = String(corePackage.version);
 	if (!/^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$/.test(extrasVersion)) {
 		throw new Error(`invalid extras version: ${extrasVersion}`);
 	}

@@ -19,7 +19,9 @@
         "package:bun": "bun run scripts/bun-package.ts templates/repl-agent.ts dist/repl-agent",
         "bundle": "node --experimental-strip-types --experimental-transform-types scripts/bundle.ts",
         "publish:dry": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run",
-        "publish": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts"
+        "publish": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts",
+        "release": "node --experimental-strip-types --experimental-transform-types scripts/release.ts",
+        "release:dry": "node --experimental-strip-types --experimental-transform-types scripts/release.ts --dry-run"
     },
     "devDependencies": {
         "@types/node": "^26.4.0",
