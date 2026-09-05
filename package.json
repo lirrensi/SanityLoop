@@ -20,8 +20,9 @@
         "bundle": "node --experimental-strip-types --experimental-transform-types scripts/bundle.ts",
         "publish:dry": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run",
         "publish": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts",
-        "release": "node --experimental-strip-types --experimental-transform-types scripts/release.ts",
-        "release:dry": "node --experimental-strip-types --experimental-transform-types scripts/release.ts --dry-run"
+        "release:core": "node --experimental-strip-types --experimental-transform-types scripts/release.ts core",
+        "release:extras": "node --experimental-strip-types --experimental-transform-types scripts/release.ts extras",
+        "release:dry": "node --experimental-strip-types --experimental-transform-types scripts/release.ts core --dry-run && node --experimental-strip-types --experimental-transform-types scripts/release.ts extras --dry-run"
     },
     "devDependencies": {
         "@types/node": "^26.4.0",

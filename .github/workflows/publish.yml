@@ -3,7 +3,8 @@ name: Publish packages
 on:
   push:
     tags:
-      - "v*"
+      - "core-v*"
+      - "extras-v*"
   workflow_dispatch:
 
 # npm trusted publishing uses GitHub's short-lived OIDC identity.
@@ -17,7 +18,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Verify and publish core + extras
+    name: Verify and publish (core / extras — per tag)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -37,31 +38,56 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Resolve the release version
+      - name: Resolve the release
         id: release
         shell: bash
         run: |
-          # ONE source of truth: packages/core/package.json — extras ships at the
-          # same version (lockstep). The `vX.Y.Z` tag is the TRIGGER and the
-          # confirmation, not a second version. Bump core, commit, tag, push.
-          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json','utf8')).version")"
+          # TWO INDEPENDENT TRAINS — the tag names the package AND the version:
+          #   core-vX.Y.Z   -> publish @sanityloop/core only, at its own version
+          #   extras-vX.Y.Z -> publish @sanityloop/extras only, at its own version
+          # Each tag is validated against THAT package's version file. Extras
+          # declares a core RANGE (packages/extras/shelf.json), never a lockstep
+          # copy — bump core only when core changed.
+          REF="${GITHUB_REF_NAME}"
+          case "$REF" in
+            core-v*)
+              PKG=core
+              ONLY=core
+              VERSION="$(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json','utf8')).version")"
+              TAG_VERSION="${REF#core-v}"
+              ;;
+            extras-v*)
+              PKG=extras
+              ONLY=extras
+              VERSION="$(node -p "JSON.parse(require('fs').readFileSync('packages/extras/shelf.json','utf8')).version")"
+              TAG_VERSION="${REF#extras-v}"
+              ;;
+            *)
+              echo "::error::tag must be core-vX.Y.Z or extras-vX.Y.Z, got: $REF"
+              exit 1
+              ;;
+          esac
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
             if [ "$TAG_VERSION" != "$VERSION" ]; then
-              echo "::error::tag $GITHUB_REF_NAME does not match core version $VERSION. Bump packages/core/package.json, commit, then re-tag."
+              echo "::error::tag $REF does not match $PKG version $VERSION. Bump packages/$PKG, commit, then re-tag."
               exit 1
             fi
-            echo "Publishing from tag $GITHUB_REF_NAME (core + extras @ $VERSION)"
+            echo "Publishing @sanityloop/$PKG @ $VERSION (from tag $REF)"
           else
-            echo "Manual dispatch — publishing core + extras @ $VERSION"
+            echo "Manual dispatch — publishing core @ $(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json','utf8')).version") + extras @ $(node -p "JSON.parse(require('fs').readFileSync('packages/extras/shelf.json','utf8')).version")"
+            ONLY="core,extras"
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "pkg=$PKG"
+            echo "version=$VERSION"
+            echo "only=$ONLY"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify the publish artifacts
-        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run
+        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts --dry-run --only "${{ steps.release.outputs.only }}"
 
-      - name: Publish core and extras
-        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts
+      - name: Publish
+        run: node --experimental-strip-types --experimental-transform-types scripts/publish.ts --only "${{ steps.release.outputs.only }}"
         env:
           # Bootstrap with an npm granular automation token that has publish
           # access and bypass-2FA enabled. Store it as repository secret NPM_TOKEN.

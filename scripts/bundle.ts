@@ -160,14 +160,22 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 	const exports: Record<string, { default: string }> = {};
 	for (const b of bricks) exports[`./${b.short}`] = { default: `./${b.short}/${b.entry.replace(/^\.\//, "")}` };
 	exports["."] = { default: "./index.ts" };
-	const corePackage = json(join(ROOT, "packages", "core", "package.json"));
-	// LOCKSTEP — extras ships at core's version. ONE version, ONE tag. To
-	// release: bump packages/core/package.json, commit, `git tag vX.Y.Z`,
-	// push the tag. The publish workflow validates the tag against core.
-	const extrasVersion = String(corePackage.version);
+	// INDEPENDENT VERSIONS — extras is NOT core's shadow. Its version and the
+	// MINIMUM core range it supports live in packages/extras/shelf.json:
+	//   { "version": "0.2.2", "core": "^0.2.0" }
+	// Bump extras when a brick changes; bump core only when core changes.
+	// Released via `npm run release:extras` / `npm run release:core`
+	// (tags extras-vX.Y.Z / core-vX.Y.Z; the publish workflow validates the
+	// tag against THAT package and publishes only it).
+	const shelf = json<{ version: string; core: string }>(
+		join(ROOT, "packages", "extras", "shelf.json"),
+	);
+	const extrasVersion = String(shelf.version ?? "");
 	if (!/^\d+\.\d+\.\d+([+-][0-9A-Za-z.-]+)?$/.test(extrasVersion)) {
-		throw new Error(`invalid extras version: ${extrasVersion}`);
+		throw new Error(`invalid extras version in shelf.json: ${extrasVersion}`);
 	}
+	const coreRange = String(shelf.core ?? "");
+	if (!coreRange) throw new Error("shelf.json: missing `core` — the minimum core range extras supports");
 	const pkg = {
 		name: "@sanityloop/extras",
 		version: extrasVersion,
@@ -179,7 +187,7 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 		},
 		type: "module",
 		exports,
-		dependencies: collectDeps(bricks),
+		dependencies: { "@sanityloop/core": coreRange, ...collectDeps(bricks) },
 		engines: { node: ">=22.6" },
 		files: ["**/*.ts", "README.md"],
 	};
