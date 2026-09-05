@@ -1,29 +1,29 @@
 {
-    "name": "@sanityloop/core",
-    "version": "0.2.2",
-    "license": "MIT",
-    "type": "module",
-    "description": "the core agent loop + SDK - zero dependencies",
-    "repository": {
-        "type": "git",
-        "url": "https://github.com/lirrensi/SanityLoop.git"
-    },
-    "exports": {
-        ".": "./src/index.ts",
-        "./v1": "./src/core/v1/index.ts",
-        "./core/v1": "./src/core/v1/index.ts"
-    },
-    "scripts": {
-        "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
-    },
-    "dependencies": {},
-    "devDependencies": {
-        "@sanityloop/test-kit": "^0.1.0"
-    },
-    "files": [
-        "src"
-    ],
-    "engines": {
-        "node": ">=22.6"
-    }
+  "name": "@sanityloop/core",
+  "version": "0.2.3",
+  "license": "MIT",
+  "type": "module",
+  "description": "the core agent loop + SDK - zero dependencies",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lirrensi/SanityLoop.git"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./v1": "./src/core/v1/index.ts",
+    "./core/v1": "./src/core/v1/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  }
 }
