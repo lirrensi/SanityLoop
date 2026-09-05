@@ -18,6 +18,8 @@ export function tmpHome(): string {
 
 export interface DaemonOpts {
 	home: string;
+	/** The daemon's declared swarm name — absent = hermit. */
+	name?: string;
 	tokens?: Partial<Record<SwarmRole, string>>;
 	port?: number;
 	templatesDir?: string;
@@ -31,6 +33,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<SwarmServer> {
 		home: opts.home,
 		addr: "127.0.0.1",
 		port: opts.port ?? 0,
+		name: opts.name,
 		tokens: opts.tokens,
 		templatesDir: opts.templatesDir,
 		manifestPath: opts.manifestPath,

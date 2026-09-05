@@ -32,6 +32,9 @@ export interface SwarmJoinOptions {
 	mode?: SwarmRole;
 	/** The daemon address. Default ws://127.0.0.1:5317. */
 	server?: string;
+	/** Where this worker lives (worker mode) / the mount point (peer/admin mode).
+	 *  A room is a "/"-path prefix; an ancestor sees its descendants. Default "global". */
+	room?: string;
 	/** Per-role token (when the daemon has tokens configured). */
 	token?: string;
 	/** Storage enabled → this session is resumable. Reported at register. */
@@ -54,6 +57,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 	const {
 		mode = "worker",
 		server = defaultServer,
+		room,
 		token,
 		persistent = false,
 		heartbeatMs = 15_000,
@@ -97,6 +101,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 			agentId: agent.agentId,
 			description: agent.description,
 			mode,
+			room,
 			persistent,
 			token,
 		});
@@ -116,6 +121,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 				attempt = 0;
 				agent.emit("swarm/welcome", {
 					type: "swarm/welcome",
+					swarm: frame.swarm,
 					registry: frame.registry,
 				});
 				return;
@@ -475,7 +481,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 
 			agent.addDeclaredCapability({
 				id: "swarm",
-				description: `swarm ${mode} @ ${server}${persistent ? " (persistent)" : ""}`,
+				description: `swarm ${mode}${room ? ` @ ${room}` : ""} @ ${server}${persistent ? " (persistent)" : ""}`,
 			});
 		},
 

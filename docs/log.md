@@ -1,4 +1,8 @@
 
+## 2026-09-05
+
+- swarm package: rooms + federation shipped. A room is a path prefix on registry entries (never an object); ONE visibility rule — an ancestor sees its descendants, 404 for the invisible; the daemon STAMPS its declared name onto every address (`--name`, optional, absent = hermit, federation refused both directions). Registry re-keyed to full addresses (`<swarm>/<room>/<sessionId>`, bare sessionIds via index, locals outrank mirrors). Federation = the daemon dials a remote as a peer and mirrors its online workers under the remote's declared name as a room subtree (`global/<mount>/...`) — state folds from the remote's own reports, offline follows TCP, authority stays home, no transit, name collisions refuse loudly. REST loses its x-ray (`?room=` / `X-Swarm-Room` mount point, same law). New: server/federate.ts; tests: rooms.test.ts (6 tests, full suite 10/10). Architecture doc: /architecture/swarm.md
+
 ## 2026-08-23
 
 - sync pass across the two-clock core rewrite: architecture/core.md rewritten for LOOP 1 (signal supervisor + literal `blocked` flag + derived `loopState`) and LOOP 2 (one step per beat); api.md/state.md/product.md/cookbook.md updated (no `runTurn`, `stopped` state, preResolved contract, crash-heal, the protected override seam); verification/strategy.md synced to the permanent 112-test suite (`npm test`) with V-BLOCK/V-CRASH-HEAL/V-SUBCLASS evidence; index rebuilt

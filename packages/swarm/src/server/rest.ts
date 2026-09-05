@@ -7,7 +7,7 @@
 //
 //   GET    /api/v1                             route index (discovery)
 //   GET    /api/v1/health                      daemon self-description
-//   GET    /api/v1/workers?status=&mode=&agentId=
+//   GET    /api/v1/workers?status=&mode=&agentId=&room=
 //   GET    /api/v1/workers/:id
 //   GET    /api/v1/workers/:id/events?limit=N  the recent-events ring
 //   GET    /api/v1/history                     every worker ever seen
@@ -18,6 +18,12 @@
 //   POST   /api/v1/workers/:id/restart         {prompt?}
 //   DELETE /api/v1/workers/:id                 kill
 //
+// ROOMS: the SAME visibility rule as every other door. The caller presents a
+// mount point — `?room=` or the `X-Swarm-Room` header (default "global" = see
+// everything). Every route filters through the same prefix check: an ancestor
+// sees its descendants; sideways and upward: invisible — and a worker you
+// can't see doesn't exist (404), can't be steered, and can't be killed.
+//
 // input/listen stay WS-only where they are about streams; input is here because
 // steering a worker is fleet management too. Auth: `Authorization: Bearer
 // <role-token>` — the token IS the role. No tokens configured (open mode) →
@@ -25,7 +31,7 @@
 // 127.0.0.1-bound by default).
 // ============================================================================
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { CONTROL_ACTIONS } from "../protocol.ts";
+import { CONTROL_ACTIONS, ROOT_ROOM, normalizeRoom } from "../protocol.ts";
 import type { ControlAction, SwarmRole } from "../protocol.ts";
 import type { FleetApi } from "./index.ts";
 
@@ -109,7 +115,7 @@ async function readObject(req: IncomingMessage): Promise<Record<string, unknown>
 
 const ROUTES = [
 	"GET    /api/v1/health",
-	"GET    /api/v1/workers?status=online|offline&mode=worker|peer|admin&agentId=",
+	"GET    /api/v1/workers?status=online|offline&mode=worker|peer|admin&agentId=&room=",
 	"POST   /api/v1/workers                      {template, sessionId?, prompt?}",
 	"GET    /api/v1/workers/:id",
 	"GET    /api/v1/workers/:id/events?limit=N",
@@ -140,6 +146,16 @@ export function handleRest(
 		return fail(res, 401, "unauthorized — bad or missing bearer token");
 	}
 
+	// ---- the mount point — the same visibility law as every other door ----
+	// `?room=` or `X-Swarm-Room`; default "global" = see everything.
+	const rawRoom = query.get("room") ?? req.headers["x-swarm-room"];
+	const mount = normalizeRoom(
+		typeof rawRoom === "string" ? rawRoom : undefined,
+	);
+	if (mount === null) {
+		return fail(res, 400, `malformed room path: ${String(rawRoom)}`);
+	}
+
 	const seg = url.pathname.slice(prefix.length).split("/").filter(Boolean);
 	const query = url.searchParams;
 	const need = (level: SwarmRole): boolean => {
@@ -162,7 +178,7 @@ export function handleRest(
 		// ---- history / templates ------------------------------------------
 		if (method === "GET" && seg[0] === "history" && seg.length === 1) {
 			if (!need("peer")) return;
-			return json(res, 200, opts.api.history());
+			return json(res, 200, opts.api.history(mount));
 		}
 		if (method === "GET" && seg[0] === "templates" && seg.length === 1) {
 			if (!need("peer")) return;
@@ -182,6 +198,7 @@ export function handleRest(
 					if (mode === "worker" || mode === "peer" || mode === "admin") filter.mode = mode;
 					const agentId = query.get("agentId");
 					if (agentId) filter.agentId = agentId;
+					filter.under = mount;
 					return json(res, 200, opts.api.list(filter));
 				}
 				if (method === "POST") {
@@ -206,12 +223,12 @@ export function handleRest(
 			if (seg.length === 2) {
 				if (method === "GET") {
 					if (!need("peer")) return;
-					const w = opts.api.get(id);
+					const w = opts.api.get(id, mount);
 					return w ? json(res, 200, w) : fail(res, 404, `unknown worker: ${id}`);
 				}
 				if (method === "DELETE") {
 					if (!need("admin")) return;
-					return json(res, 200, opts.api.kill(id));
+					return json(res, 200, opts.api.kill(id, mount));
 				}
 				return fail(res, 405, "method not allowed");
 			}
@@ -219,7 +236,11 @@ export function handleRest(
 			// sub-resources
 			if (seg[2] === "events" && seg.length === 3 && method === "GET") {
 				if (!need("peer")) return;
-				const events = opts.api.events(id, Number(query.get("limit") ?? 100) || 100);
+				const events = opts.api.events(
+					id,
+					Number(query.get("limit") ?? 100) || 100,
+					mount,
+				);
 				return events ? json(res, 200, events) : fail(res, 404, `unknown worker: ${id}`);
 			}
 			if (seg[2] === "input" && seg.length === 3 && method === "POST") {
@@ -228,7 +249,7 @@ export function handleRest(
 				if (!body) {
 					return fail(res, 400, "input must be a single JSON object with keys — passed through as-is");
 				}
-				const r = opts.api.input(id, body);
+				const r = opts.api.input(id, body, mount);
 				return r ? json(res, 200, r) : fail(res, 404, `worker not online: ${id}`);
 			}
 			if (seg[2] === "control" && seg.length === 3 && method === "POST") {
@@ -238,16 +259,18 @@ export function handleRest(
 				if (typeof action !== "string" || !CONTROL_ACTIONS.includes(action as ControlAction)) {
 					return fail(res, 400, `action must be one of: ${CONTROL_ACTIONS.join(", ")}`);
 				}
-				const r = opts.api.control(id, action as ControlAction);
+				const r = opts.api.control(id, action as ControlAction, mount);
 				return r ? json(res, 200, r) : fail(res, 404, `worker not online: ${id}`);
 			}
 			if (seg[2] === "restart" && seg.length === 3 && method === "POST") {
 				if (!need("admin")) return;
 				const body = await readObject(req);
 				if (!body) return fail(res, 400, "body must be a single JSON object with keys");
-				const r = opts.api.restart(id, {
-					prompt: typeof body.prompt === "string" ? body.prompt : undefined,
-				});
+				const r = opts.api.restart(
+					id,
+					{ prompt: typeof body.prompt === "string" ? body.prompt : undefined },
+					mount,
+				);
 				return r.ok
 					? json(res, 200, r)
 					: fail(res, 409, `not spawned by the daemon / already gone: ${id}`);

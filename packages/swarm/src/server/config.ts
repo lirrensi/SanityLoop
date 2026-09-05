@@ -26,6 +26,11 @@ export const DEFAULT_HOME = join(homedir(), ".sanity", "swarm");
 /** Everything the daemon declares about itself — written to config.json at serve. */
 export interface SwarmConfig {
 	version: typeof CONFIG_VERSION;
+	/** The swarm's declared name — stamped onto every local address
+	 *  ("<name>/<room>/<sessionId>"). Optional: an unnamed daemon is a HERMIT —
+	 *  fully functional locally, but federation is refused in both directions
+	 *  (a mount needs a name to stamp under; an unnamed daemon dials nobody). */
+	name?: string;
 	home: string;
 	addr: string;
 	/** The effective port — after bind (0 = random → the real one lands here). */

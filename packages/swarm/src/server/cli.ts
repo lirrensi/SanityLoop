@@ -4,7 +4,8 @@
 // REST routes and the frames speak — same server, same tokens, same perms.
 //
 //   swarm serve [--port N] [--addr H] [--templates DIR] [--manifest FILE]
-//              [--token admin=TOK --token peer=TOK --token worker=TOK] [--resurrect]
+//              [--name N] [--token admin=TOK --token peer=TOK --token worker=TOK]
+//              [--connect ws://B [--as ALIAS]]... [--resurrect]
 //   swarm create <template> [--session ID] [--prompt TEXT] [--server ws://...]
 //   swarm list    [--server ws://...]
 //   swarm get <sessionId>                        [--server ws://...]
@@ -31,7 +32,7 @@ import { randomUUID } from "node:crypto";
 
 const HELP = `usage:
   swarm serve [--dir HOME] [--port N] [--addr H] [--templates DIR] [--manifest FILE]
-              [--token <role>=<tok>]... [--resurrect]
+              [--name N] [--token <role>=<tok>]... [--connect ws://B [--as ALIAS]]... [--resurrect]
   swarm create <template> [--session ID] [--prompt TEXT] [--dir HOME] [--server ws://H:P]
   swarm list                                  [--dir HOME] [--server ws://H:P]
   swarm get <sessionId>                       [--dir HOME] [--server ws://H:P]
@@ -59,7 +60,10 @@ function parseArgs(argv: string[]): Args {
 			const key = a.slice(2);
 			const next = argv[i + 1];
 			if (next !== undefined && !next.startsWith("--")) {
-				flags.set(key, next);
+				// repeated keys accumulate (multiple --token / --connect / --as) —
+				// stringified list under one key, order preserved
+				const prev = flags.get(key);
+				flags.set(key, prev === undefined ? next : `${prev}\u0000${next}`);
 				i++;
 			} else {
 				flags.set(key, true);
@@ -69,6 +73,12 @@ function parseArgs(argv: string[]): Args {
 		}
 	}
 	return { flags, positionals };
+}
+
+/** All values of a (possibly repeated) flag, in declaration order. */
+function flagValues(flags: Map<string, string | true>, key: string): string[] {
+	const raw = flags.get(key);
+	return raw === undefined ? [] : String(raw).split("\u0000");
 }
 
 /** The daemon a command targets: --server wins; else the home's config.json tells us. */
@@ -161,12 +171,13 @@ const printWorkerRow = (r: {
 	status: string;
 	state?: string;
 	sessionId: string;
+	address?: string;
 	agentId: string;
 	persistent: boolean;
 	spawned: boolean;
 }): void =>
 	console.log(
-		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${r.sessionId.padEnd(24)} ${r.agentId}${r.persistent ? " [persistent]" : ""}${r.spawned ? " [spawned]" : ""}`,
+		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${(r.address ?? r.sessionId).padEnd(40)} ${r.agentId}${r.persistent ? " [persistent]" : ""}${r.spawned ? " [spawned]" : ""}`,
 	);
 
 async function main(): Promise<void> {
@@ -183,26 +194,45 @@ async function main(): Promise<void> {
 			const layout = homeLayout(home);
 			const port = Number(args.flags.get("port") ?? DEFAULT_PORT);
 			const addr = (args.flags.get("addr") as string) ?? "127.0.0.1";
+			const name =
+				typeof args.flags.get("name") === "string"
+					? (args.flags.get("name") as string)
+					: undefined;
 			const templatesDir =
 				(args.flags.get("templates") as string) ?? layout.templatesDir;
 			const manifestPath =
 				(args.flags.get("manifest") as string) ?? layout.manifestPath;
-			const tokensRaw = [...args.flags.entries()]
-				.filter(([k]) => k === "token")
-				.map(([, v]) => v);
+			const tokensRaw = flagValues(args.flags, "token");
 			const tokens: Partial<Record<SwarmRole, string>> = {};
 			for (const t of tokensRaw) {
-				if (typeof t === "string") {
-					const [role, ...r] = t.split("=");
-					if (role === "admin" || role === "peer" || role === "worker") {
-						tokens[role] = r.join("=");
-					}
+				const [role, ...r] = t.split("=");
+				if (role === "admin" || role === "peer" || role === "worker") {
+					tokens[role] = r.join("=");
 				}
+			}
+			// federation mounts: --connect pairs with --as by index (alias optional)
+			const connects = flagValues(args.flags, "connect");
+			const aliases = flagValues(args.flags, "as");
+			if (aliases.length > connects.length) {
+				console.error(
+					"[swarm] --as given without a matching --connect (pair them by index)",
+				);
+				process.exitCode = 1;
+				return;
+			}
+			if (connects.length && !name) {
+				// hermit rule: federation requires a declared name — in BOTH directions
+				console.error(
+					"[swarm] federation requires a declared name — add --name <swarm>",
+				);
+				process.exitCode = 1;
+				return;
 			}
 			const server = createSwarmServer({
 				home,
 				addr,
 				port,
+				name,
 				tokens: Object.keys(tokens).length ? tokens : undefined,
 				templatesDir,
 				manifestPath,
@@ -217,12 +247,22 @@ async function main(): Promise<void> {
 			console.log(
 				`[swarm] daemon on ws://${addr}:${server.port} — rest http://${addr}:${server.port}/api/v1 — home: ${home} — templates: ${t}`,
 			);
+			if (name) console.log(`[swarm] name: ${name}`);
+			else console.log("[swarm] unnamed (hermit mode — federation refused)");
 			if (Object.keys(tokens).length) {
 				console.log(
 					`[swarm] tokens: ${Object.entries(tokens)
 						.map(([r]) => `${r}=***`)
 						.join(", ")}`,
 				);
+			}
+			// dial every mount — failures don't kill the daemon, they log and retry
+			for (let i = 0; i < connects.length; i++) {
+				server.federate({
+					url: connects[i]!,
+					as: aliases[i],
+					token: opToken(args),
+				});
 			}
 			// keep the process alive — the daemon IS this process
 			await new Promise<void>(() => {});

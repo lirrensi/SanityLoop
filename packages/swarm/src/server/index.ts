@@ -1,12 +1,22 @@
 // ============================================================================
 // sanity/src/packages/swarm/src/server/index.ts — THE DAEMON. A dumb hypervisor:
-//   · WS hub — routes frames by sessionId, fan-outs streams to subscribers. It
+//   · WS hub — routes frames by address, fan-outs streams to subscribers. It
 //     never interprets a payload, only its shape (the core is type-blind, so is
 //     the hub).
 //   · ONE API, MANY SURFACES — the ops live in FleetApi; WS frames, REST routes
 //     (rest.ts) and the CLI (a WS client) are thin adapters over the same core.
 //   · registry (live) + history (every worker ever seen) — resumable = persistent
 //     workers the daemon recognizes; restartable = workers it spawned.
+//   · ROOMS — a room is NOT an object, it is a "/"-path prefix on registry
+//     entries. ONE visibility rule: an ancestor sees its descendants
+//     (startsWith); sideways and upward: invisible. Workers claim where they
+//     live; peer/admin mount where they look. The swarm name is STAMPED by the
+//     daemon — a worker never claims which swarm it belongs to.
+//   · FEDERATION (server/federate.ts) — the daemon dials another daemon as a
+//     peer and mirrors its online workers under the remote's declared name as a
+//     room subtree. State stays honest (reports are folded, not invented),
+//     authority stays home (the remote's tokens decide), and federation does
+//     not transit (mirrors of mirrors are never mirrored).
 //   · the daemon FOLDS what it hears: lifecycle reports become per-worker state
 //     (idle/busy/paused/error), counters, and a recent-events ring. State is truth.
 //   · prompts on create/restart are queued and delivered the instant the worker
@@ -19,7 +29,13 @@
 // ============================================================================
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { DEFAULT_PORT, parseFrame } from "../protocol.ts";
+import {
+	ROOT_ROOM,
+	DEFAULT_PORT,
+	addressOf,
+	normalizeRoom,
+	parseFrame,
+} from "../protocol.ts";
 import type {
 	ClientFrame,
 	ControlAction,
@@ -34,6 +50,8 @@ import type {
 import { Spawner, type TemplateInfo } from "./spawner.ts";
 import { ensureScaffold, ensureNodeModulesLink, homeLayout, resolveHome, writeConfig } from "./config.ts";
 import { handleRest } from "./rest.ts";
+import { createMount } from "./federate.ts";
+import type { FederationHost } from "./federate.ts";
 
 export interface SwarmServerOptions {
 	/** The daemon's home — where config.json, templates/, sessions/ and fleet.json live.
@@ -42,6 +60,9 @@ export interface SwarmServerOptions {
 	addr?: string;
 	/** 0 = random port (lands in onPort + state). */
 	port?: number;
+	/** The swarm's declared name — stamped onto every local address. Absent =
+	 *  hermit mode: fully functional locally, federation refused in both directions. */
+	name?: string;
 	/** Per-role tokens. When configured, a register MUST present the token matching
 	 *  its claimed mode (or no token → worker). Empty/undefined = open. */
 	tokens?: Partial<Record<SwarmRole, string>>;
@@ -58,10 +79,17 @@ interface Connection {
 	ws: WebSocket;
 	role: SwarmRole;
 	sessionId?: string;
+	/** Where this worker lives (worker) / the visibility prefix (peer/admin). */
+	room: string;
 	mode: SwarmRole;
 	persistent: boolean;
+	/** Subscribed addresses — the fan-out targets this connection listens to. */
 	subscribed: Set<string>;
 }
+
+/** A mirror's live wire back to the daemon it came from. Mirrors route
+ *  input/control/kill/restart through this — the remote's tokens decide. */
+export type MirrorForward = (frame: Record<string, unknown>) => void;
 
 interface RegistryEntry {
 	sessionId: string;
@@ -70,6 +98,10 @@ interface RegistryEntry {
 	mode: SwarmRole;
 	persistent: boolean;
 	spawned: boolean;
+	/** Always set — the room this worker lives in (default "global"). */
+	room: string;
+	/** "local" | "mirrored" */
+	origin: "local" | "mirrored";
 	pid?: number;
 	status: "online" | "offline";
 	lastSeen: number;
@@ -81,6 +113,8 @@ interface RegistryEntry {
 	/** Recent-events ring — lifecycle payloads only, capped. */
 	recent: RecentEvent[];
 	conn?: Connection;
+	/** Mirrored only — routes ops to the home daemon over its peer socket. */
+	forward?: MirrorForward;
 }
 
 /** How lifecycle reports fold into derived state. The daemon never invents
@@ -147,34 +181,57 @@ export interface FleetApi {
 		status?: "online" | "offline";
 		mode?: SwarmRole;
 		agentId?: string;
+		/** Visibility scope — only workers under this room subtree. */
+		under?: string;
 	}): WorkerInfo[];
-	get(sessionId: string): WorkerInfo | null;
-	history(): WorkerInfo[];
+	get(sessionId: string, under?: string): WorkerInfo | null;
+	history(under?: string): WorkerInfo[];
 	templates(): TemplateInfo[];
 	/** The recent-events ring of one worker (lifecycle payloads only). */
 	events(
 		sessionId: string,
 		limit?: number,
+		under?: string,
 	): { sessionId: string; events: RecentEvent[] } | null;
 	/** Spawn a template worker. Returns null for an unknown template. */
 	create(
 		template: string,
 		opts?: { sessionId?: string; prompt?: string },
 	): { sessionId: string; pid?: number } | null;
-	kill(sessionId: string): { ok: boolean; sessionId: string };
+	kill(sessionId: string, under?: string): { ok: boolean; sessionId: string };
 	/** Restart a daemon-spawned worker; optional prompt delivered after re-register. */
 	restart(
 		sessionId: string,
 		opts?: { prompt?: string },
+		under?: string,
 	): { ok: boolean; sessionId: string };
 	control(
 		target: string,
 		action: ControlAction,
+		under?: string,
 	): { ok: boolean; target: string; action: ControlAction } | null;
 	input(
 		target: string,
 		body: Record<string, unknown>,
+		under?: string,
 	): { ok: boolean; target: string } | null;
+}
+
+/** One federation mount — the daemon dialing another daemon as a peer. */
+export interface FederateOptions {
+	/** The remote daemon's WS url — where. */
+	url: string;
+	/** Mount under this name instead of the remote's declared name. */
+	as?: string;
+	/** The peer token for the remote (when it has tokens configured). */
+	token?: string;
+}
+
+export interface FederateResult {
+	ok: boolean;
+	/** The mount name actually claimed (remote's declared name or --as). */
+	mount?: string;
+	error?: string;
 }
 
 export interface SwarmServer {
@@ -193,6 +250,10 @@ export interface SwarmServer {
 		template: string,
 		opts?: { sessionId?: string },
 	): { sessionId: string; pid?: number } | null;
+	/** Dial another daemon and mirror its fleet under a room subtree.
+	 *  Requires a declared name (hermits can't federate). Fire-and-forget:
+	 *  the mount connects, retries, and follows the remote's truth. */
+	federate(opts: FederateOptions): FederateResult;
 }
 
 export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
@@ -202,6 +263,8 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		tokens = {},
 		resurrectOnBoot = false,
 	} = opts;
+	/** The stamp. Every local address starts with it (when declared). */
+	const swarmName = opts.name?.trim() || undefined;
 
 	// the daemon IS a location — resolve its home, scaffold it, derive the defaults
 	const home = opts.home ?? resolveHome();
@@ -213,13 +276,35 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	const sessionsDir = layout.sessionsDir;
 
 	const bootedAt = Date.now();
+	/** KEYED BY ADDRESS ("<swarm>/<room>/<sessionId>"). sessionId can collide
+	 *  across swarms — never locally. The bySessionId index keeps bare sessionIds
+	 *  working for everything local (first claim wins, locals outrank mirrors). */
 	const registry = new Map<string, RegistryEntry>();
+	const bySessionId = new Map<string, string>();
 	const history = new Map<string, RegistryEntry>();
+	/** Claimed mount names — collision policy is loud, never silent. */
+	const mountNames = new Set<string>();
 	const connections = new Set<Connection>();
 	const spawner = new Spawner({
 		templatesDir,
 		manifestPath,
 	});
+
+	/** THE one visibility rule. A room is a path prefix; an ancestor sees its
+	 *  descendants; sideways and upward: invisible. */
+	const visible = (mount: string, room: string): boolean =>
+		room === mount || room.startsWith(`${mount}/`);
+
+	/** Target resolution — bare sessionId (index) or full address (contains "/").
+	 *  Full address wins when it names a real entry; else fall back to the index. */
+	const resolve = (target: string): RegistryEntry | null => {
+		if (target.includes("/")) {
+			const hit = registry.get(target);
+			if (hit) return hit;
+		}
+		const addr = bySessionId.get(target);
+		return addr ? (registry.get(addr) ?? null) : null;
+	};
 
 	/** Prompts waiting for a (re)register — the daemon owns that moment. */
 	const pendingPrompts = new Map<
@@ -264,6 +349,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		persistent: e.persistent,
 		spawned: e.spawned,
 		status: e.status,
+		room: e.room,
+		address: addressOf(swarmName, e.room, e.sessionId),
+		origin: e.origin,
 		state: e.state,
 		lastEvent: e.lastEvent,
 		lastEventAt: e.lastEventAt,
@@ -272,7 +360,14 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		lastSeen: e.lastSeen,
 	});
 
-	const snapshot = (): WorkerInfo[] => [...registry.values()].map(info);
+	const snapshot = (mount: string = ROOT_ROOM): WorkerInfo[] =>
+		[...registry.values()]
+			.filter((e) => visible(mount, e.room))
+			.map(info);
+
+	/** The registry key for a local worker — the swarm stamps itself. */
+	const localKey = (room: string, sessionId: string): string =>
+		addressOf(swarmName, room, sessionId);
 
 	const hasPerm = (conn: Connection, op: string): boolean =>
 		PERMS[conn.role].has(op);
@@ -333,18 +428,34 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			conn.ws.close();
 			return;
 		}
+		const room = normalizeRoom(frame.room);
+		if (!room) {
+			send(conn, {
+				op: "error",
+				reqOp: "register",
+				error: `malformed room path: ${String(frame.room)}`,
+			});
+			conn.ws.close();
+			return;
+		}
 		conn.role = role;
 		conn.sessionId = frame.sessionId;
+		// workers live where they claim; peer/admin MOUNT where they look
+		conn.room = room;
 		conn.mode = frame.mode;
 		conn.persistent = frame.persistent;
 
 		// re-identity: the same sessionId reconnecting replaces the old socket
-		const old = registry.get(frame.sessionId);
+		// (even under a different room — the old address is found and retired)
+		const oldAddr = bySessionId.get(frame.sessionId);
+		const old = oldAddr ? registry.get(oldAddr) : undefined;
 		if (old?.conn) {
 			old.conn.ws.close();
 			connections.delete(old.conn);
 		}
+		if (oldAddr) registry.delete(oldAddr);
 
+		const key = localKey(room, frame.sessionId);
 		const entry: RegistryEntry = {
 			sessionId: frame.sessionId,
 			agentId: frame.agentId,
@@ -353,20 +464,24 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			persistent: frame.persistent,
 			spawned: spawner.isSpawned(frame.sessionId),
 			pid: spawner.pidOf(frame.sessionId),
+			room,
+			origin: "local",
 			status: "online",
 			stats: freshStats(),
 			recent: [],
 			lastSeen: Date.now(),
 			conn,
 		};
-		registry.set(frame.sessionId, entry);
-		const seen = history.get(frame.sessionId);
-		history.set(frame.sessionId, { ...seen, ...entry, status: "online" });
+		registry.set(key, entry);
+		bySessionId.set(frame.sessionId, key);
+		const seen = history.get(key);
+		history.set(key, { ...seen, ...entry, status: "online" });
 
 		send(conn, {
 			op: "welcome",
 			sessionId: frame.sessionId,
-			registry: snapshot(),
+			swarm: swarmName,
+			registry: snapshot(conn.room),
 		});
 
 		// a queued prompt (create/restart with prompt) is delivered the moment
@@ -400,28 +515,41 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		}
 	};
 
+	/** Fan a voice out to subscribed mounts that can SEE it (the one visibility
+	 *  rule), never back to the reporter itself. Mirrors report with no conn. */
+	const fanOut = (
+		entry: RegistryEntry,
+		event: string,
+		payload: unknown,
+		except?: Connection,
+	): void => {
+		const key = addressOf(swarmName, entry.room, entry.sessionId);
+		for (const sub of connections) {
+			if (sub === except) continue;
+			if (sub.subscribed.has(entry.sessionId) || sub.subscribed.has(key)) {
+				if (!visible(sub.room, entry.room)) continue;
+				send(sub, {
+					op: "event",
+					target: entry.sessionId,
+					event: event as SwarmEvent,
+					payload,
+				});
+			}
+		}
+	};
+
 	const onReport = (
 		conn: Connection,
 		frame: { event: string; payload?: unknown },
 	): void => {
 		if (!conn.sessionId) return;
-		const entry = registry.get(conn.sessionId);
+		const key = bySessionId.get(conn.sessionId);
+		const entry = key ? registry.get(key) : undefined;
 		if (entry) {
 			entry.lastSeen = Date.now();
 			fold(entry, frame.event, frame.payload);
 		}
-		// fan out to subscribers (never back to the reporter itself)
-		for (const sub of connections) {
-			if (sub === conn) continue;
-			if (sub.subscribed.has(conn.sessionId)) {
-				send(sub, {
-					op: "event",
-					target: conn.sessionId,
-					event: frame.event,
-					payload: frame.payload,
-				});
-			}
-		}
+		if (entry) fanOut(entry, frame.event, frame.payload, conn);
 	};
 
 	// ---------------------------------------------------------------------------
@@ -429,29 +557,36 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	// ---------------------------------------------------------------------------
 	const api: FleetApi = {
 		list(filter) {
-			let rows = snapshot();
+			let rows = snapshot(filter?.under ?? ROOT_ROOM);
 			if (filter?.status) rows = rows.filter((r) => r.status === filter.status);
 			if (filter?.mode) rows = rows.filter((r) => r.mode === filter.mode);
 			if (filter?.agentId) rows = rows.filter((r) => r.agentId === filter.agentId);
 			return rows;
 		},
 
-		get(sessionId) {
-			const e = registry.get(sessionId);
-			return e ? info(e) : null;
+		get(sessionId, under) {
+			const e = resolve(sessionId);
+			if (!e) return null;
+			// 404 semantics: a room you can't see doesn't exist
+			if (under && !visible(under, e.room)) return null;
+			return info(e);
 		},
 
-		history() {
-			return [...history.values()].map(info);
+		history(under) {
+			const mount = under ?? ROOT_ROOM;
+			return [...history.values()]
+				.filter((e) => visible(mount, e.room))
+				.map(info);
 		},
 
 		templates() {
 			return spawner.scanTemplates();
 		},
 
-		events(sessionId, limit = 100) {
-			const e = registry.get(sessionId);
+		events(sessionId, limit = 100, under) {
+			const e = resolve(sessionId);
 			if (!e) return null;
+			if (under && !visible(under, e.room)) return null;
 			return { sessionId, events: e.recent.slice(-Math.max(1, limit)) };
 		},
 
@@ -463,7 +598,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				extraEnv: spawnEnv(),
 			});
 			// registry shows it as offline until it registers (spawned → restartable)
-			registry.set(spawned.sessionId, {
+			const room = ROOT_ROOM;
+			const key = localKey(room, spawned.sessionId);
+			registry.set(key, {
 				sessionId: spawned.sessionId,
 				agentId: t.id,
 				description: t.description,
@@ -471,49 +608,202 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				mode: t.mode ?? "worker",
 				persistent: true,
 				spawned: true,
+				room,
+				origin: "local",
 				pid: spawned.pid,
 				status: "offline",
 				stats: freshStats(),
 				recent: [],
 				lastSeen: Date.now(),
 			});
+			bySessionId.set(spawned.sessionId, key);
 			if (createOpts.prompt) queuePrompt(spawned.sessionId, createOpts.prompt);
 			return spawned;
 		},
 
-		kill(sessionId) {
-			const ok = spawner.kill(sessionId);
-			const entry = registry.get(sessionId);
-			if (entry?.conn) {
-				entry.conn.ws.close();
-				entry.status = "offline";
-				entry.conn = undefined;
+		kill(sessionId, under) {
+			const e = resolve(sessionId);
+			if (!e) return { ok: false, sessionId };
+			if (under && !visible(under, e.room)) return { ok: false, sessionId };
+			if (e.origin === "mirrored") {
+				// authority stays home — the remote daemon decides if it may die
+				e.forward?.({ op: "kill", sessionId: e.sessionId });
+				return { ok: true, sessionId: e.sessionId };
 			}
-			return { ok, sessionId };
+			const ok = spawner.kill(e.sessionId);
+			if (e.conn) {
+				e.conn.ws.close();
+				e.status = "offline";
+				e.conn = undefined;
+			}
+			return { ok, sessionId: e.sessionId };
 		},
 
-		restart(sessionId, restartOpts = {}) {
-			if (restartOpts.prompt) queuePrompt(sessionId, restartOpts.prompt);
-			const ok = spawner.restart(sessionId);
-			if (!ok && restartOpts.prompt) pendingPrompts.delete(sessionId);
-			return { ok, sessionId };
+		restart(sessionId, restartOpts = {}, under) {
+			const e = resolve(sessionId);
+			if (!e) return { ok: false, sessionId };
+			if (under && !visible(under, e.room)) return { ok: false, sessionId };
+			if (e.origin === "mirrored") {
+				// the remote restarts it its way; our mirror follows the reports
+				e.forward?.({
+					op: "restart",
+					sessionId: e.sessionId,
+					prompt: restartOpts.prompt,
+				});
+				return { ok: true, sessionId: e.sessionId };
+			}
+			if (restartOpts.prompt) queuePrompt(e.sessionId, restartOpts.prompt);
+			const ok = spawner.restart(e.sessionId);
+			if (!ok && restartOpts.prompt) pendingPrompts.delete(e.sessionId);
+			return { ok, sessionId: e.sessionId };
 		},
 
-		control(target, action) {
-			const entry = registry.get(target);
-			if (!entry?.conn) return null;
-			send(entry.conn, { op: "control", action });
+		control(target, action, under) {
+			const e = resolve(target);
+			if (!e) return null;
+			if (under && !visible(under, e.room)) return null;
+			if (e.origin === "mirrored") {
+				// routed as-is; the REMOTE's tokens decide whether it lands
+				e.forward?.({ op: "control", target: e.sessionId, action });
+				return { ok: true, target, action };
+			}
+			if (!e.conn) return null;
+			send(e.conn, { op: "control", action });
 			// optimistic — the worker's next report corrects us if it disagrees
-			entry.state = action === "pause" ? "paused" : "idle";
+			e.state = action === "pause" ? "paused" : "idle";
 			return { ok: true, target, action };
 		},
 
-		input(target, body) {
-			const entry = registry.get(target);
-			if (!entry?.conn) return null;
-			send(entry.conn, { op: "input", body });
+		input(target, body, under) {
+			const e = resolve(target);
+			if (!e) return null;
+			if (under && !visible(under, e.room)) return null;
+			if (e.origin === "mirrored") {
+				e.forward?.({ op: "input", target: e.sessionId, body });
+				return { ok: true, target };
+			}
+			if (!e.conn) return null;
+			send(e.conn, { op: "input", body });
 			return { ok: true, target };
 		},
+	};
+
+	// ---------------------------------------------------------------------------
+	// FEDERATION HOST — what a mount (federate.ts) may do to this daemon's state.
+	// Mirrors follow the remote's truth: upserted from its registry snapshot,
+	// advanced only by its workers' own reports, removed when it forgets them.
+	// ---------------------------------------------------------------------------
+	const host: FederationHost = {
+		swarmName,
+
+		claimMount(name: string): boolean {
+			if (!swarmName) return false;
+			// your own name is not a valid mount — that way lies a mirror loop
+			if (name === swarmName || mountNames.has(name)) return false;
+			mountNames.add(name);
+			return true;
+		},
+
+		releaseMount(name: string): void {
+			mountNames.delete(name);
+		},
+
+		/** Follow the remote's registry: upsert its workers as mirrors, remove the
+		 *  ones it forgot. No transit — the remote's own mirrors are skipped.
+		 *  Mirrors live UNDER the root room (global/<mount>/...) so the default
+		 *  mount sees them — the global ones see the rooms. */
+		syncMount(mount, remote, forward) {
+			const roomPrefix = `${ROOT_ROOM}/${mount}/`;
+			const desired = remote.filter((w) => w.origin !== "mirrored");
+			const keep = new Set<string>();
+			const links: { sessionId: string; address: string }[] = [];
+			for (const w of desired) {
+				const room = `${ROOT_ROOM}/${mount}/${normalizeRoom(w.room) ?? ROOT_ROOM}`;
+				const key = addressOf(swarmName, room, w.sessionId);
+				keep.add(key);
+				links.push({ sessionId: w.sessionId, address: key });
+				const existing = registry.get(key);
+				if (existing) {
+					// identity refresh only — derived state stays folded, never clobbered
+					existing.agentId = w.agentId;
+					existing.description = w.description;
+					existing.mode = w.mode;
+					existing.persistent = w.persistent;
+					existing.status = w.status;
+					existing.forward = forward;
+					existing.lastSeen = Date.now();
+				} else {
+					registry.set(key, {
+						sessionId: w.sessionId,
+						agentId: w.agentId,
+						description: w.description,
+						mode: w.mode,
+						persistent: w.persistent,
+						spawned: false,
+						room,
+						origin: "mirrored",
+						status: w.status,
+						stats: freshStats(),
+						recent: [],
+						lastSeen: Date.now(),
+						forward,
+					});
+					// bare-sessionId index: locals outrank mirrors, always
+					if (!bySessionId.has(w.sessionId)) bySessionId.set(w.sessionId, key);
+				}
+				const now = registry.get(key)!;
+				history.set(key, { ...history.get(key), ...now });
+			}
+			for (const [key, e] of registry) {
+				if (
+					e.origin === "mirrored" &&
+					e.room.startsWith(roomPrefix) &&
+					!keep.has(key)
+				) {
+					// the remote forgot it — we follow its truth, no ghosts
+					registry.delete(key);
+					if (bySessionId.get(e.sessionId) === key)
+						bySessionId.delete(e.sessionId);
+				}
+			}
+			return links;
+		},
+
+		/** A mount lost its wire — every mirror under it follows into offline. */
+		setMountStatus(mount: string, status: "online" | "offline"): void {
+			const roomPrefix = `${ROOT_ROOM}/${mount}/`;
+			for (const e of registry.values()) {
+				if (e.origin === "mirrored" && e.room.startsWith(roomPrefix)) {
+					e.status = status;
+					e.lastSeen = Date.now();
+				}
+			}
+		},
+
+		/** A relayed voice from a mirrored worker — folded, never invented. */
+		reportEntry(key: string, event: string, payload: unknown): void {
+			const e = registry.get(key);
+			if (!e) return;
+			e.status = "online";
+			e.lastSeen = Date.now();
+			fold(e, event, payload);
+			fanOut(e, event, payload);
+		},
+	};
+
+	const mountStoppers = new Set<() => void>();
+
+	const federate = (fedOpts: FederateOptions): FederateResult => {
+		if (!swarmName) {
+			return {
+				ok: false,
+				error:
+					"this daemon is unnamed (hermit) — declare --name to federate",
+			};
+		}
+		const handle = createMount(host, fedOpts);
+		mountStoppers.add(() => handle.stop());
+		return { ok: true };
 	};
 
 	const handleFrame = (conn: Connection, frame: ClientFrame): void => {
@@ -529,16 +819,23 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				return;
 			case "list":
 				if (!hasPerm(conn, "list")) break;
-				result(conn, frame, "list", api.list());
+				result(conn, frame, "list", api.list({ under: conn.room }));
 				return;
 			case "get":
 				if (!hasPerm(conn, "get")) break;
-				result(conn, frame, "get", api.get(frame.sessionId));
+				result(conn, frame, "get", api.get(frame.sessionId, conn.room));
 				return;
 			case "listen":
 				if (!hasPerm(conn, "listen")) break;
-				if (frame.on) conn.subscribed.add(frame.sessionId);
-				else conn.subscribed.delete(frame.sessionId);
+				{
+					// resolve to the registry ADDRESS — the fan-out speaks addresses
+					const e = resolve(frame.sessionId);
+					if (e) {
+						const key = addressOf(swarmName, e.room, e.sessionId);
+						if (frame.on) conn.subscribed.add(key);
+						else conn.subscribed.delete(key);
+					}
+				}
 				result(conn, frame, "listen", {
 					on: frame.on,
 					sessionId: frame.sessionId,
@@ -547,14 +844,14 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			case "events":
 				if (!hasPerm(conn, "events")) break;
 				{
-					const r = api.events(frame.sessionId, frame.limit);
+					const r = api.events(frame.sessionId, frame.limit, conn.room);
 					if (!r) fail(conn, frame, "events", `unknown worker: ${frame.sessionId}`);
 					else result(conn, frame, "events", r);
 				}
 				return;
 			case "history":
 				if (!hasPerm(conn, "history")) break;
-				result(conn, frame, "history", api.history());
+				result(conn, frame, "history", api.history(conn.room));
 				return;
 			case "templates":
 				if (!hasPerm(conn, "templates")) break;
@@ -598,10 +895,21 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			case "broadcast":
 				if (!hasPerm(conn, "broadcast")) break;
 				{
+					// blast radius = caller's mount ∩ explicit room scope ∩ online
+					const scope = frame.room
+						? (normalizeRoom(frame.room) ?? ROOT_ROOM)
+						: ROOT_ROOM;
+					const inScope = (e: RegistryEntry): boolean =>
+						e.status === "online" &&
+						visible(conn.room, e.room) &&
+						visible(scope, e.room);
 					const targets = frame.targets
-						? frame.targets.filter((t) => registry.has(t))
+						? frame.targets
+								.map((t) => resolve(t))
+								.filter((e): e is RegistryEntry => !!e && inScope(e))
+								.map((e) => e.sessionId)
 						: [...registry.values()]
-								.filter((e) => e.status === "online")
+								.filter(inScope)
 								.map((e) => e.sessionId);
 					let sent = 0;
 					for (const t of targets) {
@@ -680,7 +988,8 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				ws.on("close", () => {
 					connections.delete(conn);
 					if (conn.sessionId) {
-						const entry = registry.get(conn.sessionId);
+						const key = bySessionId.get(conn.sessionId);
+						const entry = key ? registry.get(key) : undefined;
 						if (entry) {
 							entry.status = "offline";
 							entry.conn = undefined;
@@ -697,20 +1006,23 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					resolve();
 				});
 			});
-			// the daemon declares itself — config.json is its identity
-			writeConfig({
-				version: 1,
-				home,
-				addr,
-				port: actualPort,
-				templatesDir,
-				sessionsDir,
-				manifestPath,
-				tokens: Object.keys(tokens).length ? tokens : undefined,
-			});
+		// the daemon declares itself — config.json is its identity
+		writeConfig({
+			version: 1,
+			name: swarmName,
+			home,
+			addr,
+			port: actualPort,
+			templatesDir,
+			sessionsDir,
+			manifestPath,
+			tokens: Object.keys(tokens).length ? tokens : undefined,
+		});
 		},
 
 		async stop() {
+			for (const stop of mountStoppers) stop();
+			mountStoppers.clear();
 			for (const conn of connections) {
 				try {
 					conn.ws.close();
@@ -732,7 +1044,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		},
 
 		registry() {
-			return snapshot();
+			return snapshot(ROOT_ROOM);
 		},
 
 		history() {
@@ -746,5 +1058,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		spawnTemplate(template: string, opts?: { sessionId?: string }) {
 			return api.create(template, opts);
 		},
+
+		federate,
 	};
 }
