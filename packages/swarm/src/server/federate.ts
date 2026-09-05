@@ -107,7 +107,11 @@ export function createMount(
 				reject(new Error("remote list timed out"));
 			}, RPC_TIMEOUT_MS);
 			timer.unref?.();
-			pending.set(id, { resolve, reject, timer });
+			pending.set(id, {
+				resolve: (data) => resolve(data as WorkerInfo[]),
+				reject,
+				timer,
+			});
 			send({ op: "list", id });
 		});
 
@@ -197,7 +201,7 @@ export function createMount(
 				{
 					const id = typeof frame.id === "string" ? frame.id : undefined;
 					const p = id ? pending.get(id) : undefined;
-					if (!p) return;
+					if (!id || !p) return;
 					pending.delete(id);
 					clearTimeout(p.timer);
 					p.resolve(frame.data);

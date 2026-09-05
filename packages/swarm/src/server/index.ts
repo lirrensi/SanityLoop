@@ -963,6 +963,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				const conn: Connection = {
 					ws,
 					role: "worker",
+					room: ROOT_ROOM,
 					mode: "worker",
 					persistent: false,
 					subscribed: new Set(),

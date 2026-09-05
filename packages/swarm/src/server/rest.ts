@@ -146,6 +146,9 @@ export function handleRest(
 		return fail(res, 401, "unauthorized — bad or missing bearer token");
 	}
 
+	const seg = url.pathname.slice(prefix.length).split("/").filter(Boolean);
+	const query = url.searchParams;
+
 	// ---- the mount point — the same visibility law as every other door ----
 	// `?room=` or `X-Swarm-Room`; default "global" = see everything.
 	const rawRoom = query.get("room") ?? req.headers["x-swarm-room"];
@@ -156,8 +159,6 @@ export function handleRest(
 		return fail(res, 400, `malformed room path: ${String(rawRoom)}`);
 	}
 
-	const seg = url.pathname.slice(prefix.length).split("/").filter(Boolean);
-	const query = url.searchParams;
 	const need = (level: SwarmRole): boolean => {
 		if (!atLeast(role, level)) {
 			fail(res, 403, `forbidden — this route needs ${level}, your token is ${role}`);
