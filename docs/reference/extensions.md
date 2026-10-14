@@ -77,6 +77,7 @@ agent.install(createSomething({ /* opts */ }));
 | --- | --- | --- |
 | `@sanityloop/http-server` | `createHttpServer({ port, addr, apikey? })` | Elysia on Node: `POST /input` (the ONLY write door), `GET /getState` (+`?keys=` dotted picks), SSE stream + WS ops (`getState`/`awaits`/`questions`/...). Port 0 = random → real port lands in `state.http.port`. |
 | `@sanityloop/repl` | `createReplPlugin(opts)` | Terminal REPL: readline chat, ANSI markdown, stream feedback, `/tools` `/model` `/compact` commands, auto-stats after each turn. The quick prototype surface. |
+| `@sanityloop/file-rpc` | `createFileRpc({ dir \| sessionDir })` | Files, not sockets: claims `<lobby>/<agent.id>/`, inbox command files in, pi-shaped responses + stream/lifecycle voices out (`outbox/events.jsonl`). Cron-safe; sender lib + CLI included. |
 
 ## Models & fleet
 

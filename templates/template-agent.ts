@@ -322,6 +322,16 @@ agent.install(createQuitOnEndPlugin());
 //
 // import { createHttpServer } from "@sanityloop/http-server";
 // agent.install(createHttpServer({ port: 0 }));
+//
+// ---- FILE RPC — drive the agent through a shared dir ───────────────────────
+// WHAT: no pipes, no ports, no daemon. Claims <lobby>/<agent.id>/; anyone with
+//       dir access drops {id,type,...} files into inbox/ and reads pi-shaped
+//       responses + stream/lifecycle voices from outbox/events.jsonl.
+// WANT: cron jobs, detached processes, humans/agents without a network path.
+// REMOVE: delete both lines → no file room, nothing left behind.
+//
+// import { createFileRpc } from "@sanityloop/file-rpc";
+// agent.install(createFileRpc({ dir: "/var/run/my-lobby" }));
 
 // ---- OBSERVER — watch the loop think ──────────────────────────────────────
 // WHAT: prints lifecycle headlines (verbosity 1) or +stream details (2).
