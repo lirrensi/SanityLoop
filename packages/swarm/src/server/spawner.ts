@@ -9,7 +9,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { SwarmRole } from "../protocol.ts";
 
 
@@ -39,6 +39,15 @@ export interface TemplateManifest {
 	env?: Record<string, string>;
 }
 
+/** What the daemon remembers about a spawned child's death — enough to diagnose. */
+export interface ExitFacts {
+	code: number | null;
+	signal: string | null;
+	at: number;
+	/** Last ~2KB of the child's stderr (still forwarded to the daemon's own). */
+	stderrTail?: string;
+}
+
 /** A spawn recipe — everything needed to resurrect this worker. */
 export interface SpawnRecipe {
 	sessionId: string;
@@ -55,6 +64,26 @@ export interface SpawnerOptions {
 	spawnCommand?: string[];
 	/** Where the fleet manifest lives. Omit = no persistence. */
 	manifestPath?: string;
+	/** The daemon HOME — when it holds the node_modules junction (see
+	 *  config.ts:ensureNodeModulesLink), templates anywhere resolve bare imports. */
+	homeDir?: string;
+	/** Fires whenever a tracked child exits (or fails to spawn). The daemon uses
+	 *  it to mark the registry entry offline + diagnosable. Never throws into us. */
+	onExit?: (sessionId: string, facts: ExitFacts) => void;
+}
+
+/** How much child stderr we keep — enough to name the crash, too small to matter. */
+const STDERR_TAIL_MAX = 2048;
+
+/** True when some ancestor of dir holds a node_modules (bare imports resolve). */
+function hasNodeModulesUpTree(startDir: string): boolean {
+	let dir = startDir;
+	for (;;) {
+		if (existsSync(join(dir, "node_modules"))) return true;
+		const parent = dirname(dir);
+		if (parent === dir) return false;
+		dir = parent;
+	}
 }
 
 const MANIFEST_VERSION = 1;
@@ -81,8 +110,11 @@ export class Spawner {
 	private readonly templatesDir: string;
 	private readonly spawnCommand: string[];
 	private readonly manifestPath?: string;
+	private readonly homeDir?: string;
+	private readonly onExit?: (sessionId: string, facts: ExitFacts) => void;
 	private recipes = new Map<string, SpawnRecipe>();
 	private children = new Map<string, ChildProcess>();
+	private lastExits = new Map<string, ExitFacts>();
 
 	constructor(opts: SpawnerOptions) {
 		this.templatesDir = opts.templatesDir;
@@ -92,6 +124,8 @@ export class Spawner {
 			"--experimental-transform-types",
 		];
 		this.manifestPath = opts.manifestPath;
+		this.homeDir = opts.homeDir;
+		this.onExit = opts.onExit;
 		this.loadManifest();
 	}
 
@@ -138,6 +172,7 @@ export class Spawner {
 		opts: { sessionId?: string; extraEnv?: Record<string, string> } = {},
 	): { sessionId: string; pid?: number } {
 		const sessionId = opts.sessionId ?? `swarm-${randomUUID().slice(0, 8)}`;
+		this.warnBareTemplateDir(template);
 		const env: Record<string, string> = {
 			...this.baseEnv(),
 			...(template.env ?? {}), // the manifest's per-template config
@@ -151,10 +186,15 @@ export class Spawner {
 			{
 				env,
 				cwd: process.cwd(),
-				stdio: "inherit",
+				// stdin/stdout stay inherited (console UX unchanged); stderr is
+				// piped through a small ring buffer AND forwarded to ours so a
+				// crashed worker leaves a diagnosable tail behind.
+				stdio: ["inherit", "inherit", "pipe"],
 			},
 		);
-		this.children.set(sessionId, child);
+		this.trackChild(sessionId, child);
+		// a fresh spawn clears the previous death — the worker lives again
+		this.lastExits.delete(sessionId);
 		this.recipes.set(sessionId, {
 			sessionId,
 			template: template.file,
@@ -164,9 +204,6 @@ export class Spawner {
 			createdAt: Date.now(),
 		});
 		this.saveManifest();
-		child.on("exit", () => {
-			this.children.delete(sessionId);
-		});
 		return { sessionId, pid: child.pid };
 	}
 
@@ -183,6 +220,11 @@ export class Spawner {
 	/** The live pid of a spawned worker (undefined when not running). */
 	pidOf(sessionId: string): number | undefined {
 		return this.children.get(sessionId)?.pid;
+	}
+
+	/** How this session's child last died — undefined when never (or respawned since). */
+	lastExit(sessionId: string): ExitFacts | undefined {
+		return this.lastExits.get(sessionId);
 	}
 
 	/** Kill a spawned worker's process. Graceful first (input_stop), then SIGTERM. */
@@ -236,17 +278,54 @@ export class Spawner {
 				{
 					env: recipe.env,
 					cwd: recipe.cwd,
-					stdio: "inherit",
+					stdio: ["inherit", "inherit", "pipe"],
 				},
 			);
-			this.children.set(recipe.sessionId, child);
-			child.on("exit", () => this.children.delete(recipe.sessionId));
+			this.trackChild(recipe.sessionId, child);
+			this.lastExits.delete(recipe.sessionId);
 			spawned.push(recipe.sessionId);
 		}
 		return spawned;
 	}
 
-	/** The env every spawned worker inherits from the daemon (minus swarm-specifics). */
+	/** Watch a child: buffer + forward stderr, record death facts on exit/error. */
+	private trackChild(sessionId: string, child: ChildProcess): void {
+		this.children.set(sessionId, child);
+		let tail = "";
+		let done = false;
+		child.stderr?.on("data", (chunk: Buffer | string) => {
+			const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+			process.stderr.write(text); // console UX unchanged — still inherited, visually
+			tail = (tail + text).slice(-STDERR_TAIL_MAX);
+		});
+		const record = (code: number | null, signal: string | null): void => {
+			if (done) return;
+			done = true;
+			// a restart supersedes this child — the new life owns the session,
+			// the old death must not clobber it (nor fire the daemon hook).
+			if (this.children.get(sessionId) !== child) return;
+			this.children.delete(sessionId);
+			const facts: ExitFacts = { code, signal, at: Date.now() };
+			if (tail) facts.stderrTail = tail;
+			this.lastExits.set(sessionId, facts);
+			try {
+				this.onExit?.(sessionId, facts);
+			} catch {
+				/* the hook is a courtesy, never a contract */
+			}
+		};
+		child.on("exit", (code, signal) => record(code, signal ?? null));
+		// spawn failure (bad command): no exit event ever comes — record it here
+		child.on("error", () => record(null, null));
+	}
+	/** Warn when a template can't see any node_modules (bare imports will fail)
+	 *  and the daemon-home junction can't cover it either. Cheap existsSync walk. */
+	private warnBareTemplateDir(template: TemplateInfo): void {
+		if (hasNodeModulesUpTree(dirname(template.path))) return;
+		if (this.homeDir && existsSync(join(this.homeDir, "node_modules"))) return;
+		console.warn(`[swarm] template outside any node_modules tree — bare imports may fail: ${template.path}`);
+	}
+ 	/** The env every spawned worker inherits from the daemon (minus swarm-specifics). */
 	private baseEnv(): Record<string, string> {
 		const env: Record<string, string> = {};
 		for (const [k, v] of Object.entries(process.env)) {

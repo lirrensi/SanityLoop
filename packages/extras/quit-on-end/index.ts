@@ -8,7 +8,10 @@
 // mode "terminate" calls agent.terminate() so ONLY this agent's heart stops
 // and run() resolves — safe when the process hosts other agents too.
 //
-// It does NOT exit while the agent is still owed work:
+// UNIFIED CONTRACT — both modes stand down while work is owed or a rebuild
+// is in flight; terminal states (aborted/errored/terminated) always quit
+// immediately, work or no:
+//   - terminal first: the agent is dead — work will never be done;
 //   - a follow-up inserted at the landing (state.inputFollowUp drained at
 //     stop) means a new turn is about to run — `agent.hasWork` is true;
 //   - a compaction rebuild is in flight (state.compacting) — the machine will
@@ -51,16 +54,18 @@ export function createQuitOnEndPlugin(opts: QuitOnEndOptions = {}): Plugin {
 						agent.loopState === "aborted" ||
 						agent.loopState === "errored" ||
 						agent.loopState === "terminated";
+					if (!terminal) {
+						// not done yet — a follow-up was just inserted at the landing, or a
+						// compaction rebuild is in flight: the machine will keep going
+						if (agent.hasWork) return;
+						if (agent.state.compacting) return;
+					}
 					if (mode === "terminate") {
 						// heart-stop lane — idempotent, safe even mid-teardown
 						void agent.terminate(terminal ? `quit-on-end:${agent.loopState}` : "quit-on-end:done");
 						return;
 					}
 					if (terminal) process.exit(errorCode);
-					// not done yet — a follow-up was just inserted at the landing, or a
-					// compaction rebuild is in flight: the machine will keep going
-					if (agent.hasWork) return;
-					if ((agent.state as { compacting?: boolean }).compacting) return;
 					process.exit(code);
 				},
 			});

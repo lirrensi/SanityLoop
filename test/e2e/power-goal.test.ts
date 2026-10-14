@@ -158,8 +158,9 @@ test("active goal holds the heart: exit-quitter stands down mid-pursuit, leaves 
     // runs `if (agent.hasWork) return;` at every agentEnd. During pursuit the
     // dwell is a PARKED AWAIT — hasWork stays true, so it must stand down.
     // After the checker confirms (no new kick), hasWork falls and it WOULD exit.
-    // (Real quit-on-end mode "terminate" terminates unconditionally at every
-    // landing by design — it never consults hasWork; see its source.)
+    // (Real quit-on-end — both exit and terminate modes — stands down while
+    // work is owed or a compaction rebuild is in flight; only terminal states
+    // quit immediately. See its source.)
     const script = Array.from({ length: 6 }, (_, i) => () => assistantTurn(`effort ${i}`));
     const agent = new Agent({ model: new QuietScriptModel(script) });
     agent.install(createDefaultInputs());

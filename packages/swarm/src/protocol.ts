@@ -303,6 +303,9 @@ export interface WorkerInfo {
 	stats?: WorkerStats;
 	pid?: number;
 	lastSeen: number;
+	/** How this worker's spawned child last died (exit code + stderr tail) —
+	 *  present when the daemon spawned it and the child has exited since. */
+	lastExit?: { code: number | null; signal: string | null; at: number; stderrTail?: string };
 }
 
 /** The control actions a peer/admin may send a worker. */

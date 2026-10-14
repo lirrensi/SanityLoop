@@ -6,4 +6,5 @@
 // Generic fixtures (waits, temp dirs) stay on the "." entry, dependency-free.
 
 export * from "./stub-model.ts";
+export * from "./gated-model.ts";
 export * from "./harness.ts";

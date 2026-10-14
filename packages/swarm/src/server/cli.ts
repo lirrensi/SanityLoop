@@ -175,9 +175,10 @@ const printWorkerRow = (r: {
 	agentId: string;
 	persistent: boolean;
 	spawned: boolean;
+	lastExit?: { code: number | null; signal: string | null; stderrTail?: string };
 }): void =>
 	console.log(
-		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${(r.address ?? r.sessionId).padEnd(40)} ${r.agentId}${r.persistent ? " [persistent]" : ""}${r.spawned ? " [spawned]" : ""}`,
+		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${(r.address ?? r.sessionId).padEnd(40)} ${r.agentId}${r.persistent ? " [persistent]" : ""}${r.spawned ? " [spawned]" : ""}${r.lastExit ? ` [exit ${r.lastExit.code ?? r.lastExit.signal ?? "?"}${r.lastExit.stderrTail ? ` — ${(r.lastExit.stderrTail.trim().split("\n").pop() ?? "").slice(0, 120)}` : ""}]` : ""}`,
 	);
 
 async function main(): Promise<void> {

@@ -112,6 +112,8 @@ interface RegistryEntry {
 	stats: WorkerStats;
 	/** Recent-events ring — lifecycle payloads only, capped. */
 	recent: RecentEvent[];
+	/** How the spawned child last died — makes a crash diagnosable from list/get. */
+	lastExit?: { code: number | null; signal: string | null; at: number; stderrTail?: string };
 	conn?: Connection;
 	/** Mirrored only — routes ops to the home daemon over its peer socket. */
 	forward?: MirrorForward;
@@ -288,6 +290,21 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	const spawner = new Spawner({
 		templatesDir,
 		manifestPath,
+		homeDir: home,
+		onExit: (sessionId, facts) => {
+			// the child died before ever registering (or after dropping its
+			// socket) — the registry still names it, now as an offline worker
+			// with the death facts attached, so list/get can diagnose it.
+			const key = bySessionId.get(sessionId);
+			const entry = key ? registry.get(key) : undefined;
+			if (entry) {
+				entry.status = "offline";
+				entry.conn = undefined;
+				entry.pid = undefined;
+				entry.lastSeen = Date.now();
+				entry.lastExit = { ...facts };
+			}
+		},
 	});
 
 	/** THE one visibility rule. A room is a path prefix; an ancestor sees its
@@ -358,6 +375,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		stats: e.stats,
 		pid: e.pid,
 		lastSeen: e.lastSeen,
+		lastExit: e.lastExit,
 	});
 
 	const snapshot = (mount: string = ROOT_ROOM): WorkerInfo[] =>
