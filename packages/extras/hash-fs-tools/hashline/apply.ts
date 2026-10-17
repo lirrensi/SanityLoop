@@ -4,6 +4,8 @@ import {
 	valEdit,
 	stripBarePrefixes,
 	stripDiffPrefixes,
+	stripReadRowPrefixes,
+	rejectDiffContamination,
 	swapReversedRanges,
 	warnUnicodeEsc,
 	fmtMismatchWithHashes,
@@ -162,8 +164,13 @@ export function applyEdit(
 	const warnings: string[] = [];
 
 	const rangeFixed = swapReversedRanges(edit, fileHashes, warnings);
-	const prefixFixed = stripDiffPrefixes(
-		stripBarePrefixes(rangeFixed, fileHashes, warnings),
+	// contamination first: a diff payload must error, never be half-repaired
+	rejectDiffContamination(rangeFixed);
+	const prefixFixed = stripReadRowPrefixes(
+		stripDiffPrefixes(
+			stripBarePrefixes(rangeFixed, fileHashes, warnings),
+			warnings,
+		),
 		warnings,
 	);
 

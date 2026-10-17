@@ -20,6 +20,9 @@ interface Prepared {
   servedGet(path: string): Record<string, unknown> | undefined;
   servedUpsert(path: string, hashes: string, updatedAt: number): void;
   servedDelete(path: string): void;
+  noopGet(path: string): Record<string, unknown> | undefined;
+  noopUpsert(path: string, payloadHash: string, count: number, updatedAt: number): void;
+  noopDelete(path: string): void;
 }
 
 export interface HashStore {
@@ -182,6 +185,14 @@ function buildStore(
       "updated_at INTEGER NOT NULL" +
     ")"
   );
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS noop (" +
+      "path TEXT PRIMARY KEY, " +
+      "payload_hash TEXT NOT NULL, " +
+      "count INTEGER NOT NULL, " +
+      "updated_at INTEGER NOT NULL" +
+    ")"
+  );
   const versionRow = db.prepare("SELECT value FROM meta WHERE key = 'version'").get() as { value?: string } | undefined;
   if (versionRow && versionRow.value !== String(HASH_STORE_VERSION)) {
     db.exec("DELETE FROM snapshots");
@@ -213,6 +224,12 @@ function buildStore(
     "ON CONFLICT(path) DO UPDATE SET hashes = excluded.hashes, updated_at = excluded.updated_at"
   );
   const servedDelStmt = db.prepare("DELETE FROM served WHERE path = ?");
+  const noopGetStmt = db.prepare("SELECT payload_hash, count FROM noop WHERE path = ?");
+  const noopUpsertStmt = db.prepare(
+    "INSERT INTO noop (path, payload_hash, count, updated_at) VALUES (?, ?, ?, ?) " +
+    "ON CONFLICT(path) DO UPDATE SET payload_hash = excluded.payload_hash, count = excluded.count, updated_at = excluded.updated_at"
+  );
+  const noopDelStmt = db.prepare("DELETE FROM noop WHERE path = ?");
   const stmts: Prepared = {
     get: (...params) => getStmt.get(...params) as Record<string, unknown> | undefined,
     allPaths: (...params) => allStmt.all(...params) as Record<string, unknown>[],
@@ -225,6 +242,9 @@ function buildStore(
     servedGet: (...params) => servedGetStmt.get(...params) as Record<string, unknown> | undefined,
     servedUpsert: (...params) => { withBusyRetry(() => { servedUpsertStmt.run(...params); }); },
     servedDelete: (...params) => { withBusyRetry(() => { servedDelStmt.run(...params); }); },
+    noopGet: (...params) => noopGetStmt.get(...params) as Record<string, unknown> | undefined,
+    noopUpsert: (...params) => { withBusyRetry(() => { noopUpsertStmt.run(...params); }); },
+    noopDelete: (...params) => { withBusyRetry(() => { noopDelStmt.run(...params); }); },
   };
   return { db, stmts };
 }
@@ -318,6 +338,7 @@ export function createMemoryHashStore(): HashStore {
   const snapshots = new Map<string, { checksum: string; lineCount: number; hashes: string }>();
   const undo = new Map<string, { content: string; bom: string; ending: string; hashes: string; resultContent: string }>();
   const served = new Map<string, string>();
+  const noop = new Map<string, { payloadHash: string; count: number }>();
 
   const stmts: Prepared = {
     get: (path: string, checksum: string, lineCount: number) => {
@@ -342,6 +363,12 @@ export function createMemoryHashStore(): HashStore {
     },
     servedUpsert: (path: string, hashes: string) => void served.set(path, hashes),
     servedDelete: (path: string) => void served.delete(path),
+    noopGet: (path: string) => {
+      const n = noop.get(path);
+      return n ? { payload_hash: n.payloadHash, count: n.count } : undefined;
+    },
+    noopUpsert: (path: string, payloadHash: string, count: number) => void noop.set(path, { payloadHash, count }),
+    noopDelete: (path: string) => void noop.delete(path),
   };
   return { stmts, engine: "node:sqlite" };
 }
@@ -533,6 +560,25 @@ export function deleteUndo(store: HashStore, path: string): void {
   store.stmts.undoDelete(path);
 }
 
+/** No-op loop guard state: last payload hash + consecutive identical-noop count. */
+export interface NoopState {
+  payloadHash: string;
+  count: number;
+}
+
+export function getNoop(store: HashStore, path: string): NoopState | undefined {
+  const row = store.stmts.noopGet(path);
+  if (!row || typeof row.payload_hash !== "string" || typeof row.count !== "number") return undefined;
+  return { payloadHash: row.payload_hash, count: row.count };
+}
+
+export function upsertNoop(store: HashStore, path: string, state: NoopState): void {
+  store.stmts.noopUpsert(path, state.payloadHash, state.count, Date.now());
+}
+
+export function deleteNoop(store: HashStore, path: string): void {
+  store.stmts.noopDelete(path);
+}
 const STAT_BATCH = 64;
 
 async function statMissing(rows: { path: string }[]): Promise<string[]> {

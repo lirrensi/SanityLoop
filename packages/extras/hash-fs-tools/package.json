@@ -6,6 +6,9 @@
   "exports": {
     ".": "./index.ts"
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
   "dependencies": {
     "@sanityloop/core": "^0.2.0",
     "diff": "^9.0.0",
@@ -13,6 +16,7 @@
     "xxhash-wasm": "^1.1.0"
   },
   "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0",
     "@types/diff": "^7.0.2"
   },
   "files": [

@@ -260,6 +260,60 @@ export function stripDiffPrefixes(
 	return { ...edit, content_lines: contentLines };
 }
 
+/** `N:content` rows pasted from `read` output with line numbers (e.g. `42:const x = 1;`). */
+const READ_ROW_RE = /^(\d{1,7}):(.*)$/;
+
+/**
+ * Strip `N:` read-output prefixes when EVERY non-empty replacement line carries
+ * one — a whole block pasted from numbered read output. Partial matches are
+ * left alone (a legit line may start with digits+colon).
+ */
+export function stripReadRowPrefixes(
+	edit: HEdit,
+	warnings: string[],
+): HEdit {
+	const nonEmpty = edit.content_lines.filter((l) => l.length > 0);
+	if (nonEmpty.length === 0) return edit;
+	if (!nonEmpty.every((l) => READ_ROW_RE.test(l))) return edit;
+	const contentLines = edit.content_lines.map((line) => {
+		if (line.length === 0) return line;
+		return line.replace(READ_ROW_RE, "$2");
+	});
+	warnings.push(
+		`[E_READ_ROW_PREFIX] Autocorrected: stripped "N:" line-number prefixes copied from read output in replacement_text (${nonEmpty.length} lines).`
+	);
+	return { ...edit, content_lines: contentLines };
+}
+
+/**
+ * Reject unified-diff contamination: `@@` hunk headers or `-old`/`+new` rows
+ * pasted as the replacement body. Unlike single-marker slips (auto-stripped
+ * above), a hunk header proves the whole payload is a diff, not content —
+ * repairing it would guess. Hard error with a targeted message.
+ */
+export function rejectDiffContamination(edit: HEdit): void {
+	const lines = edit.content_lines;
+	const hunk = lines.findIndex((l) => l.startsWith("@@ "));
+	if (hunk >= 0) {
+		throw new Error(
+			`[E_DIFF_CONTAMINATION] replacement_text looks like a unified diff (hunk header "@@ ..." on line ${hunk + 1}), not replacement content. ` +
+			`Pass the new file lines as plain text — no "@@" headers, no leading "-" / "+" markers. ` +
+			`To delete a range, pass replacement_text "" with remove_from/remove_to anchors.`
+		);
+	}
+	const nonEmpty = lines.filter((l) => l.length > 0);
+	if (
+		nonEmpty.length >= 2 &&
+		nonEmpty.every((l) => l.startsWith("-") || l.startsWith("+")) &&
+		nonEmpty.some((l) => l.startsWith("-")) &&
+		nonEmpty.some((l) => l.startsWith("+"))
+	) {
+		throw new Error(
+			`[E_DIFF_CONTAMINATION] replacement_text looks like diff rows (every line starts with "-" or "+"), not replacement content. ` +
+			`Pass the new file lines as plain text without markers. To delete a range, pass replacement_text "" with remove_from/remove_to anchors.`
+		);
+	}
+}
 export function swapReversedRanges(
 	edit: HEdit,
 	fileHashes: string[],

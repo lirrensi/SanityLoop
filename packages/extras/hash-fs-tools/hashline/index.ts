@@ -29,6 +29,8 @@ export {
 	valEdit,
 	stripBarePrefixes,
 	stripDiffPrefixes,
+	stripReadRowPrefixes,
+	rejectDiffContamination,
 	swapReversedRanges,
 	findNewEdge,
 	assertRangeServed,

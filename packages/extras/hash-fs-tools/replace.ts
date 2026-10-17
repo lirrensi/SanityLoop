@@ -32,7 +32,7 @@ import {
 } from "./replace-response.ts";
 import { loadP, loadGuide } from "./prompts.ts";
 import { saveUndo } from "./replace-undo.ts";
-import { loadHashStore, findSnapshotPaths, type HashStore } from "./hash-store.ts";
+import { loadHashStore, findSnapshotPaths, getNoop, upsertNoop, deleteNoop, type HashStore } from "./hash-store.ts";
 import { getServed, recordServedSafe, recordServedDiffSafe } from "./served.ts";
 import { withFileMutationQueue } from "./compat.ts";
 import { Tool, type JsonSchema } from "@sanityloop/core";
@@ -108,6 +108,20 @@ interface PipelineResult {
 }
 
 const ROOT_KS = new Set(["path", "remove_from", "remove_to", "replacement_text"]);
+
+/** Consecutive identical no-ops before the answer turns into a hard STOP (OMP: NOOP_HARD_LIMIT). */
+const NOOP_HARD_LIMIT = 3;
+
+/** Payload identity for the loop guard: normalized bounds + replacement text. FNV-1a hex. */
+function noopPayloadHash(params: ReqParams): string {
+  const payload = `${params.remove_from}␟${params.remove_to}␟${params.replacement_text}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < payload.length; i++) {
+    h ^= payload.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
 
 export function assertReq(request: unknown): asserts request is ReqParams {
   if (!isRec(request)) {
@@ -341,12 +355,20 @@ export function createReplaceTool(_opts: EditToolOptions = {}) {
         const editsAttempted = 1;
         if (originalNormalized === result) {
           const noopSnapshotId = await safeSnapId(absolutePath, "noop edit");
+          // loop guard: same payload no-op'ing repeatedly → escalate to STOP
+          const hashStore = await loadHashStore();
+          const payloadHash = noopPayloadHash(normalizedParams);
+          const prev = getNoop(hashStore, absolutePath);
+          const count = prev && prev.payloadHash === payloadHash ? prev.count + 1 : 1;
+          upsertNoop(hashStore, absolutePath, { payloadHash, count });
           return buildNoop({
             path,
             noopEdit,
             snapshotId: noopSnapshotId,
             editMeta: { editsAttempted, noopEditsCount: noopEdit ? 1 : 0, addedLines: 0, removedLines: 0 },
             warnings,
+            loopCount: count,
+            loopLimit: NOOP_HARD_LIMIT,
           });
         }
 
@@ -370,6 +392,8 @@ export function createReplaceTool(_opts: EditToolOptions = {}) {
         try {
           abortIf(agent.abortSignal);
           await writeAtomic(absolutePath, bom + restoreEndings(result, originalEnding));
+          // a real change breaks the loop — clear the guard for this path
+          deleteNoop(await loadHashStore(), absolutePath);
         } catch (error) {
           await undo.restore();
           throw error;

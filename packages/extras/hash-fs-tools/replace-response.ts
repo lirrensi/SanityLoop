@@ -38,6 +38,10 @@ export interface NoopInput {
 	snapshotId?: string;
 	editMeta: RMeta;
 	warnings: string[] | undefined;
+	/** Consecutive identical-noop count for this payload (loop guard). */
+	loopCount?: number;
+	/** Count at which the message turns into a hard STOP. */
+	loopLimit?: number;
 }
 
 export interface SuccessInput {
@@ -97,11 +101,19 @@ export function buildNoop(input: NoopInput): TResult {
 		warnings,
 	} = input;
 
+	const loopCount = input.loopCount ?? 1;
+	const loopLimit = input.loopLimit ?? 3;
+	const looping = loopCount >= loopLimit;
 	const noopDetailsText = noopEdit
 		? `Replacement for ${noopEdit.loc} is identical to current content:\n  ${noopEdit.loc}: ${clipLine(noopEdit.currentContent)}`
 		: "The edit produced identical content.";
+	const loopText = looping
+		? `\n\nSTOP — this exact edit has produced no change ${loopCount} times in a row. Do NOT re-issue it. Re-read the file, check whether the change is already applied or the anchors are wrong, and only then try a DIFFERENT edit.`
+		: loopCount > 1
+			? `\n\nNote: this identical edit has no-op'd ${loopCount} times in a row${loopLimit ? ` (${loopLimit - loopCount} more identical no-op before you must stop retrying it)` : ""}.`
+			: "";
 
-	const text = `No changes made to ${path}\nClassification: noop\n${noopDetailsText}${warnBlock(warnings)}`;
+	const text = `No changes made to ${path}\nClassification: noop\n${noopDetailsText}${loopText}${warnBlock(warnings)}`;
 
 	const metrics = buildMetrics({
 		classification: "noop",
