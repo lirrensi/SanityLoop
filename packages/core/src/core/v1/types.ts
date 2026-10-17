@@ -518,8 +518,8 @@ export interface GodObject extends Session {
   model: ModelContract;
   /** The loop hands this to the model so it can emit stream events. */
   streamSink?: StreamSink;
-  /** The abort signal — the model checks it between chunks. */
-  abortSignal?: AbortSignal;
+  /** The abort signal — live from construction; tools/models/subscribers hang here. Fires on abort(), fail(), and terminate(). */
+  abortSignal: AbortSignal;
 
   // ---- plugins (named batches of registrations, observable) ----
   install(plugin: Plugin): Promise<this>;

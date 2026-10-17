@@ -51,7 +51,10 @@ test("run() resolves after terminate() — the promise finally settles", async (
     assert.equal(agent.loopState, "terminated");
     // agentEnd is dual-purpose: once at the graceful landing, once at teardown
     assert.ok(ends.n() >= 1, "teardown announced (agentEnd)");
-    assert.equal(aborts.n(), 0, "an idle agent dies QUIETLY — no fake abort events");
+    // terminate ALWAYS aborts first — the cleanup channel fires even for an
+    // idle agent, so out-of-band children (background jobs) are never orphaned
+    assert.equal(aborts.n(), 1, "terminate fires the abort family exactly once");
+    assert.equal(agent.abortSignal.aborted, true, "the signal fired — subscribers saw it");
     assert.ok(
         agent.messages.length >= 2,
         "state preserved — the post-mortem stays inspectable",
@@ -137,6 +140,27 @@ test("terminate() mid-batch: in-flight tool commits its result, run() resolves",
         0,
         "no further turn ran after the off switch",
     );
+});
+// ---------------------------------------------------------------------------
+// Abort-first: out-of-band children die on terminate, even when idle
+// ---------------------------------------------------------------------------
+
+test("terminate() on an idle agent still fires signal + abort family (no orphans)", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("done")] });
+    seedUserMessage(agent, "hi");
+    const aborts = counter(agent, EVENTS.abort);
+    const befores = counter(agent, EVENTS.beforeAbort);
+    let signalFired = 0;
+    agent.abortSignal.addEventListener("abort", () => signalFired++, { once: true });
+    agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.terminate("owner cleanup");
+    assert.equal(befores.n(), 1, "beforeAbort fired on idle terminate");
+    assert.equal(aborts.n(), 1, "abort fired on idle terminate");
+    assert.equal(signalFired, 1, "signal subscribers saw it");
+    assert.equal(agent.loopState, "terminated");
 });
 
 // ---------------------------------------------------------------------------

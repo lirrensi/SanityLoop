@@ -284,6 +284,10 @@ export class Agent implements GodObject {
     };
     /** The abort controller — abort() fires it; the model checks it. */
     abortController = new AbortController();
+    /** The live abort signal — tools/models/subscribers hang here. Always defined. */
+    get abortSignal(): AbortSignal {
+        return this.abortController.signal;
+    }
 
     // ---- internal state ----
     /** The input being processed right now — public, the position. */
@@ -752,10 +756,10 @@ export class Agent implements GodObject {
     /**
      * THE OFF SWITCH — the only thing that ends run(). abort() kills the turn
      * but the heart keeps beating (process-lifetime agents); terminate() stops
-     * the heart: fires the abort family IF anything is in flight (an idle
-     * agent dies QUIETLY — no fake abort events in the stream), stamps
-     * `terminated`, both loops break at their next beat (≤1 quantum), and
-     * run() RESOLVES.
+     * the heart: ALWAYS aborts first — the cleanup channel, so out-of-band
+     * children (background jobs, servers) die on the signal/event and are
+     * never orphaned — then stamps `terminated`, both loops break at their
+     * next beat (≤1 quantum), and run() RESOLVES.
      *
      * Fire-and-forget safe: `void agent.terminate()` needs no listener — a
      * defensive catch logs any late loop crash instead of surfacing an
@@ -770,12 +774,11 @@ export class Agent implements GodObject {
         if (this.terminated) return this.runPromise ?? Promise.resolve();
         this.terminated = true;
         this.runDriven = true; // a terminated agent can never be driven again
-        // In-flight work gets the real kill: signal + event family + terminal
-        // stamp. Idle/quiet agents skip it — terminating must not fabricate
-        // beforeAbort/abort noise for a turn that never existed.
-        if (this.hasWorkerWork() || this.pendingSync.length > 0) {
-            this.abort(reason);
-        }
+        // ALWAYS abort first — out-of-band children (background jobs, servers)
+        // hang off the abort signal/event, and terminate must not orphan them.
+        // abort() is idempotent + terminal-guarded; an idle agent's abort is a
+        // no-op for the loop but still fires the cleanup channel for listeners.
+        this.abort(reason);
         this.loopState = "terminated";
         // fire-and-forget insurance: nobody holding the promise must never
         // mean an unhandled rejection if a loop crashes mid-death.
@@ -1577,6 +1580,7 @@ export class Agent implements GodObject {
     protected async fail(err: unknown, source: ErrorSource = "loop"): Promise<void> {
         if (this.isTerminal()) return; // terminal already handled (abort / terminate / errored)
         this.fire(EVENTS.error, this.errorFacts(err, source), true);
+        this.abortController.abort(); // the error path kills in-flight work too — same as abort()
         this.fire(EVENTS.beforeAbort, { reason: "error" }, true);
         this.fire(EVENTS.abort, { reason: "error" }, true);
         this.loopState = "errored";

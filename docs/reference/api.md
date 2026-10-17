@@ -94,7 +94,7 @@ agent.wake()            // pure "keep going" signal — sets wakeRequested, noth
 agent.stop()            // GENTLE request — finish the step, land at the next boundary
 agent.pause()           // GENTLE request — same family, land after the current message commits
 agent.abort(reason?)    // HARD kill — controller aborted, beforeAbort → abort → terminal (heart keeps ticking)
-agent.terminate(reason?) // THE OFF SWITCH — stops the heartbeat, run() RESOLVES; idempotent,
+agent.terminate(reason?) // THE OFF SWITCH — aborts FIRST (cleanup channel, never orphans), then stops the heartbeat, run() RESOLVES; idempotent,
                         // fire-and-forget safe; await for a "corpse is cold" join point
 agent.endCycle()        // veto: discard this cycle, run again (filters call it)
 agent.park(awaitItem)   // push a pending await — loop 1 raises blocked, loop 2 parks
@@ -128,7 +128,9 @@ Two ways to end it:
    - `createKeepOpenPlugin()` — the opposite: keeps breathing after each job
      (service/daemon shape)
    - (see `docs/reference/extensions.md` — one import + one install line)
-2. **The off switch** — `agent.terminate(reason?)` stops the heartbeat and
+2. **The off switch** — `agent.terminate(reason?)` aborts first (the cleanup
+   channel: in-flight model calls, tools, and out-of-band children like
+   background jobs die on the signal/event), then stops the heartbeat and
    `run()` **resolves** (await it for a clean join). Fire-and-forget safe,
    idempotent. Without either, the process is shut down at the app layer
    (e.g. `process.exit`).
