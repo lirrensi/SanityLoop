@@ -200,7 +200,7 @@ agent.install(createDefaultInputs());
 agent.install(createReplPlugin({ prompt: "you> " }));
 
 console.log("=== sanity repl — type something, /help for commands ===");
-agent.run();
+agent.run({ startState: "idle" }); // interactive posture, like templates/repl-agent.ts — bare run() screams on zero messages
 `;
 
 /**

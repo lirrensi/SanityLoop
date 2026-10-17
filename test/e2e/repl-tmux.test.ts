@@ -4,8 +4,10 @@
 // Per AGENTS.md law: the REPL is tested inside an ISOLATED tmux session —
 // never from our own shell. We derive the repl-agent composition with a stub
 // model (take template, change something), boot it in tmux, type at it, and
-// require: banner → prompt → reply → RE-PROMPT (the loop stays alive) →
-// /exit leaves the REPL. Skips cleanly when tmux is absent.
+// require: banner → input box → reply → idle-again (the loop stays alive) →
+// /exit leaves the REPL. Inside tmux it's a real TTY so the micro-TUI paints
+// (input box + status bar), NOT the readline "you>" fallback — markers match
+// the TUI surface. Skips cleanly when tmux is absent.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -62,22 +64,27 @@ test("repl: prompt → reply → re-prompt → /exit, inside isolated tmux", asy
         "Enter",
     );
 
-    // Banner + first prompt.
+    // Banner + input box (the TUI prompt marker).
     let pane = "";
     const bootDeadline = Date.now() + 20_000;
     while (Date.now() < bootDeadline) {
         pane = capture();
-        if (pane.includes("sanity repl") && pane.includes("you>")) break;
+        if (pane.includes("sanity repl") && pane.includes("type a message")) break;
         await sleep(300);
     }
     assert.ok(pane.includes("sanity repl"), `no banner\npane:\n${pane}`);
-    assert.ok(pane.includes("you>"), `no prompt\npane:\n${pane}`);
+    assert.ok(pane.includes("type a message"), `no input box\npane:\n${pane}`);
 
     // Type a real prompt; require the REPLY TEXT to actually paint. This is
     // the regression guard for the stream-delivery fix: deltas dispatch via
     // the registry lane + seam flush, so even a non-streaming stub's reply
     // renders before the landing. Markdown-inert text (no underscores).
-    tmux("send-keys", "-t", SESSION, "hello stub", "Enter");
+    // NOTE: text and Enter go as SEPARATE send-keys — one call blends them
+    // into a single chunk, and the raw-mode router reads that as paste
+    // (CR becomes a literal newline in the draft) instead of submit.
+    tmux("send-keys", "-t", SESSION, "hello stub");
+    await sleep(300);
+    tmux("send-keys", "-t", SESSION, "Enter");
     const replyDeadline = Date.now() + 15_000;
     while (Date.now() < replyDeadline) {
         pane = capture();
@@ -89,25 +96,31 @@ test("repl: prompt → reply → re-prompt → /exit, inside isolated tmux", asy
         `reply never painted\npane:\n${pane}`,
     );
 
-    // THE re-prompt — the loop landed and the session stayed open. The prompt
-    // redraws ~10ms after landing (setTimeout), so POLL for it after the reply
-    // instead of asserting from the same snapshot that first saw the reply.
+    // THE re-prompt — the loop landed and the session stayed open. The status
+    // bar returns to idle and the input box re-renders below the reply.
     const replyAt = pane.indexOf("STUB REPLY 1 OK");
-    let rePromptAt = -1;
+    let idleAgain = false;
     const promptDeadline = Date.now() + 5_000;
     while (Date.now() < promptDeadline) {
         pane = capture();
-        rePromptAt = pane.indexOf("you>", replyAt + 1);
-        if (rePromptAt > replyAt) break;
+        const tail = pane.slice(replyAt + 1);
+        if (tail.includes("idle") && tail.includes("type a message")) {
+            idleAgain = true;
+            break;
+        }
         await sleep(150);
     }
-    assert.ok(rePromptAt > replyAt, `no re-prompt after reply\npane:\n${pane}`);
+    assert.ok(idleAgain, `no idle-again after reply\npane:\n${pane}`);
 
-    // /exit must leave the REPL. A dead pane KEEPS its last pixels (the old
-    // "you>" lingers above whatever comes next), so "prompt gone" proves
-    // nothing. Decisive signals: the repl's "bye!" farewell with a FRESH pwsh
-    // prompt below it — or the tmux session itself gone.
-    tmux("send-keys", "-t", SESSION, "/exit", "Enter");
+    // /exit must leave the REPL (quit() → process.exit(0), no farewell text).
+    // A dead pane KEEPS its last pixels, so painted content proves nothing.
+    // Decisive signals: the tmux session itself gone, or a FRESH shell prompt
+    // below the last repl pixels.
+    tmux("send-keys", "-t", SESSION, "/exit");
+    await sleep(300);
+    tmux("send-keys", "-t", SESSION, "Escape"); // "/exit" opens the suggestion popup — dismiss it so Enter submits
+    await sleep(300);
+    tmux("send-keys", "-t", SESSION, "Enter");
     const exitDeadline = Date.now() + 10_000;
     let leftRepl = false;
     while (Date.now() < exitDeadline) {
@@ -116,8 +129,10 @@ test("repl: prompt → reply → re-prompt → /exit, inside isolated tmux", asy
             break;
         }
         pane = capture();
-        const byeAt = pane.lastIndexOf("bye!");
-        if (byeAt !== -1 && pane.indexOf("PS ", byeAt) > byeAt) {
+        // shell prompt back on the last lines (glued to stale bar pixels —
+        // match the prompt shape, not line position)
+        const tail = pane.trimEnd().split("\n").slice(-3).join("\n");
+        if (/(\w@[\w.-]+:[^\n]*[$#] ?|PS )/.test(tail)) {
             leftRepl = true;
             break;
         }

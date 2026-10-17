@@ -4,7 +4,7 @@
 // Production promise: when things explode mid-turn, the process LANDS —
 // bounded, diagnosed, never hung. Two documented contracts under fire:
 //   - provider throw → fail(err,"provider") → terminal "errored" landing,
-//     stderr carries "[sanity] turn failed:", quit-on-end exits 1.
+//     stderr carries "[sanity] turn failed (agent=…", quit-on-end exits 1.
 //   - tool throw → error-as-result → the MODEL sees the failure, the turn
 //     COMPLETES, graceful exit 0.
 
@@ -25,7 +25,7 @@ test("crash: exploding PROVIDER lands terminal, diagnosed, bounded — never han
     );
     assert.ok(r.stdout.includes("CRASH_WORKER_RUNNING mode=model"), "never started");
     assert.ok(
-        r.stderr.includes("[sanity] turn failed:") && r.stderr.includes("BOMB_MODEL_EXPLODED"),
+        r.stderr.includes("[sanity] turn failed (agent=crash-worker, source=provider") && r.stderr.includes("BOMB_MODEL_EXPLODED"),
         "the explosion was not diagnosed on stderr",
     );
 });

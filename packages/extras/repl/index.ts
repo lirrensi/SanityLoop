@@ -327,6 +327,9 @@ function installTui(agent: GodObject, opts: ReplOptions): void {
 				printRaw(`${s.gray("── ")}${line}${s.gray(" ──")}`);
 			}
 			updateBar();
+			// updateBar only repaints while streaming (tally) — the landing
+			// flip to idle needs its own repaint or the bar sticks on ● ch.
+			block.render();
 		},
 	});
 
