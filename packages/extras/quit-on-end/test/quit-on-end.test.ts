@@ -78,3 +78,90 @@ test("terminate mode still fires on terminal states even with work owed", async 
     await fireAgentEnd(agent);
     assert.equal(terminateCalls, 1, "terminal states must terminate immediately");
 });
+
+test("canQuit veto stands down (terminate mode)", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
+    let consults = 0;
+    agent.install(createQuitOnEndPlugin({
+        mode: "terminate",
+        canQuit: () => {
+            consults += 1;
+            return false;
+        },
+    }));
+    let terminateCalls = 0;
+    agent.terminate = ((..._args: unknown[]) => {
+        terminateCalls += 1;
+        return Promise.resolve();
+    }) as typeof agent.terminate;
+    assert.equal(agent.hasWork, false, "fresh agent must be workless");
+    await fireAgentEnd(agent);
+    assert.equal(consults, 1, "predicate must be consulted when built-ins pass");
+    assert.equal(terminateCalls, 0, "veto must stand down");
+});
+
+test("canQuit allow quits (terminate mode)", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
+    agent.install(createQuitOnEndPlugin({ mode: "terminate", canQuit: () => true }));
+    let terminateCalls = 0;
+    agent.terminate = ((..._args: unknown[]) => {
+        terminateCalls += 1;
+        return Promise.resolve();
+    }) as typeof agent.terminate;
+    await fireAgentEnd(agent);
+    assert.equal(terminateCalls, 1, "allow must quit");
+});
+
+test("canQuit NOT consulted when built-ins already stand down", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
+    let consults = 0;
+    agent.install(createQuitOnEndPlugin({
+        mode: "terminate",
+        canQuit: () => {
+            consults += 1;
+            return true;
+        },
+    }));
+    agent.terminate = (() => Promise.resolve()) as typeof agent.terminate;
+    seed(agent); // hasWork true → built-in stands down first
+    await fireAgentEnd(agent);
+    assert.equal(consults, 0, "predicate must not run when built-ins already stand down");
+});
+
+test("canQuit NOT consulted on terminal states", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
+    let consults = 0;
+    agent.install(createQuitOnEndPlugin({
+        mode: "terminate",
+        canQuit: () => {
+            consults += 1;
+            return false;
+        },
+    }));
+    let terminateCalls = 0;
+    agent.terminate = ((..._args: unknown[]) => {
+        terminateCalls += 1;
+        return Promise.resolve();
+    }) as typeof agent.terminate;
+    agent.loopState = "aborted";
+    await fireAgentEnd(agent);
+    assert.equal(consults, 0, "terminal path must bypass the predicate");
+    assert.equal(terminateCalls, 1, "terminal states quit immediately");
+});
+
+test("throwing canQuit stands down (fail-closed)", async () => {
+    const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
+    agent.install(createQuitOnEndPlugin({
+        mode: "terminate",
+        canQuit: () => {
+            throw new Error("predicate bug");
+        },
+    }));
+    let terminateCalls = 0;
+    agent.terminate = ((..._args: unknown[]) => {
+        terminateCalls += 1;
+        return Promise.resolve();
+    }) as typeof agent.terminate;
+    await fireAgentEnd(agent);
+    assert.equal(terminateCalls, 0, "throw must stand down, never quit");
+});

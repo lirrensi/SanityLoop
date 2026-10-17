@@ -34,7 +34,7 @@ agent.install(createSomething({ /* opts */ }));
 | `@sanityloop/inputs` | `createDefaultInputs()` | The default input vocabulary: `input_abort`, `input_stop`, `input_steer` (inserts after current tool batch), `input_followup` (inserts at landing), `request_clear` (hide history), `request_reset` (back to system-only). Install this or nothing turns inputs into messages. |
 | `@sanityloop/loop-control` | `loopControl(opts)` | Watchdogs: doom-loop detection (repeated tool failures), max-turns budget. The doctrine says a strong model needs none of it. |
 | `@sanityloop/keep-open` | `createKeepOpenPlugin()` | Keeps the loop breathing when it would otherwise settle (long-lived processes). |
-| `@sanityloop/quit-on-end` | `createQuitOnEndPlugin()` | Exits the process when the agent lands idle (batch scripts). |
+| `@sanityloop/quit-on-end` | `createQuitOnEndPlugin(opts)` | Exits the process when the agent lands idle (batch scripts). `mode: "terminate"` stops only this agent's heart (multi-agent hosts). `canQuit(agent)` vetoes the quit while out-of-band work (background bash jobs) is alive — fail-closed, non-terminal path only. |
 
 ## Context & knowledge
 
@@ -53,7 +53,7 @@ agent.install(createSomething({ /* opts */ }));
 | --- | --- | --- |
 | `@sanityloop/basic-fs-tools` | `createBasicTools(opts)` | Read/write/edit file tools with truncation guards. |
 | `@sanityloop/hash-fs-tools` | `createEditTools(opts)` | Hash-addressed edit tools — precise, conflict-safe edits. |
-| `@sanityloop/shell-tool` | `bashTool` / `createBashPlugin(opts)`, plus `globTool`, `echo` | Shell execution (Windows-first: resolves login shell/coreutils, kills process trees, accumulates output, truncates tail so errors survive). |
+| `@sanityloop/shell-tool` | `bashTool` / `createBashPlugin(opts)`, plus `globTool`, `echo` | Shell execution (Windows-first: resolves login shell/coreutils, kills process trees, accumulates output, truncates tail so errors survive). `background: {...}` adds explicit `background: true` (bg_N) + auto-background with followup delivery; companions `jobs`/`job_read`/`job_kill`/`job_wait`; plugin returns `{ jobs }` view for quit-on-end's `canQuit`. |
 | `@sanityloop/simple-todo` | `createTodoTool()` | Task-list tool writing `state.todos` — observed, restorable. |
 | `@sanityloop/ask-question` | `createQuestionTool(opts)` | The model asks the human a question: parks an await, any channel answers (`terminalAsk` included). |
 

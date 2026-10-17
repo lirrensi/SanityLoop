@@ -134,6 +134,13 @@ const myTools = [echoTool];   // ← collect tools here, feed them to the agent 
 // import { createBashPlugin, globTool } from "@sanityloop/shell-tool";
 // // ^ bash arrives as a PLUGIN — install it down in §5, NOT as a tool here.
 // myTools.push(globTool);                               // glob file search
+//
+// BACKGROUND (optional): pass `background: {...}` to the plugin → the model
+// gets `background: true` (explicit bg_N) + auto-background of slow calls.
+// Settled jobs deliver as new messages. Companions included:
+// jobs / job_read / job_kill / job_wait. Requires the inputs plugin (§5,
+// already installed). ⚠ with quit-on-end (§5-B) you MUST wire `canQuit`
+// (see §5-B) or the process exits mid-job and orphans the child.
 
 // --- OPTION: task list ------------------------------------------------------
 // WANT: the model keeping a visible plan? Writes `state.todos` — observed,
@@ -301,6 +308,15 @@ agent.install(createDefaultInputs());
 //       its reply and exits cleanly instead of hanging.)
 import { createQuitOnEndPlugin } from "@sanityloop/quit-on-end";
 agent.install(createQuitOnEndPlugin());
+//
+// BACKGROUND JOBS? Wire the gate or orphans happen: a backgrounded job keeps
+// no loop work owed, so bare quit-on-end exits at the first landing and the
+// child is orphaned (POSIX) or dies with the process. Capture the plugin and
+// veto while jobs run — JobCompletes → delivery turn → TrueCompletion → exit:
+//
+// const bash = createBashPlugin({ background: { autoThresholdMs: 60_000 } });
+// agent.install(bash);   // ← install THIS (in the bash block), not a fresh one
+// agent.install(createQuitOnEndPlugin({ canQuit: () => !bash.jobs.hasRunningJobs() }));
 //
 // C) KEEP-OPEN — long-lived daemon ──────────────────────────────────────────
 // WHAT: keeps the loop breathing after each job settles — the opposite of B.
