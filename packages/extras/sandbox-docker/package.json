@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
-  "description": "docker micro-sandbox RunTarget for SanityLoop — mounts your project, runs the agent isolated",
+  "description": "docker micro-sandbox ExecutionTarget for SanityLoop — mounts your project, runs the agent isolated",
   "exports": {
     ".": "./index.ts"
   },

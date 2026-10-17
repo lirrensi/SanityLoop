@@ -1,7 +1,7 @@
 // sandboxed-agent.ts — a normal agent that can optionally run INSIDE a docker
-// micro-sandbox. The agent code (main) is byte-identical on host or in-container;
-// only the launch differs. This is the single-file / Pattern #1 dream: one file,
-// opt into isolation with an env var, no tool changes anywhere.
+// micro-sandbox (the ExecutionTarget execution axis). The agent code (main) is
+// byte-identical on host or in-container; only the launch differs. This is the
+// single-file / Pattern #1 dream: one file, opt into isolation with an env var,
 //
 //   node --experimental-strip-types templates/sandboxed-agent.ts            # host
 //   SANDBOX=docker node --experimental-strip-types templates/sandboxed-agent.ts
@@ -13,7 +13,7 @@ import { Agent, SimpleModel, EVENTS } from "@sanityloop/core";
 import { createDefaultInputs } from "@sanityloop/inputs";
 import { jsonlSession } from "@sanityloop/base-storage";
 import { runInSandbox } from "@sanityloop/sandbox";
-import { createDockerSandbox } from "@sanityloop/sandbox-docker";
+import { createDockerExecution } from "@sanityloop/sandbox-docker";
 import { fileURLToPath } from "node:url";
 import { dirname, relative } from "node:path";
 
@@ -48,7 +48,7 @@ export function main() {
 // runs on the host (no SANDBOX) AND inside the container (SANDBOX not forwarded).
 if (process.env.SANDBOX === "docker") {
   await runInSandbox({
-    target: createDockerSandbox({
+    target: createDockerExecution({
       image: "node:22",
       mount: projectRoot, // bind-mount project root read-only into /work
       readOnly: true,

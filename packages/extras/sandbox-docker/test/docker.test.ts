@@ -6,8 +6,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildMountArg, buildRunArgs, createDockerSandbox } from "../docker.ts";
-import type { RunOptions } from "@sanityloop/sandbox";
+import { buildMountArg, buildRunArgs, createDockerExecution, createDockerSandbox } from "../docker.ts";
+import type { ExecutionOptions } from "@sanityloop/sandbox";
 
 test("buildMountArg: readOnly appends :ro; defaults to the staged root", () => {
 	assert.equal(
@@ -28,7 +28,7 @@ test("buildRunArgs: mounts, tmpfs, ports, env and entry all end up in the docker
 		"stageRoot",
 		"node:22",
 		"probe.ts",
-		{ env: { K: "v" }, ports: [8080], args: ["--flag"] } satisfies RunOptions,
+		{ env: { K: "v" }, ports: [8080], args: ["--flag"] } satisfies ExecutionOptions,
 	);
 	const s = args.join(" ");
 	assert.ok(s.includes("-v C:/proj:/work:ro"), s);
@@ -58,7 +58,7 @@ test("LIVE docker micro-sandbox: real isolation (needs SL_DOCKER=1)", {
 		].join("\n"),
 	);
 
-	const sandbox = createDockerSandbox({
+	const sandbox = createDockerExecution({
 		mount: projectRoot,
 		readOnly: true,
 		tmpfs: "/tmp",
@@ -86,4 +86,8 @@ test("LIVE docker micro-sandbox: real isolation (needs SL_DOCKER=1)", {
 		out.includes("work_write=blocked"),
 		`read-only mount should block writes; output: ${out}`,
 	);
+});
+
+test("alias: createDockerSandbox still resolves", () => {
+	assert.equal(createDockerSandbox, createDockerExecution);
 });

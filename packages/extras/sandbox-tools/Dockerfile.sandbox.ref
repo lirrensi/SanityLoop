@@ -1,0 +1,23 @@
+# Reference sandbox image for @sanityloop/sandbox-tools.
+# Layer 1: build + run a long-lived container the loop execs into.
+#   docker build -f Dockerfile.sandbox.ref -t sl-sandbox:ref .
+#   (build context = the sanityloop repo root; the SDK ships in-package)
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git jq ripgrep python3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# In-image SDK (protocol 1): the host's fs tools talk to this over stdin/stdout.
+
+COPY packages/extras/sandbox-tools/sdk/cli.cjs /opt/sdk/cli.cjs
+
+RUN useradd -m -s /bin/sh sbx \
+  && mkdir -p /workspace /opt/sdk \
+  && chown -R sbx:sbx /workspace /opt/sdk \
+  && chmod 755 /opt/sdk /workspace \
+  && chmod 644 /opt/sdk/cli.cjs
+
+USER sbx
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

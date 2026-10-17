@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stageFiles } from "@sanityloop/sandbox";
-import type { RunTarget, RunOptions, StageSpec } from "@sanityloop/sandbox";
+import type { ExecutionTarget, ExecutionOptions, StageSpec } from "@sanityloop/sandbox";
 
 export interface DockerSandboxOpts {
 	image?: string; // default "node:22" (needs --experimental-strip-types → 22.6+)
@@ -35,7 +35,7 @@ export function buildRunArgs(
 	stageRoot: string,
 	image: string,
 	script: string,
-	run: RunOptions,
+	run: ExecutionOptions,
 ): string[] {
 	const portArgs = (run.ports ?? []).flatMap((p) => ["-p", `${p}:${p}`]);
 	const mountArgs = [
@@ -75,7 +75,7 @@ export function buildRunArgs(
 // Foreground model: `docker run` streams the container's stdout/stderr straight
 // into our callbacks and its exit code IS the script's exit code — no
 // logs/detach/wait race.
-export function createDockerSandbox(opts: DockerSandboxOpts = {}): RunTarget {
+export function createDockerExecution(opts: DockerSandboxOpts = {}): ExecutionTarget {
 	const image = opts.image ?? "node:22";
 	const workdir = opts.workdir ?? "/work";
 	const stageRoot = mkdtempSync(join(tmpdir(), "sl-docker-"));
@@ -88,7 +88,7 @@ export function createDockerSandbox(opts: DockerSandboxOpts = {}): RunTarget {
 			await stageFiles(files, stageRoot);
 		},
 
-		async run(script: string, run: RunOptions = {}) {
+		async run(script: string, run: ExecutionOptions = {}) {
 			const proc = spawn(
 				"docker",
 				buildRunArgs(opts, workdir, stageRoot, image, script, run),
@@ -114,3 +114,6 @@ export function createDockerSandbox(opts: DockerSandboxOpts = {}): RunTarget {
 		},
 	};
 }
+
+// Backward-compat alias: old imports still compile (plan contract).
+export const createDockerSandbox = createDockerExecution;

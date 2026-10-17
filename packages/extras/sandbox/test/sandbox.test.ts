@@ -11,23 +11,28 @@ import {
 	stageAndRun,
 } from "@sanityloop/sandbox";
 import type {
+	ExecutionTarget,
+	ExecutionOptions,
+	ExecutionResult,
+	StageSpec,
+} from "@sanityloop/sandbox";
+import type {
 	RunTarget,
 	RunOptions,
 	RunResult,
-	StageSpec,
 } from "@sanityloop/sandbox";
 
-function makeMockTarget(): RunTarget & {
-	calls: { script: string; opts?: RunOptions }[];
+function makeMockTarget(): ExecutionTarget & {
+	calls: { script: string; opts?: ExecutionOptions }[];
 } {
-	const calls: { script: string; opts?: RunOptions }[] = [];
+	const calls: { script: string; opts?: ExecutionOptions }[] = [];
 	return {
 		kind: "mock",
 		calls,
 		async stage() {},
-		async run(script: string, opts?: RunOptions) {
+		async run(script: string, opts?: ExecutionOptions) {
 			calls.push({ script, opts });
-			return { code: 0, signal: null } satisfies RunResult;
+			return { code: 0, signal: null } satisfies ExecutionResult;
 		},
 		async dispose() {},
 	};
@@ -134,4 +139,10 @@ test("stageAndRun: copy mode stages the script to agent/<base> and runs that ent
 	assert.equal(res?.code, 0);
 	assert.equal(stagedTo, "agent/my-agent.ts");
 	assert.equal(target.calls[0]!.script, "agent/my-agent.ts");
+});
+
+test("aliases: old Run* names still resolve to the new Execution* types", async () => {
+	const target: RunTarget = makeMockTarget();
+	const res: RunResult = await target.run("x.ts", { args: [] } satisfies RunOptions);
+	assert.equal(res.code, 0);
 });

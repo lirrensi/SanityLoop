@@ -3,12 +3,12 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stageFiles } from "./stage.ts";
-import type { RunTarget, RunOptions, StageSpec } from "./types.ts";
+import type { ExecutionTarget, ExecutionOptions, StageSpec } from "./types.ts";
 
-// The "no isolation" target — today's behavior, wrapped as a RunTarget so the
+// The "no isolation" target — today's behavior, wrapped as an ExecutionTarget so the
 // launcher API is uniform. Like Flue's local(): real host FS + real shell,
 // zero isolation by design.
-export function createLocalSandbox(opts: { workdir?: string } = {}): RunTarget {
+export function createLocalSandbox(opts: { workdir?: string } = {}): ExecutionTarget {
   const workdir = opts.workdir ?? join(tmpdir(), `sl-local-${Date.now()}`);
   mkdirSync(workdir, { recursive: true });
   return {
@@ -16,7 +16,7 @@ export function createLocalSandbox(opts: { workdir?: string } = {}): RunTarget {
     async stage(files: StageSpec[]) {
       await stageFiles(files, workdir);
     },
-    async run(script: string, run: RunOptions = {}) {
+    async run(script: string, run: ExecutionOptions = {}) {
       return new Promise((resolve) => {
         const child = spawn("node", ["--experimental-strip-types", script, ...(run.args ?? [])], {
           cwd: run.cwd ?? workdir,

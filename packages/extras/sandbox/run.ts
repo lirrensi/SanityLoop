@@ -1,8 +1,8 @@
 import { basename } from "node:path";
-import type { RunTarget, RunOptions, RunResult, StageSpec } from "./types.ts";
+import type { ExecutionTarget, ExecutionOptions, ExecutionResult, StageSpec } from "./types.ts";
 
 export interface RunInSandboxOpts {
-	target: RunTarget;
+	target: ExecutionTarget;
 	// The agent's entry function — runs unchanged inside the target.
 	run: () => void | Promise<void>;
 	// Copy mode: this file's path (pass `import.meta.filename`). Staged to agent/<base>.
@@ -19,11 +19,11 @@ export interface RunInSandboxOpts {
 }
 
 // Core, testable: stage (if needed) + run the script inside the target.
-// Returns the target's RunResult, or null when the marker guard fired (the
+// Returns the target's ExecutionResult, or null when the marker guard fired (the
 // agent ran in place and nothing was launched). Never exits the process.
 export async function stageAndRun(
 	opts: RunInSandboxOpts,
-): Promise<RunResult | null> {
+): Promise<ExecutionResult | null> {
 	const marker = opts.marker ?? "SL_INSIDE_SANDBOX";
 	if (process.env[marker]) {
 		await opts.run();
@@ -54,7 +54,7 @@ export async function stageAndRun(
 		args: opts.args,
 		env: { ...opts.env, [marker]: "1" },
 		ports: opts.ports,
-	} satisfies RunOptions);
+	} satisfies ExecutionOptions);
 	return result;
 }
 

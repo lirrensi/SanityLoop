@@ -1,8 +1,8 @@
-// The ONLY fixed contract for sandboxing. A RunTarget wraps *process execution*,
-// not the tools — the agent script runs INSIDE the target, so tools stay native
-// and untouched. Isolation comes from where the process lives.
+// The ONLY fixed contract for sandboxing. An ExecutionTarget wraps *process
+// execution*, not the tools — the agent script runs INSIDE the target, so tools
+// stay native and untouched. Isolation comes from where the process lives.
 
-export interface RunOptions {
+export interface ExecutionOptions {
   args?: string[];
   env?: Record<string, string>;
   ports?: number[];
@@ -17,18 +17,26 @@ export type StageSpec =
   | { from: string; to: string } // host path   -> staged relative path
   | { content: string; to: string }; // inline      -> staged relative path
 
-export interface RunResult {
+export interface ExecutionResult {
   code: number | null;
   signal: string | null;
 }
 
-export interface RunTarget {
+export interface ExecutionTarget {
   // "local" | "docker:node:22" | "e2b:..." — informational.
   readonly kind: string;
   // Copy-in-at-startup: stage files into the target's workspace (host side).
   stage(files: StageSpec[]): Promise<void>;
   // Run an agent script inside the target. Resolves when the script exits.
-  run(script: string, opts?: RunOptions): Promise<RunResult>;
+  run(script: string, opts?: ExecutionOptions): Promise<ExecutionResult>;
   // Tear down: kill container / remove temp workspace.
   dispose(): Promise<void>;
 }
+
+// --- Backward-compat aliases (old names still importable) ---
+/** @deprecated Use ExecutionOptions. */
+export type RunOptions = ExecutionOptions;
+/** @deprecated Use ExecutionResult. */
+export type RunResult = ExecutionResult;
+/** @deprecated Use ExecutionTarget. */
+export type RunTarget = ExecutionTarget;
