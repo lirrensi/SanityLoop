@@ -312,6 +312,7 @@ Delete any of these folders and the core still runs.
 |  [`@sanityloop/extras/observer`](packages/extras/observer/) | Developing/debugging — prints the loop: lifecycle headlines, stream details. |
 |  [`@sanityloop/extras/log-sink`](packages/extras/log-sink/) | Real logging — JSONL with rotation to file, or pretty console output. |
 |  [`@sanityloop/extras/snapshot`](packages/extras/snapshot/) | Building status cards and dashboards over the live agent. |
+|  [`@sanityloop/extras/sentry`](packages/extras/sentry/) | Sentry error monitoring — one install line turns fatal lanes into issues with a breadcrumb trail. |
 
 ### Persistence
 

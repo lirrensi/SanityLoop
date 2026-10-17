@@ -366,6 +366,14 @@ agent.install(createQuitOnEndPlugin());
 // agent.install(createFileLog({ path: "logs/my-agent.jsonl" }));
 // agent.install(createConsoleLog());
 
+// ---- SENTRY — error monitoring ──────────────────────────────────────────────
+// WHAT: fatal lanes (error + handlerError) become Sentry issues with a
+//       breadcrumb trail; tool/log lanes opt in per-lane and per-tool.
+// WANT: production error monitoring with zero new deps (fetch envelope).
+//
+// import { createSentryPlugin } from "@sanityloop/sentry";
+// agent.install(createSentryPlugin({ dsn: process.env.SENTRY_DSN }));
+
 // ---- LOOP CONTROL — watchdogs for unattended runs ─────────────────────────
 // WHAT: doom-loop detection (same tool failing repeatedly) + max-turns budget.
 // WANT: cron/unattended runs where nobody watches. The doctrine says a strong

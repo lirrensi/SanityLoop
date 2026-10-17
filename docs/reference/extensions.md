@@ -64,6 +64,7 @@ agent.install(createSomething({ /* opts */ }));
 | `@sanityloop/observer` | `createObserverPlugin({ verbosity, write, logs })` | Prints the loop: lifecycle headlines (1), + stream/details (2). `logs: true` also catches the shared `log` channel and declared `log/*` events. |
 | `@sanityloop/log-sink` | `createFileLog({ path })`, `createConsoleLog()` | Sinks for the shared log channel — JSONL with size rotation, or pretty console lines. Producers just `emitLog(...)` from util. |
 | `@sanityloop/snapshot` | `agentSnapshot(agent)` | The light status card builder (used by storage cards and dashboards). |
+| `@sanityloop/sentry` | `createSentryPlugin({ dsn })` | Sentry error monitoring — fatal lanes become issues with a breadcrumb trail; tool/log lanes opt in (`tools`/`logs` gates, `transport`/`beforeSend`/`flush()`). |
 
 ## Persistence
 
