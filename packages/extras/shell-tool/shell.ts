@@ -446,12 +446,25 @@ export class ShellError extends Error {
 }
 
 /**
- * Spawn the shell, stream stdout+stderr into onData, kill the process TREE on
- * timeout or abort. Throws `timeout:<ms>` / `aborted` / cwd errors — the tool
- * formats them into the answer.
+ * A running shell — the background-capable handle. `completion` settles when
+ * the process exits (same throw contract as executeLocalShell); `cancel()`
+ * kills the process TREE (graceful escalation); `pids()` reports the live
+ * root pid while running (empty before spawn / after exit).
  */
-export async function executeLocalShell(command: string, options: ShellExecOptions): Promise<ShellExecResult> {
-  if (options.abortSignal?.aborted) throw new Error("aborted");
+export interface RunningShell {
+  completion: Promise<ShellExecResult>;
+  cancel: () => void;
+  pids: () => readonly number[];
+}
+
+/**
+ * Spawn the shell, stream stdout+stderr into onData, kill the process TREE on
+ * timeout or abort. Returns the live handle — the caller decides whether to
+ * await it (foreground) or park it in a job (background). Throws `timeout:<ms>`
+ * / `aborted` / cwd errors on `completion` — the tool formats them into the answer.
+ * Throws cwd errors SYNCHRONOUSLY (fail fast, before any job row exists).
+ */
+export function startLocalShell(command: string, options: ShellExecOptions): RunningShell {
   if (!existsSync(options.cwd)) {
     throw new ShellError("cwd_missing", `Working directory does not exist: ${options.cwd}`);
   }
@@ -476,28 +489,51 @@ export async function executeLocalShell(command: string, options: ShellExecOptio
 
   let timedOut = false;
   let timeoutHandle: NodeJS.Timeout | undefined;
+  let cancelRequested = false;
   const onAbort = (): void => terminateGracefully(child);
+  const cancel = (): void => {
+    cancelRequested = true;
+    terminateGracefully(child);
+  };
 
-  try {
-    if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
-      timeoutHandle = setTimeout(() => {
-        timedOut = true;
-        terminateGracefully(child);
-      }, options.timeoutMs);
-    }
-    child.stdout?.on("data", (data: Buffer) => options.onData(data));
-    child.stderr?.on("data", (data: Buffer) => options.onData(data));
-    if (options.abortSignal) {
-      if (options.abortSignal.aborted) onAbort();
-      else options.abortSignal.addEventListener("abort", onAbort, { once: true });
-    }
-
-    const exitCode = await waitForChildProcess(child);
-    if (options.abortSignal?.aborted) throw new Error("aborted");
-    if (timedOut) throw new Error(`timeout:${options.timeoutMs}`);
-    return { exitCode, timedOut: false };
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-    options.abortSignal?.removeEventListener("abort", onAbort);
+  if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      terminateGracefully(child);
+    }, options.timeoutMs);
   }
+  child.stdout?.on("data", (data: Buffer) => options.onData(data));
+  child.stderr?.on("data", (data: Buffer) => options.onData(data));
+  if (options.abortSignal) {
+    if (options.abortSignal.aborted) onAbort();
+    else options.abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  const completion = (async (): Promise<ShellExecResult> => {
+    try {
+      const exitCode = await waitForChildProcess(child);
+      if (cancelRequested) throw new Error("aborted");
+      if (options.abortSignal?.aborted) throw new Error("aborted");
+      if (timedOut) throw new Error(`timeout:${options.timeoutMs}`);
+      return { exitCode, timedOut: false };
+    } finally {
+      clearTimeout(timeoutHandle);
+      options.abortSignal?.removeEventListener("abort", onAbort);
+    }
+  })();
+
+  return {
+    completion,
+    cancel,
+    pids: () => (child.exitCode === null && child.signalCode === null && child.pid !== undefined ? [child.pid] : []),
+  };
+}
+
+/**
+ * Spawn the shell and await it — the foreground one-shot. Thin wrapper over
+ * startLocalShell; identical behavior (pre-aborted signal throws before spawn).
+ */
+export async function executeLocalShell(command: string, options: ShellExecOptions): Promise<ShellExecResult> {
+  if (options.abortSignal?.aborted) throw new Error("aborted");
+  return startLocalShell(command, options).completion;
 }
