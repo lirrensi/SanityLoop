@@ -1,4 +1,5 @@
 // sanity/src/extras/util.ts — shared tool-output truncation (vendored from pi).
+import { answerText as coreAnswerText } from "@sanityloop/core";
 import type { Filter, Message } from "@sanityloop/core";
 
 /**
@@ -67,11 +68,10 @@ export function toolNames(agent: { messages: Message[] }, turn: Message | undefi
   return "?";
 }
 
-/** The tool result's `answer` face — what the model sees. */
+/** The tool result's `answer` face — what the model sees (flattened, capped). */
 export function toolAnswer(turn: Message | undefined): string {
   const answer = (turn?.content as { answer?: unknown } | undefined)?.answer;
-  if (typeof answer !== "string") return "";
-  const flat = answer.replace(/\s+/g, " ").trim();
+  const flat = coreAnswerText(answer).replace(/\s+/g, " ").trim();
   return flat.length > 200 ? flat.slice(0, 200) + "…" : flat;
 }
 

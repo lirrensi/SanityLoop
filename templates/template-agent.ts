@@ -42,8 +42,9 @@ import {
 // WHEN: always. No model, no loop.
 // PICK ONE of the shapes below. Everything else in this file works with either.
 const model = new SimpleModel({
-    modelId: "gpt-4o-mini",
+    modelId: process.env.SANITYLOOP_MODEL ?? "gpt-4o-mini",
     apiKey: process.env.OPENAI_API_KEY,
+    baseUrl: process.env.OPENAI_BASE_URL,   // unset → api.openai.com; point at llama.cpp/vLLM for local
     stream: true,          // token-by-token deltas → your filters (§6) see them
 });
 

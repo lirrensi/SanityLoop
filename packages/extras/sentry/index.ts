@@ -16,7 +16,7 @@
 // `transport` (power users forward into `@sentry/node` or a file). Network is
 // fire-and-forget, never awaited in the filter chain; `flush()` settles it.
 // ============================================================================
-import { EVENTS } from "@sanityloop/core";
+import { EVENTS, answerText } from "@sanityloop/core";
 import type { EventPayload, GodObject, Plugin } from "@sanityloop/core";
 import { LOG_CHANNEL, removeFiltersByPrefix } from "@sanityloop/util";
 import type { LogEntry } from "@sanityloop/util";
@@ -275,10 +275,11 @@ export function isThrownResult(result: { error?: boolean; stored?: unknown }): b
 }
 
 /** Model-noise: bad args, unknown/disabled tool — breadcrumb, never an issue. */
-export function isNoiseResult(result: { answer: string; error?: boolean; errorMessage?: string }): boolean {
+export function isNoiseResult(result: { answer: string | unknown[]; error?: boolean; errorMessage?: string }): boolean {
   if (!result.error) return false;
   if (result.errorMessage === "invalid_arguments") return true;
-  return result.answer.startsWith("Unknown tool:") || result.answer.includes("currently disabled:");
+  const face = answerText(result.answer);
+  return face.startsWith("Unknown tool:") || face.includes("currently disabled:");
 }
 
 // ============================================================================
@@ -466,7 +467,7 @@ export function createSentryPlugin(opts: SentryPluginOptions = {}): SentryPlugin
             };
             const callName = typeof e.call?.name === "string" ? e.call.name : "unknown";
             const result = {
-              answer: typeof e.result?.answer === "string" ? e.result.answer : "",
+              answer: answerText(e.result?.answer),
               error: e.result?.error === true,
               errorMessage: typeof e.result?.errorMessage === "string" ? e.result.errorMessage : undefined,
               stored: e.result?.stored,

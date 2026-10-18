@@ -42,8 +42,9 @@
 // `state[STATE_KEY]` so a UI can watch them. Counts/actions reset on uninstall.
 // ============================================================================
 import { randomUUID } from "node:crypto";
-import { EVENTS } from "@sanityloop/core";
+import { EVENTS, answerText } from "@sanityloop/core";
 import type {
+	ContentBlock,
 	GodObject,
 	Message,
 	Plugin,
@@ -168,10 +169,10 @@ export interface RetryOptions {
 	/** Which error results are worth another attempt. Default: transient-only
 	 * (errorMessage matches /timeout|429|5\d\d|ECONN|ENOTFOUND|temporar/i, or an
 	 * `invalid_arguments` NEVER retries — bad args are the model's job). */
-	retryOn?: (info: { name: string; parameters: Record<string, unknown>; answer: string; errorMessage?: string }) => boolean;
+	retryOn?: (info: { name: string; parameters: Record<string, unknown>; answer: string | ContentBlock[]; errorMessage?: string }) => boolean;
 	/** Last resort: substitute a typed result so the turn continues instead of
 	 * committing the final error. Omit = the final error commits honestly. */
-	fallback?: (info: { name: string; parameters: Record<string, unknown>; answer: string; errorMessage?: string; attempts: number }) => { answer: string; error?: boolean; errorMessage?: string };
+	fallback?: (info: { name: string; parameters: Record<string, unknown>; answer: string | ContentBlock[]; errorMessage?: string; attempts: number }) => { answer: string; error?: boolean; errorMessage?: string };
 }
 
 export interface LoopControlOptions {
@@ -245,9 +246,9 @@ const DEFAULT_SPIN_GUARD: Required<SpinGuardOptions> = {
 const TRANSIENT_RE = /timeout|429|5\d\d|ECONN|ENOTFOUND|EAI_AGAIN|temporar|rate.limit|overloaded|unavailable/i;
 
 /** Default retry predicate: transient-only, never invalid_arguments. */
-export function defaultRetryOn(info: { errorMessage?: string; answer: string }): boolean {
+export function defaultRetryOn(info: { errorMessage?: string; answer: string | ContentBlock[] }): boolean {
 	if (info.errorMessage === "invalid_arguments") return false;
-	return TRANSIENT_RE.test(`${info.errorMessage ?? ""} ${info.answer}`);
+	return TRANSIENT_RE.test(`${info.errorMessage ?? ""} ${answerText(info.answer)}`);
 }
 
 /** `*` = anything (glob-ish, single-pattern). Case-sensitive tool names. */
@@ -458,7 +459,7 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 					const name = call.name;
 					if (typeof name !== "string") return;
 					if (!retryTools.some((g) => toolGlobMatch(g, name))) return;
-					const res = result as { answer: string; error?: boolean; errorMessage?: string; stored?: unknown };
+					const res = result as { answer: string | ContentBlock[]; error?: boolean; errorMessage?: string; stored?: unknown };
 					if (res.error !== true) return; // success commits untouched
 					const params =
 						"parameters" in call && typeof call.parameters === "object" && call.parameters !== null

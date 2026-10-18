@@ -151,7 +151,8 @@ test("real provider: it THINKS — worst-complex quantum entanglement, then 5-ye
     });
 
     assert.equal(r.timedOut, false, "quantum worker HUNG — kill at deadline");
-    assert.equal(r.code, 0, `child exited ${r.code}\nstdout: ${r.stdout.slice(0, 800)}`);
+    const death = r.stdout.split("\n").find((l) => l.startsWith("QUANTUM_ERROR"));
+    assert.equal(r.code, 0, `child exited ${r.code}${death ? `\n${death}` : ""}\nstdout: ${r.stdout.slice(0, 800)}`);
     assert.ok(r.stdout.includes("QUANTUM_OK"), "child never finished both turns");
 
     const turn1 = parseTurn(r.stdout, "TURN1");

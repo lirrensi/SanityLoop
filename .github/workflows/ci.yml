@@ -1,9 +1,9 @@
 name: CI
 
 # Gate, not a museum. Runs on every push/PR to main.
-# 1. typecheck the whole monorepo (catches the breakage class we hit repeatedly)
-# 2. unit tests across workspaces (no provider keys needed)
-# 3. e2e smoke — ONLY when a provider key is present, so fork PRs stay green
+# `npm run verify` IS the gate: typecheck → unit → e2e → templates → live.
+# tmux is installed so the REPL stream-delivery guard (repl-tmux) RUNS instead
+# of silently skipping — a skipped guard is a dead guard.
 on:
   push:
     branches: [main]
@@ -13,7 +13,7 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    # Job-level so the `if` below can see it.
+    # Job-level so the live tier can see it.
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
@@ -24,15 +24,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install tmux (the REPL guard needs a real terminal)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
       - name: Install (clean, reproducible)
         run: npm ci
 
-      - name: Typecheck (whole monorepo)
-        run: npm run typecheck
-
-      - name: Unit tests (workspaces)
-        run: npm test
-
-      - name: E2E smoke (only when a provider key is present)
-        if: ${{ env.OPENAI_API_KEY != '' }}
-        run: npm run test:e2e
+      - name: Verify (type → unit → e2e → templates → live)
+        run: npm run verify

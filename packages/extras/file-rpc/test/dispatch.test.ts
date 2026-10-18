@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Agent } from "@sanityloop/core";
 import { StubModel, assistantTurn } from "@sanityloop/test-kit/core";
-import { makeTempDir, waitUntil } from "@sanityloop/test-kit";
+import { awaitLanded, makeTempDir, waitUntil } from "@sanityloop/test-kit";
 import { createDefaultInputs } from "@sanityloop/inputs";
 import { createFileRpc, readEvents } from "@sanityloop/file-rpc";
 import type { RpcResponse } from "@sanityloop/file-rpc";
@@ -124,7 +124,10 @@ test("dispatch: control ops + unknown op failure", async (t) => {
 test("dispatch: input passthrough reaches agent.input verbatim", async (t) => {
   const lobby = await makeTempDir(t);
   const agent = new Agent({
-    model: new StubModel([() => assistantTurn("hi")]),
+    // TWO turns scripted — one per followup. An exhausted stub throws →
+    // terminal, and (worse) the length assert below races a late assistant
+    // commit under load. Both turns land BEFORE the malformed-input probe.
+    model: new StubModel([() => assistantTurn("hi"), () => assistantTurn("second")]),
     agentId: "passthru",
   });
   agent.install(createDefaultInputs());
@@ -148,6 +151,10 @@ test("dispatch: input passthrough reaches agent.input verbatim", async (t) => {
     body: { type: "input_followup", text: "second" },
   });
   assert.equal((await responseFor(room, "i2")).success, true);
+  // BOTH turns fully landed — the length below is frozen, no late commit can
+  // slip in under load (the old shape flaked: turn 1's assistant reply could
+  // commit after `before` was sampled).
+  await awaitLanded(agent);
 
   // malformed input body → failure response, nothing lands
   const before = agent.messages.length;

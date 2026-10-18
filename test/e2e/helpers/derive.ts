@@ -345,7 +345,10 @@ const model = new SimpleModel({
     apiKey: process.env.SANITYLOOP_E2E_KEY,
     baseUrl: BASE_URL,
     stream: false,
-    maxOutputTokens: 1200,
+    // "worst, most complex" is DELIBERATELY verbose — the cap must fit the
+    // lecture or finish_reason:length becomes a terminal error (by core
+    // doctrine) and no landing ever fires. 1200 truncated gemma-26B.
+    maxOutputTokens: 4000,
 });
 const agent = new Agent({ model, agentId: "quantum-worker" });
 agent.install(createDefaultInputs());
@@ -390,7 +393,18 @@ agent.addFilter({
         }
     },
 });
-
+// Fail FAST with a diagnosis — a terminal turn (length/error/abort) never
+// fires stop+idle, so without this the worker burns the full 300s silent.
+agent.addFilter({
+    event: EVENTS.error,
+    id: "quantum/death-rattle",
+    priority: 0,
+    fn: async (a, raw) => {
+        const p = raw as { message?: string; reason?: string } | undefined;
+        console.log("QUANTUM_ERROR state=" + a.loopState + " reason=" + (p?.reason ?? "?") + " msg=" + (p?.message ?? "?").slice(0, 300));
+        setTimeout(() => process.exit(1), 50);
+    },
+});
 setTimeout(() => {
     console.log("QUANTUM_TIMEOUT after 300s, landings=" + landings);
     process.exit(1);

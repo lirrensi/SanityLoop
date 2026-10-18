@@ -10,7 +10,7 @@
 // initialized, no dir param), swarm → remote peer search. Nothing is shared
 // except `Tool.define`. This file is the pattern to copy.
 // ============================================================================
-import { Tool } from "@sanityloop/core";
+import { Tool, answerText } from "@sanityloop/core";
 import type { JsonSchema, Message, ToolType } from "@sanityloop/core";
 
 export interface SearchHistoryOptions {
@@ -51,10 +51,10 @@ function project(m: Message): string {
 	if (c && typeof c === "object") {
 		const o = c as Record<string, unknown>;
 		const parts: string[] = [];
-		for (const k of ["answer", "errorMessage"] as const) {
-			const v = o[k];
-			if (typeof v === "string" && v.length > 0) parts.push(v);
-		}
+		const face = answerText(o.answer);
+		if (face.length > 0) parts.push(face);
+		const errTail = o.errorMessage;
+		if (typeof errTail === "string" && errTail.length > 0) parts.push(errTail);
 		const stored = o.stored;
 		if (Array.isArray(stored)) {
 			for (const s of stored as Array<Record<string, unknown>>) {

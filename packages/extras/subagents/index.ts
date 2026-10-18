@@ -41,7 +41,7 @@
 // Independent from swarm: swarm = multi-process hypervisor. This = one process.
 // ============================================================================
 
-import { Agent, EVENTS, Tool, validateToolArgs } from "@sanityloop/core";
+import { Agent, EVENTS, Tool, answerText, validateToolArgs } from "@sanityloop/core";
 import type {
     GodObject,
     Input,
@@ -122,7 +122,8 @@ function transcriptLine(m: Message): string {
         // never the raw wire shape
         const cobj = c as { answer?: unknown; stored?: unknown; errorMessage?: unknown };
         const parts: string[] = [];
-        if (typeof cobj.answer === "string" && cobj.answer.length > 0) parts.push(cobj.answer);
+        const face = answerText(cobj.answer);
+        if (face.length > 0) parts.push(face);
         if (m.type === "toolCall") {
             const calls = (cobj.stored as Array<{ name?: string; parameters?: unknown }> | undefined) ?? [];
             for (const tc of calls) {

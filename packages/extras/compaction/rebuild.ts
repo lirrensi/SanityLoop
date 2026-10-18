@@ -6,7 +6,7 @@
 // never reach here — they mutate in place, no rebuild needed.
 
 import { randomUUID } from "node:crypto";
-import { normalizeForAlternation } from "@sanityloop/core";
+import { answerText as coreAnswerText, normalizeForAlternation } from "@sanityloop/core";
 import type { Message } from "@sanityloop/core";
 
 export interface RebuildOptions {
@@ -39,12 +39,15 @@ export function messageText(m: Message): string {
   if (Array.isArray(c)) {
     let out = "";
     for (const b of c) {
-      // TextBlock carries type:"text"; FragmentBlock has no `type` key.
-      if ("type" in b && b.type === "text") out += b.content;
+      // TextBlock carries type:"text"; FragmentBlock { id, content } has no
+      // `type` key — both are text (same rule as core's toBlockList).
+      if (typeof b !== "object" || b === null) continue;
+      if ("type" in b && b.type === "text") out += (b as { content?: unknown }).content ?? "";
+      else if (!("type" in b) && typeof (b as { content?: unknown }).content === "string") out += (b as { content: string }).content;
     }
     return out;
   }
-  if (typeof c === "object" && "answer" in c && typeof c.answer === "string") return c.answer;
+  if (typeof c === "object" && "answer" in c) return coreAnswerText((c as { answer: unknown }).answer);
   return "";
 }
 
@@ -55,14 +58,17 @@ export function messageText(m: Message): string {
  * toolResults drop too. Shared by soft, handoff, and remote rebuilds.
  */
 export function recentTail(snapshot: Message[], extra: Message[], keepRecent: number): Message[] {
+  // Trim the WINDOW first, then append extra raw: extra is LIVE input that
+  // arrived mid-compaction — trimming the concatenation would eat a
+  // leading-user arrival (user input wiped silently). normalizeForAlternation
+  // merges any boundary adjacency downstream (content preserved, never dropped).
   const tail = snapshot
     .filter((m) => m.type !== "system" && m.enabled)
-    .slice(-keepRecent)
-    .concat(extra);
+    .slice(-keepRecent);
   while (tail.length > 0 && tail[0].type === "user") tail.shift();
   while (tail.length > 0 && tail[tail.length - 1].type === "assistant") tail.pop();
   while (tail.length > 0 && tail[0].type === "toolResult") tail.shift();
-  return tail;
+  return tail.concat(extra);
 }
 
 /** Swap history for [systems + summary-as-user + tail]. Never splices mid-turn. */

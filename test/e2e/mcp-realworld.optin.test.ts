@@ -14,14 +14,50 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { runNode, REPO_ROOT } from "./helpers/spawn.ts";
 
 const ARMED = process.env.SANITYLOOP_MCP_REALWORLD === "1";
+const CONFIG = process.env.SANITYLOOP_OPENCODE_CONFIG ?? join(homedir(), ".config", "opencode", "opencode.json");
+
+function onPath(bin: string): boolean {
+    try {
+        execFileSync("which", [bin], { stdio: "ignore" });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function portOpen(url: string): Promise<boolean> {
+    try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 2000);
+        await fetch(url, { signal: ctl.signal });
+        clearTimeout(timer);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 test("mcp real-world servers (opencode config): connect + real calls", async (t) => {
     if (!ARMED) {
         t.skip("SANITYLOOP_MCP_REALWORLD=1 not set — staying hermetic");
+        return;
+    }
+    // Armed but the box lacks the wild's prerequisites → honest SKIP, not a
+    // red herring. The flag means "attempt when possible", not "fail without".
+    const missing: string[] = [];
+    if (!existsSync(CONFIG)) missing.push(`config ${CONFIG}`);
+    if (!onPath("playwright-mcp")) missing.push("playwright-mcp on PATH");
+    if (!onPath("skill-store-mcp")) missing.push("skill-store-mcp on PATH");
+    if (!(await portOpen("http://localhost:58080/"))) missing.push("llama.cpp at :58080 (navigate target)");
+    if (missing.length > 0) {
+        t.skip(`armed but prerequisites missing: ${missing.join("; ")}`);
         return;
     }
 

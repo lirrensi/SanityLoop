@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
   "exports": {
     ".": "./index.ts"
   },

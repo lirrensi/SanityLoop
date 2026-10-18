@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createBasicTools } from "@sanityloop/basic-fs-tools";
 import { createBashTool } from "@sanityloop/shell-tool";
+import type { ContentBlock } from "@sanityloop/core";
 import type { ExecTransport } from "./exec.ts";
 import { ExecError } from "./exec.ts";
 
@@ -55,7 +56,7 @@ export interface SdkEnvelope {
 }
 
 interface SdkToolResult {
-  answer: string;
+  answer: string | ContentBlock[];
   stored?: unknown;
   error?: boolean;
   errorMessage?: string;

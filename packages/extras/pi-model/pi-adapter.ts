@@ -45,7 +45,14 @@ export function toPiParts(content: unknown): { type: string; text?: string; data
   const parts: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
   for (const b of content) {
     if (typeof b !== "object" || b === null) continue;
-    if (!("type" in b) || typeof (b as { type: unknown }).type !== "string") continue;
+    // typeless compound fragments { id, content } are text — same rule as
+    // core's toBlockList (dropping them loses system/user content silently)
+    if (!("type" in b) || typeof (b as { type: unknown }).type !== "string") {
+      if ("content" in b && typeof (b as { content: unknown }).content === "string") {
+        parts.push({ type: "text", text: (b as { content: string }).content });
+      }
+      continue;
+    }
     const t = (b as { type: string }).type;
     if (t === "text" && "content" in b && typeof (b as { content: unknown }).content === "string") {
       parts.push({ type: "text", text: (b as { content: string }).content });
@@ -202,16 +209,11 @@ export class PiAdapterModel extends SimpleModel {
 				}
         case "toolResult": {
           const face = m.content as ToolResultContent | null;
-          const head = [{ type: "text", text: face?.answer ?? "[tool failed catastrophically — no result produced]" }] as { type: string; text?: string; data?: string; mimeType?: string }[];
-          const extra = face !== null && typeof face === "object" && "media" in face && Array.isArray((face as { media: unknown }).media) ? ((face as { media: unknown[] }).media ?? []) : [];
-          for (const b of extra) {
-            if (typeof b !== "object" || b === null) continue;
-            const t = (b as { type?: unknown }).type;
-            if (t === "image") {
-              const img = b as unknown as MediaBlock & { type: "image" };
-              if (typeof img.data === "string" && typeof img.mimeType === "string") head.push({ type: "image", data: img.data, mimeType: img.mimeType });
-            }
-          }
+          // the answer IS the content: string → one text part, blocks → parts
+          // (images ride; audio/video/document become descriptors in toPiParts)
+          const head = face === null
+            ? [{ type: "text", text: "[tool failed catastrophically — no result produced]" }]
+            : toPiParts(face.answer);
           piMessages.push({
             role: "toolResult",
             toolCallId: (m as ToolResultMessage).toolCallId ?? "",
@@ -312,14 +314,24 @@ export class PiAdapterModel extends SimpleModel {
 	protected override parseResponse(response: unknown): TurnResult {
 		const msg = response as AssistantMessage;
 
-		// ADAPTER RESPONSIBILITY (item 21.5): bad outcomes are ERRORS, not results.
-		if (msg.stopReason === "length") {
+		// Shared vocabulary: badStopReason (stopReasons config) decides, with
+		// tool-call bypass. NOTE: pi-adapter has NO retry loop (its callApi is
+		// pi-ai's own stream), so an unclean reason still throws terminal here —
+		// but stamped retryable:true so a future loop (or loop-level policy)
+		// honors it. The error shape, not the loop, is what unifies today.
+		const hasCalls = msg.content.some((b) => b.type === "toolCall");
+		if (this.badStopReason(msg.stopReason, hasCalls)) {
 			// structured facts for errorFacts parity with SimpleModel (truncated/reason)
+			// error/aborted keep the provider's own message (the actual failure)
+			const detail = (msg.stopReason === "error" || msg.stopReason === "aborted") && msg.errorMessage
+				? `: ${msg.errorMessage}`
+				: `: ${msg.stopReason}`;
 			const err = new Error(
-				`[sanity] pi-adapter: provider finished with bad reason: length`,
-			) as Error & { reason?: string; truncated?: boolean };
-			err.reason = "length";
-			err.truncated = true;
+				`[sanity] pi-adapter: provider finished with bad reason${detail}`,
+			) as Error & { reason?: string; truncated?: boolean; retryable?: boolean };
+			err.reason = msg.stopReason;
+			err.retryable = true;
+			if (msg.stopReason === "length") err.truncated = true;
 			throw err;
 		}
 		if (msg.stopReason === "error" || msg.stopReason === "aborted") {

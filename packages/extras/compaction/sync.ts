@@ -12,6 +12,7 @@
 // - shake elides heavy REGIONS inside text: full tool-result text →
 //   placeholder, large fenced/XML blocks → one-liners. Kept text stays live.
 
+import { answerText as coreAnswerText } from "@sanityloop/core";
 import type { Message } from "@sanityloop/core";
 
 export type ProtectedToolMatcher = string | ((toolName: string, toolCallId: string) => boolean);
@@ -111,14 +112,19 @@ function isProtected(toolName: string, toolCallId: string, matchers: ProtectedTo
 function answerText(m: Message): string | undefined {
   if (m.type !== "toolResult" || m.content === null) return undefined;
   const c = m.content;
-  if (typeof c === "object" && "answer" in c && typeof c.answer === "string") return c.answer;
+  if (typeof c === "object" && "answer" in c) return coreAnswerText((c as { answer: unknown }).answer);
   return undefined;
 }
 
 function setAnswerText(m: Message, text: string): void {
   if (m.type !== "toolResult" || m.content === null) return;
   const c = m.content;
-  if (typeof c === "object" && "answer" in c) c.answer = text;
+  // block answers elide to a single text block (never a raw string — the
+  // union shape survives the round-trip, and undo restores the original)
+  if (typeof c === "object" && "answer" in c) {
+    const face = c as { answer: unknown };
+    face.answer = Array.isArray(face.answer) ? [{ type: "text", content: text }] : text;
+  }
 }
 const OPENING_XML = /^<([a-z_-]+)(?:\s+[^>]*)?>$/;
 const CLOSING_XML = /^<\/([a-z_-]+)>$/;
@@ -178,6 +184,9 @@ function collectRegions(messages: Message[], opts: Required<ShakeOptions>): Shak
     if (m.type !== "toolResult") continue;
     const text = answerText(m);
     if (text === undefined) continue;
+    // own placeholders are terminal — re-shaking them eats the marker and
+    // lies about the count (and double-counts tokensSaved on re-shake)
+    if (text.startsWith("[shaken — ") && text.endsWith("elided]")) continue;
     const tokens = estimateTokens(text);
     if (st.budget > 0) {
       st.budget -= tokens;
@@ -208,7 +217,9 @@ function collectRegions(messages: Message[], opts: Required<ShakeOptions>): Shak
 /**
  * Elide heavy regions in place. Full-text regions blank the answer to a
  * placeholder; block regions collapse to a one-liner. Returns estimated
- * tokens saved. Idempotent — a second call finds no eligible regions.
+ * tokens saved. Idempotent — own placeholders are never re-shaken, so a
+ * repeat call finds no eligible regions (partial-collapse remainders ARE
+ * eligible: re-shake = shake harder, converging on the full placeholder).
  */
 export function shakeNow(messages: Message[], opts: ShakeOptions = {}): { regions: number; tokensSaved: number } {
   const o: Required<ShakeOptions> = { ...DEFAULT_SHAKE_OPTIONS, ...opts };
@@ -256,12 +267,16 @@ export function shakeNow(messages: Message[], opts: ShakeOptions = {}): { region
 export function pruneNow(messages: Message[], opts: PruneOptions = {}): PruneResult {
   const o: Required<PruneOptions> = { ...DEFAULT_PRUNE_OPTIONS, ...opts };
   let budget = o.protectTokens;
-  const blanked: Array<{ m: Message; prev: string }> = [];
+  // prev keeps the ORIGINAL answer value (string OR blocks) — undo restores
+  // verbatim. The flattened text is only for budgeting/savings math.
+  const blanked: Array<{ m: Message; prev: unknown; text: string }> = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m.type !== "toolResult") continue;
     const text = answerText(m);
     if (text === undefined) continue;
+    // own placeholder is terminal — never re-blank (honest prunedCount)
+    if (text === "[pruned — output blanked to reclaim context]") continue;
     const tokens = estimateTokens(text);
     if (budget > 0) {
       budget -= tokens;
@@ -270,9 +285,9 @@ export function pruneNow(messages: Message[], opts: PruneOptions = {}): PruneRes
     const toolName = toolNameOf(m);
     const toolCallId = toolCallIdOf(m);
     if (isProtected(toolName, toolCallId, o.protectedTools)) continue;
-    blanked.push({ m, prev: text });
+    blanked.push({ m, prev: (m.content as { answer: unknown }).answer, text });
   }
-  const saved = blanked.reduce((n, b) => n + estimateTokens(b.prev), 0);
+  const saved = blanked.reduce((n, b) => n + estimateTokens(b.text), 0);
   if (blanked.length === 0 || saved < o.minimumSavings) {
     return { prunedCount: 0, tokensSaved: 0, undo: () => {} };
   }
@@ -281,7 +296,11 @@ export function pruneNow(messages: Message[], opts: PruneOptions = {}): PruneRes
     prunedCount: blanked.length,
     tokensSaved: saved,
     undo: () => {
-      for (const b of blanked) setAnswerText(b.m, b.prev);
+      for (const b of blanked) {
+        if (b.m.content !== null && typeof b.m.content === "object") {
+          (b.m.content as { answer: unknown }).answer = b.prev;
+        }
+      }
     },
   };
 }

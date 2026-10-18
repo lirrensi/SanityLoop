@@ -169,10 +169,11 @@ const t = Tool.define({
 Tool.factory({ tool: someTool, prefix: "!!!" })  // pre-lock params merged into every call
 ```
 
-The result contract: `answer` (string — what the model sees), `stored` (raw,
-verbatim, never on the wire), `error: true` + `errorMessage` (failure as a
-RESULT — the loop never dies from a tool). Return garbage and the core
-synthesizes an error result telling the model it was a tool bug.
+The result contract: `answer` (string, or text/media blocks like a regular
+message — what the model sees), `stored` (raw, verbatim, never on the wire),
+`error: true` + `errorMessage` (failure as a RESULT — the loop never dies from
+a tool). Return garbage (no answer face at all) and the core synthesizes an
+error result telling the model it was a tool bug.
 
 ## Plugin — the named bundle
 

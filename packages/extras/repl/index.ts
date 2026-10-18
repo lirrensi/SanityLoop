@@ -57,14 +57,24 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
 export function createReplPlugin(opts: ReplOptions = {}): Plugin {
+	// readline fallback owns a live stdin interface — uninstall MUST close it
+	// or the data listener + pending question leak past teardown (and hold
+	// the process open). TUI mode owns nothing closable (raw-mode restore is
+	// best-effort inside installTui's own exit paths).
+	let rl: { close(): void } | undefined;
 	return {
 		id: "repl",
 		install(agent) {
 			const tty = process.stdin.isTTY && process.stdout.isTTY && typeof process.stdin.setRawMode === "function";
 			if (tty) installTui(agent, opts);
-			else installReadline(agent, opts);
+			else rl = installReadline(agent, opts);
 		},
 		uninstall(agent) {
+			try {
+				rl?.close();
+			} finally {
+				rl = undefined;
+			}
 			removeFiltersByPrefix(agent, "repl/");
 			agent.removeDeclaredCapability("repl");
 		},
@@ -610,7 +620,7 @@ let emit: (text: string) => void = (t) => process.stdout.write(`${t}\n`);
 // READLINE FALLBACK — non-TTY (pipes, e2e). Same semantics, no ANSI box.
 // ============================================================================
 
-function installReadline(agent: GodObject, opts: ReplOptions): void {
+function installReadline(agent: GodObject, opts: ReplOptions): { close(): void } {
 	const promptText = opts.prompt ?? "you> ";
 	emit = (t) => process.stdout.write(`${t}\n`);
 	let rl: ReturnType<typeof createInterface> | undefined;
@@ -671,8 +681,9 @@ function installReadline(agent: GodObject, opts: ReplOptions): void {
 		},
 	});
 
-	rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-	rl.on("SIGINT", () => {
+	const iface = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+	rl = iface;
+	iface.on("SIGINT", () => {
 		if (agent.inTurn) agent.abort();
 		else process.exit(0);
 	});
@@ -686,4 +697,5 @@ function installReadline(agent: GodObject, opts: ReplOptions): void {
 		id: "repl",
 		description: "interactive terminal session (readline fallback)",
 	});
+	return iface;
 }

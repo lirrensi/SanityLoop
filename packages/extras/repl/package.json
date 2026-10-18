@@ -13,7 +13,12 @@
     "@sanityloop/tui": "^0.1.0",
     "marked": "^18.0.5"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
   "files": [
     "**/*.ts",
     "!test",

@@ -6,6 +6,9 @@
   "exports": {
     ".": "./index.ts"
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
   "dependencies": {
     "@sanityloop/core": "^0.2.0",
     "@sanityloop/snapshot": "^0.1.0",

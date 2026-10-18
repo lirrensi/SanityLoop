@@ -346,3 +346,6 @@ export {
 } from "./sync.ts";
 export type { ShakeOptions, PruneOptions, PruneResult, ShakeRegion, ProtectedToolMatcher } from "./sync.ts";
 export { createOpenAiResponsesCompactor, createAnthropicCompactor, defaultCompactors, flattenSnapshot, ANTHROPIC_COMPACTION_BETA } from "./remote.ts";
+export { messageText, recentTail, rebuildWithSummary } from "./rebuild.ts";
+export type { RebuildOptions, RebuildAgent } from "./rebuild.ts";
+export { createSoftSummarizer, createHandoffRun, runRemoteSummary, DEFAULT_HANDOFF_INSTRUCTION } from "./methods.ts";

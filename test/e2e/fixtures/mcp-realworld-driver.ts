@@ -13,7 +13,7 @@
 // Remote (url) entries are honestly reported as NOT SUPPORTED (stdio-only
 // adapter today) — no pretending. Exit code = verdict.
 
-import { Agent, SimpleModel, EVENTS } from "@sanityloop/core";
+import { Agent, SimpleModel, EVENTS, answerText } from "@sanityloop/core";
 import type { GodObject, ToolResult } from "@sanityloop/core";
 import { createDefaultInputs } from "@sanityloop/inputs";
 import { createMcp } from "@sanityloop/mcp";
@@ -154,7 +154,7 @@ agent.addFilter({
             call?: { name?: string };
             result?: Pick<ToolResult, "answer" | "error">;
         };
-        const ans = p?.result?.answer ?? "";
+        const ans = answerText(p?.result?.answer);
         log(
             `[tool:${p?.call?.name}] error=${!!p?.result?.error} len=${ans.length}\n--- answer head ---\n${ans.slice(0, 700)}\n--- end head ---`,
         );

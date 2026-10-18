@@ -12,7 +12,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Agent, EVENTS } from "@sanityloop/core";
-import { agentAsTool, createSubAgents } from "@sanityloop/subagents";
+import { agentAsTool, createSubAgents, fork, runOnce, runUntilSettled, sideCall, textMessage, collectFinalAnswer } from "@sanityloop/subagents";
 import {
     StubModel,
     assistantTurn,
@@ -621,4 +621,103 @@ test("manager: ORCHESTRATE — ask surfaces to the host, top loop NOT blocked, r
     assert.match(collected.answer!, /orchestrated gold/);
 
     assert.equal(mgr.respond(asks[0].id, { type: "gate-answer", ref: "gate-3" }), false, "stale ask refuses");
+});
+
+// ---------------------------------------------------------------------------
+// FORK — parallel sessions that return (e87e4b8, previously untested)
+// ---------------------------------------------------------------------------
+
+test("fork: copies history+state by value, tools by ref, nothing shared mutable", () => {
+    const parent = new Agent({ model: new StubModel([]), agentId: "parent" });
+    parent.messages.push(
+        { id: "u1", enabled: true, type: "user", content: [{ type: "text", content: "work" }] } as never,
+        { id: "a1", enabled: true, type: "assistant", content: [{ type: "text", content: "done" }] } as never,
+    );
+    parent.setState("k", { nested: [1, 2] });
+    const child = fork(parent);
+    assert.equal(child.agentId, "parent-fork");
+    assert.deepEqual(child.messages, parent.messages, "whole history carried");
+    assert.ok(child.messages[0] !== parent.messages[0], "messages deep-copied, not aliased");
+    assert.deepEqual(child.state.k, { nested: [1, 2] });
+    child.setState("k", { nested: [9] });
+    assert.deepEqual(parent.state.k, { nested: [1, 2] }, "child writes never leak back");
+    assert.equal(child.model, parent.model, "same model (prefix cache intact)");
+    // slice + append + blank
+    const sliced = fork(parent, { messages: { from: -1 }, append: [textMessage("user", "task")] });
+    assert.deepEqual(sliced.messages.map((m) => m.id), ["a1", sliced.messages[1].id]);
+    assert.equal(sliced.messages[1].type, "user");
+    assert.equal(fork(parent, { messages: [] }).messages.length, 0, "blank child on demand");
+    // bad builder refuses loudly
+    assert.throws(() => fork(parent, { agent: () => "nope" as never }), /instead of an Agent/);
+});
+
+test("runOnce: exactly one provider call, then terminated — tools unexecuted", async () => {
+    const parent = new Agent({ model: new StubModel([]), agentId: "p1" });
+    const child = fork(parent, {
+        messages: [],
+        append: [textMessage("user", "extract")],
+        agent: () => new Agent({ model: new StubModel([() => assistantTurn("JSON HERE"), () => assistantTurn("SECOND")]), agentId: "c1" }),
+    });
+    const res = await runOnce(child, { name: "t1" });
+    assert.equal(res.error, false);
+    assert.equal(res.answer, "JSON HERE", "first call's text collected");
+    assert.equal(res.timedOut, false);
+    assert.equal(child.loopState, "terminated", "child always terminated");
+    assert.ok(!child.messages.some((m) => JSON.stringify(m.content).includes("SECOND")), "second call never ran");
+});
+
+test("runUntilSettled: full loop lands, stats ride along, child terminated", async () => {
+    const echo = { name: "echo", description: "e", inputSchema: { type: "object" }, execute: async () => ({ answer: "echoed" }) } as never;
+    const parent = new Agent({ model: new StubModel([]), agentId: "p2" });
+    const sub = new Agent({
+        model: new StubModel([() => toolCallTurn([callTo("echo", {})]), () => assistantTurn("all done")]),
+        tools: [echo],
+        agentId: "c2",
+    });
+    sub.messages.push(textMessage("user", "go"));
+    const res = await runUntilSettled(sub, { name: "t2" });
+    assert.equal(res.error, false);
+    assert.equal(res.answer, "all done");
+    assert.equal(sub.loopState, "terminated");
+    assert.ok(res.stats.totalTokens > 0, "child stats accumulated for the ledger");
+    assert.equal(parent.messages.length, 0, "parent untouched");
+});
+
+test("sideCall: JSON extraction with schema wall — strict/warn/fallback", async () => {
+    const mkParent = (reply: string) => {
+        const p = new Agent({ model: new StubModel([() => assistantTurn(reply)]), agentId: "px" });
+        p.messages.push(textMessage("user", "context"));
+        return p;
+    };
+    const schema = { type: "object", properties: { n: { type: "number" } }, required: ["n"] } as never;
+    // happy path
+    const ok = await sideCall<{ n: number }>(mkParent('{"n": 42}'), { schema });
+    assert.equal(ok.error, false);
+    assert.deepEqual(ok.object, { n: 42 });
+    assert.equal(ok.usedFallbackValue, false);
+    // bad JSON, strict → error
+    const bad = await sideCall(mkParent("not json"), { schema });
+    assert.equal(bad.error, true);
+    assert.match(bad.errorMessage!, /not valid JSON/);
+    // bad JSON, warn → error:false + raw text
+    const warned = await sideCall(mkParent("not json"), { schema, onError: "warn" });
+    assert.equal(warned.error, false);
+    assert.equal(warned.text, "not json");
+    assert.match(warned.errorMessage!, /not valid JSON/);
+    // schema violation, fallback → fallback value stands in
+    const fb = await sideCall<{ n: number }>(mkParent('{"n": "nan"}'), { schema, onError: "fallback", fallbackValue: { n: -1 } });
+    assert.equal(fb.error, false);
+    assert.equal(fb.usedFallbackValue, true);
+    assert.deepEqual(fb.object, { n: -1 });
+});
+
+test("collectFinalAnswer: last assistant text wins; none → undefined", () => {
+    const msgs = [
+        textMessage("user", "q"),
+        textMessage("assistant", "first"),
+        textMessage("assistant", "  second  "),
+    ];
+    assert.equal(collectFinalAnswer(msgs), "second");
+    assert.equal(collectFinalAnswer([textMessage("user", "q")]), undefined);
+    assert.equal(collectFinalAnswer([]), undefined);
 });
