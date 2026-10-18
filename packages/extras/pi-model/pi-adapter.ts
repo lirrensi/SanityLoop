@@ -29,6 +29,7 @@ import type {
 import type {
   GodObject,
   Message,
+  MediaBlock,
   StreamSink,
   ToolResultContent,
   ToolResultMessage,
@@ -36,6 +37,29 @@ import type {
 } from "@sanityloop/core";
 import type { ToolCallRecord } from "@sanityloop/core";
 import { SimpleModel } from "@sanityloop/core";
+
+/** Our ContentBlock → pi-ai user/toolResult part. Text stays text; image passes through; audio/video/document ride as text descriptors (pi-ai has no slots for them). Custom wire-ready parts ({type with underscore, e.g. video_url/image_url}) pass verbatim. */
+export function toPiParts(content: unknown): { type: string; text?: string; data?: string; mimeType?: string }[] {
+  if (typeof content === "string") return content.length > 0 ? [{ type: "text", text: content }] : [{ type: "text", text: "" }];
+  if (!Array.isArray(content)) return [{ type: "text", text: "" }];
+  const parts: { type: string; text?: string; data?: string; mimeType?: string }[] = [];
+  for (const b of content) {
+    if (typeof b !== "object" || b === null) continue;
+    if (!("type" in b) || typeof (b as { type: unknown }).type !== "string") continue;
+    const t = (b as { type: string }).type;
+    if (t === "text" && "content" in b && typeof (b as { content: unknown }).content === "string") {
+      parts.push({ type: "text", text: (b as { content: string }).content });
+    } else if (t === "image" && "data" in b && "mimeType" in b) {
+      const m = b as unknown as MediaBlock & { type: "image" };
+      if (typeof m.data === "string" && typeof m.mimeType === "string") parts.push({ type: "image", data: m.data, mimeType: m.mimeType });
+    } else if (t === "audio" || t === "video" || t === "document") {
+      parts.push({ type: "text", text: `[${t} omitted — pi-ai has no ${t} slot; use SimpleModel for the video_url wire]` });
+    } else if (t.includes("_") || t === "file") {
+      parts.push({ ...(b as Record<string, string>) } as { type: string });
+    }
+  }
+  return parts.length > 0 ? parts : [{ type: "text", text: "" }];
+}
 
 export interface PiAdapterModelOptions {
 	/** pi-ai provider id: "anthropic", "openai", "google", "mistral", "deepseek", "groq", ... */
@@ -104,9 +128,9 @@ export class PiAdapterModel extends SimpleModel {
 				case "user":
 					piMessages.push({
 						role: "user",
-						content: this.toText(m.content),
+						content: toPiParts(m.content),
 						timestamp: Date.now(),
-					});
+					} as PiMessage);
 					break;
 				case "assistant": {
 					const text = this.toText(m.content);
@@ -178,14 +202,24 @@ export class PiAdapterModel extends SimpleModel {
 				}
         case "toolResult": {
           const face = m.content as ToolResultContent | null;
+          const head = [{ type: "text", text: face?.answer ?? "[tool failed catastrophically — no result produced]" }] as { type: string; text?: string; data?: string; mimeType?: string }[];
+          const extra = face !== null && typeof face === "object" && "media" in face && Array.isArray((face as { media: unknown }).media) ? ((face as { media: unknown[] }).media ?? []) : [];
+          for (const b of extra) {
+            if (typeof b !== "object" || b === null) continue;
+            const t = (b as { type?: unknown }).type;
+            if (t === "image") {
+              const img = b as unknown as MediaBlock & { type: "image" };
+              if (typeof img.data === "string" && typeof img.mimeType === "string") head.push({ type: "image", data: img.data, mimeType: img.mimeType });
+            }
+          }
           piMessages.push({
             role: "toolResult",
             toolCallId: (m as ToolResultMessage).toolCallId ?? "",
             toolName: (m as ToolResultMessage).toolName ?? "unknown",
-            content: [{ type: "text", text: face?.answer ?? "[tool failed catastrophically — no result produced]" }],
+            content: head,
             isError: face ? face.error === true : true,
 						timestamp: Date.now(),
-					});
+					} as PiMessage);
 					break;
 				}
 				default:
@@ -200,7 +234,7 @@ export class PiAdapterModel extends SimpleModel {
 
 		return {
 			systemPrompt: systemParts.join("\n\n") || undefined,
-			messages: piMessages,
+			messages: piMessages as PiContext["messages"],
 		};
 	}
 

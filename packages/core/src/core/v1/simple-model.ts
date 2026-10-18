@@ -42,18 +42,127 @@ function baseType(type: string): string {
 /** A message that may carry the model's thinking — only attached when keepReasoning is on. */
 type ReasonedMessage = Message & { reasoningContent?: string };
 
-/** Flatten any message content to a wire string — text blocks, compound fragments, tool faces. */
+/**
+ * Canonical OpenAI-compatible content part for one message block.
+ * Text stays text; media maps to parts OpenRouter accepts:
+ * image → image_url, audio → input_audio, document/pdf → file_data,
+ * video → video_url (url or base64 data-URL; optional `processing`
+ * "agentic"|"static" is a Gemini-only hint, ignored by other providers).
+ * Unknown blocks → dropped.
+ */
+export function toWirePart(block: unknown): Record<string, unknown> | undefined {
+  if (typeof block !== "object" || block === null) return undefined;
+  const b = block as { type?: unknown; content?: unknown; data?: unknown; mimeType?: unknown; name?: unknown; processing?: unknown };
+  if (b.type === "text" && typeof b.content === "string") return { type: "text", text: b.content };
+  if (typeof b.data !== "string" || typeof b.mimeType !== "string") return undefined;
+  const url = b.data.startsWith("data:") || b.data.startsWith("http") ? b.data : `data:${b.mimeType};base64,${b.data}`;
+  if (b.type === "image") return { type: "image_url", image_url: { url } };
+  if (b.type === "audio") return { type: "input_audio", input_audio: { data: b.data, format: audioFormat(b.mimeType) } };
+  if (b.type === "video") {
+    const part: Record<string, unknown> = { type: "video_url", video_url: { url } };
+    if (b.processing === "agentic" || b.processing === "static") (part.video_url as Record<string, unknown>).processing = b.processing;
+    return part;
+  }
+  if (b.type === "document") {
+    if (b.mimeType === "application/pdf") return { type: "file", file: { filename: typeof b.name === "string" ? b.name : "document.pdf", file_data: url } };
+    return { type: "text", text: `[document ${b.mimeType}${typeof b.name === "string" ? ` ${b.name}` : ""}: ${url.slice(0, 120)}…]` };
+  }
+  return undefined;
+}
+
+function audioFormat(mime: string): string {
+  const low = mime.toLowerCase();
+  if (low.includes("wav")) return "wav";
+  if (low.includes("mp3") || low.includes("mpeg")) return "mp3";
+  return "wav";
+}
+
+/** Flatten any message content to a wire string — text blocks, compound fragments, tool faces. Media blocks contribute a short descriptor (never base64). */
 function toWireText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((b) => (typeof b === "object" && b !== null && "content" in b ? String((b as { content: unknown }).content) : ""))
+      .map((b) => {
+        if (typeof b !== "object" || b === null) return "";
+        if ("content" in b && typeof (b as { content: unknown }).content === "string") return (b as { content: string }).content;
+        if ("type" in b && typeof (b as { type: unknown }).type === "string") {
+          const t = (b as { type: string }).type;
+          if (t !== "text") return `[${t} omitted — text-only fallback]`;
+        }
+        return "";
+      })
       .join("\n");
   }
   if (typeof content === "object" && content !== null && "answer" in content) {
     return String((content as { answer: unknown }).answer);
   }
   return String(content ?? "");
+}
+
+/** Canonical wire content: string when pure text, multipart array when any media. */
+export function toWireContent(content: unknown): string | Record<string, unknown>[] {
+  const parts = toWireParts(content);
+  if (parts.every((p) => p.type === "text")) return parts.map((p) => String(p.text ?? "")).join("\n");
+  return parts;
+}
+
+function toWireParts(content: unknown): { type: string; text?: unknown }[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (!Array.isArray(content)) return [{ type: "text", text: toWireText(content) }];
+  const parts: { type: string; text?: unknown }[] = [];
+  for (const b of content) {
+    if (typeof b !== "object" || b === null) continue;
+    // custom wire-ready parts (video_url, image_url, input_audio, file, ...) pass verbatim —
+    // the user knows what their provider eats. Known blocks map via toWirePart.
+    if ("type" in b && typeof (b as { type: unknown }).type === "string") {
+      const t = (b as { type: string }).type;
+      if (t.includes("_") || t === "file") {
+        parts.push({ ...(b as Record<string, unknown>) } as { type: string });
+        continue;
+      }
+    }
+    const part = toWirePart(b);
+    if (part) parts.push(part as { type: string; text?: unknown });
+  }
+  return parts.length > 0 ? parts : [{ type: "text", text: "" }];
+}
+
+/** Concat two simple contents block-wise. Adjacent text joins with blank lines; media/custom parts append verbatim. Pure helper — inputs untouched. */
+export function concatBlocks(
+  a: unknown,
+  b: unknown,
+): { type: string; content?: string; data?: string; mimeType?: string; name?: string; processing?: string }[] {
+  const parts = [...toBlockList(a), ...toBlockList(b)];
+  const out: { type: string; content?: string; data?: string; mimeType?: string; name?: string; processing?: string }[] = [];
+  for (const p of parts) {
+    out.push({ ...p });
+  }
+  // join runs of adjacent text (the old toWireText join, block-safe)
+  const joined: { type: string; content?: string; data?: string; mimeType?: string; name?: string; processing?: string }[] = [];
+  for (const p of out) {
+    const prev = joined[joined.length - 1];
+    if (p.type === "text" && prev?.type === "text") {
+      const text = [prev.content ?? "", p.content ?? ""].filter((s) => s.length > 0).join("\n\n");
+      joined[joined.length - 1] = { type: "text", content: text };
+    } else {
+      joined.push(p);
+    }
+  }
+  return joined;
+}
+
+type BlockLike = { type: string; content?: string; data?: string; mimeType?: string; name?: string; processing?: string };
+
+function toBlockList(content: unknown): BlockLike[] {
+  if (typeof content === "string") return content.length > 0 ? [{ type: "text", content }] : [];
+  if (!Array.isArray(content)) return [];
+  const list: BlockLike[] = [];
+  for (const b of content) {
+    if (typeof b !== "object" || b === null) continue;
+    if (!("type" in b) || typeof (b as { type: unknown }).type !== "string") continue;
+    list.push({ ...(b as Record<string, string>) } as BlockLike);
+  }
+  return list;
 }
 
 /**
@@ -104,12 +213,11 @@ export function normalizeForAlternation(list: Message[]): Message[] {
     ) {
       // alternation via merge — consecutive same-type fold IN PLACE. The first
       // keeps its id + position, later content appends. Never mutates the input.
-      const prev = toWireText(last.content);
-      const next = toWireText(m.content);
-      out[out.length - 1] = {
-        ...last,
-        content: [{ type: "text", content: [prev, next].filter((s) => s.length > 0).join("\n\n") }],
-      };
+      // Block concat, not string flatten: text parts join with blank lines,
+      // media/custom parts append verbatim so user-supplied parts survive.
+      // concatBlocks returns ContentBlock[] — assignable: only simple-type
+      // messages reach this branch (tool/compound never merge).
+      out[out.length - 1] = { ...last, content: concatBlocks(last.content, m.content) as Message["content"] };
     } else {
       out.push(m);
     }
@@ -628,7 +736,22 @@ export class SimpleModel {
     switch (base) {
       case "system":
       case "user":
-        return { role: base, content: this.toText(m.content) };
+        return { role: base, content: toWireContent(m.content) };
+      case "assistant": {
+        const reasoned = m as ReasonedMessage;
+        const parts = toWireParts(m.content);
+        return {
+          role: "assistant",
+          // pure text stays a string (llama.cpp/Qwen templates prefer it);
+          // any media → multipart array
+          content: parts.every((p) => p.type === "text") ? parts.map((p) => String(p.text ?? "")).join("\n") : parts,
+          // replay thinking ONLY when preserveThinking is on and the message
+          // actually carries it — default: the next request never sees it
+          ...(this.preserveThinking && reasoned.reasoningContent
+            ? { reasoning_content: reasoned.reasoningContent }
+            : {}),
+        };
+      }
       case "assistant": {
         const reasoned = m as ReasonedMessage;
         return {
@@ -663,11 +786,15 @@ export class SimpleModel {
       }
       case "toolResult": {
         const face = m.content as ToolResultContent | null;
+        const answer = face?.answer ?? "[tool failed catastrophically — no result produced]";
+        // tool results ride the answer face; media blocks ride along when present
+        const extra = face !== null && typeof face === "object" && "media" in face && Array.isArray((face as { media: unknown }).media) ? ((face as { media: unknown[] }).media ?? []) : [];
+        const mediaParts = extra.map((b) => toWirePart(b)).filter((p) => p !== undefined);
         return {
           role: "tool",
           tool_call_id: (m as ToolResultMessage).toolCallId,
           // null content = catastrophic failure — feed the model a synthetic answer anyway
-          content: face?.answer ?? "[tool failed catastrophically — no result produced]",
+          content: mediaParts.length === 0 ? answer : [{ type: "text", text: answer }, ...mediaParts],
         };
       }
       default:

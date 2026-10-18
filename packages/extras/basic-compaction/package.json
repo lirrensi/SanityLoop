@@ -7,6 +7,7 @@
     ".": "./index.ts"
   },
   "dependencies": {
+    "@sanityloop/compaction": "^0.1.0",
     "@sanityloop/core": "^0.2.0",
     "@sanityloop/util": "^0.1.0"
   },

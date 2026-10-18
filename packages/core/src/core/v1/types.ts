@@ -38,6 +38,21 @@ export type TextBlock = { type: "text"; content: string };
 /** Compound flavor — an array of objects, each with a unique ID + content. */
 export type FragmentBlock = { id: string; content: string };
 
+/**
+ * Media block — binary payload carried inline (base64) or by reference (URL).
+ * Canonical OpenAI-compatible shape; llama.cpp / vLLM / OpenRouter accept it
+ * on user messages and tool results. Unsupported-kind blocks are SKIPPED at
+ * the wire (never fatal) — the text face always survives.
+ */
+export type MediaBlock =
+  | { type: "image"; data: string; mimeType: string }
+  | { type: "audio"; data: string; mimeType: string }
+  | { type: "video"; data: string; mimeType: string; processing?: "agentic" | "static" }
+  | { type: "document"; data: string; mimeType: string; name?: string };
+
+/** Simple-flavor content part: text or media. */
+export type ContentBlock = TextBlock | MediaBlock;
+
 /** ToolCall / ToolResult two-face: what the model sees + everything else for us. */
 export interface ToolFace {
   /** Stuff that goes INTO THE MODEL as the answer. */
@@ -72,9 +87,9 @@ export interface BaseMessage {
   committedAt?: number;
 }
 
-/** Simple-flavor content: array of text blocks. */
+/** Simple-flavor content: array of text/media blocks. */
 export interface SimpleContent {
-  content: TextBlock[];
+  content: ContentBlock[];
 }
 
 /** Compound-flavor content: array of addressable fragments. */
@@ -89,14 +104,14 @@ export interface ToolContent {
 
 /**
  * The message slot. Content shape depends on type:
- * - simple types (system/user/assistant): `TextBlock[]`
+ * - simple types (system/user/assistant): `ContentBlock[]` (text + media)
  * - compound types (*-compound): `FragmentBlock[]`
  * - tool types (toolCall: `ToolFace`; toolResult: `ToolResultContent`)
  * - null: a message with no payload (catastrophic tool failure)
  * - custom: whatever you define in your own interface
  */
 export interface Message extends BaseMessage {
-  content: TextBlock[] | FragmentBlock[] | ToolFace | ToolResultContent | null;
+  content: ContentBlock[] | FragmentBlock[] | ToolFace | ToolResultContent | null;
   /** Per-call stats. Populated by agent.recordStats(). */
   stats?: MessageStats;
 }
