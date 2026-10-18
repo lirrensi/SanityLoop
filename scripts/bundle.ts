@@ -254,14 +254,23 @@ function generateShelfReadme(bricks: Brick[], extrasDir: string): void {
 /** The reproducibility gate: tsc over the staged shelf with ONLY @sanityloop/core
  * resolvable. Any leftover bare @sanityloop/* import (a missed rewrite or a
  * dangling dep) fails the gate. Generated so publish.ts can run it fresh.
+ *
+ * target/lib are inherited from tsconfig.base.json: the gate MUST compile with
+ * the same lib as the real build. Hardcoded ES2022 here cost a release — the
+ * shelf uses Promise.withResolvers, which lives in the ES2024 lib the base sets.
  */
 function generateGateTsconfig(extrasDir: string): void {
+	const base = JSON.parse(readFileSync(join(ROOT, "tsconfig.base.json"), "utf8")) as {
+		compilerOptions?: { target?: string; lib?: string[] };
+	};
+	const baseOpts = base.compilerOptions ?? {};
 	writeFileSync(
 		join(extrasDir, "tsconfig.json"),
 		JSON.stringify(
 			{
 				compilerOptions: {
-					target: "ES2022",
+					target: baseOpts.target ?? "ES2022",
+					...(baseOpts.lib ? { lib: baseOpts.lib } : {}),
 					module: "NodeNext",
 					moduleResolution: "NodeNext",
 					strict: true,

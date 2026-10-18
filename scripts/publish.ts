@@ -55,7 +55,11 @@ function run(cmd: string): void {
   try {
     execSync(cmd, { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "inherit"] });
   } catch (err) {
-    throw new Error(`command failed: ${cmd}\n${err instanceof Error ? err.message : String(err)}`);
+    // stdout is piped, so re-attach it: tsc reports to stdout, and a command that
+    // fails without saying why costs a release run (it did).
+    const captured = (err as { stdout?: string }).stdout?.trim();
+    const detail = captured || (err instanceof Error ? err.message : String(err));
+    throw new Error(`command failed: ${cmd}\n${detail}`);
   }
 }
 
