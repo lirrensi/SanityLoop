@@ -67,8 +67,9 @@ export interface ToolFace {
  * still feeds the model a synthetic answer.
  */
 export interface ToolResultContent {
-  /** What the MODEL sees — always present when content exists. */
-  answer: string;
+  /** What the MODEL sees — text, or text+media parts (same blocks as a
+   * regular message). Always present when content exists. */
+  answer: string | ContentBlock[];
   /** For us, raw verbatim — any shape, optional. */
   stored?: unknown;
   /** Additive failure flag — absent = success, `error: true` = failure. */
@@ -885,8 +886,8 @@ export interface TurnResult {
 
 /** Tool result: answer (for them) + stored (for us) + error (the additive flag). */
 export interface ToolResult {
-  /** What the MODEL sees. */
-  answer: string;
+  /** What the MODEL sees — text, or text+media parts like a regular message. */
+  answer: string | ContentBlock[];
   /** Everything else — errors, traces, structured. RAW: stored verbatim,
    * never transformed by the core. Any shape: object, array, string, undefined. */
   stored?: unknown;

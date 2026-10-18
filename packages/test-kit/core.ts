@@ -7,4 +7,5 @@
 
 export * from "./stub-model.ts";
 export * from "./gated-model.ts";
+export * from "./nightmare-model.ts";
 export * from "./harness.ts";

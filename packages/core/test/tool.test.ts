@@ -137,7 +137,7 @@ test("tool returning a raw STRING → synthesized error result", async () => {
     assert.match(result.content!.answer, /returned string/);
 });
 
-test("result without a string `answer` → synthesized error result", async () => {
+test("result without an `answer` → synthesized error result (blocks pass, garbage fails)", async () => {
     const tool = Tool.define({
         name: "answerless",
         description: "d",
@@ -149,7 +149,7 @@ test("result without a string `answer` → synthesized error result", async () =
     const { agent } = turnFor(tool);
     const result = await lastResultOf(agent);
     assert.equal(result.content!.error, true);
-    assert.match(result.content!.answer, /without a string "answer"/);
+    assert.match(result.content!.answer as string, /without an "answer" field/);
 });
 
 test("a THROWING tool becomes an error RESULT — the loop lands idle afterwards", async () => {
@@ -215,4 +215,107 @@ test("UNKNOWN tool name → synthetic unknown-tool error result", async () => {
     const result = await lastResultOf(agent);
     assert.equal(result.content!.error, true);
     assert.equal(result.content!.answer, "Unknown tool: ghost");
+});
+
+// ---------------------------------------------------------------------------
+// answer: string | ContentBlock[] — the union contract
+// ---------------------------------------------------------------------------
+
+test("UNION: block answers pass the gate verbatim and commit", async () => {
+    const blocks = [
+        { type: "text", content: "here is the shot" },
+        { type: "image", data: "aGk=", mimeType: "image/png" },
+    ] as const;
+    const tool = Tool.define({
+        name: "screenshot",
+        description: "d",
+        inputSchema: { type: "object" },
+        async execute() {
+            return { answer: [...blocks] };
+        },
+    });
+    const { agent } = turnFor(tool);
+    const result = await lastResultOf(agent);
+    assert.equal(result.content!.error, undefined, "blocks are valid, not an error");
+    assert.deepEqual(result.content!.answer, [...blocks], "committed verbatim");
+    assert.equal(agent.loopState, "idle");
+});
+
+test("UNION: number/boolean/null answers still synthesize errors (gate holds)", async () => {
+    for (const bad of [42, true, null] as const) {
+        const tool = Tool.define({
+            name: "badface",
+            description: "d",
+            inputSchema: { type: "object" },
+            async execute() {
+                return { answer: bad } as never;
+            },
+        });
+        const { agent } = turnFor(tool);
+        const result = await lastResultOf(agent);
+        assert.equal(result.content!.error, true, `${String(bad)} rejected`);
+        assert.match(result.content!.answer as string, /without an "answer" field/);
+    }
+});
+
+test("UNION: preResolved answers may be blocks (permission-shaped denial)", async () => {
+    const tool = Tool.define({
+        name: "gated",
+        description: "d",
+        inputSchema: { type: "object" },
+        async execute() {
+            return { answer: "should never run" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("gated", {}, "call-9")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [tool], agentId: "preresolve-union" });
+    agent.addFilter({
+        event: "beforeTool" as never,
+        id: "test/deny-blocks",
+        priority: 0,
+        fn: async (_a, raw) => {
+            const call = (raw as { call?: { preResolved?: unknown } }).call;
+            if (call) call.preResolved = { answer: [{ type: "text", content: "denied with parts" }], error: true };
+        },
+    });
+    seedUserMessage(agent, "go");
+    kick(agent);
+    const result = await lastResultOf(agent);
+    assert.deepEqual(result.content!.answer, [{ type: "text", content: "denied with parts" }]);
+    assert.equal(result.content!.error, true);
+});
+
+test("F1: toolEnd sees the RESULT as currentTurn (not the stale toolCall)", async () => {
+    const tool = Tool.define({
+        name: "prober",
+        description: "d",
+        inputSchema: { type: "object" },
+        async execute() {
+            return { answer: "the result face" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("prober", {}, "call-f1")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [tool], agentId: "f1-test" });
+    let seenType = "";
+    let seenAnswer: unknown = undefined;
+    agent.addFilter({
+        event: "toolEnd" as never,
+        id: "test/turn-tap",
+        priority: 0,
+        fn: async (a) => {
+            seenType = a.currentTurn?.type ?? "";
+            seenAnswer = (a.currentTurn?.content as { answer?: unknown } | undefined)?.answer;
+        },
+    });
+    seedUserMessage(agent, "go");
+    kick(agent);
+    await lastResultOf(agent);
+    assert.equal(seenType, "toolResult", "currentTurn repointed at the commit");
+    assert.equal(seenAnswer, "the result face", "readers see the result face");
 });

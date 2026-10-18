@@ -12,9 +12,10 @@
 //     │     → streaming assembles content + tool calls from SSE
 //     └── return the normal message       ← what the runtime expects, always
 //
-// Adapter responsibility (item 21.5): bad finish_reason (length/content_filter)
-// is an ERROR, not a result. Malformed tool args become preResolved error
-// results — the model sees them and self-corrects (item 21.6).
+// Adapter responsibility (item 21.5): an UNCLEAN finish_reason (not in
+// stopReasons) is a RETRY CANDIDATE, not a result — the loop retries, then
+// throws loud with reason stamped. Malformed tool args become preResolved
+// error results — the model sees them and self-corrects (item 21.6).
 // ============================================================================
 
 import type { GodObject, Message, StreamSink, ToolResultContent, ToolResultMessage, TurnResult } from "./types.ts";
@@ -77,6 +78,28 @@ function audioFormat(mime: string): string {
   return "wav";
 }
 
+/**
+ * The ONE answer normalizer — string or blocks in, display/index/summarize
+ * text out. Text blocks + typeless {id,content} fragments contribute content;
+ * media blocks contribute a short descriptor (never base64); garbage → "".
+ * Every string-assuming answer consumer (observer, repl, search, compaction,
+ * sentry, loop-control, subagents) funnels through here. Pure.
+ */
+export function answerText(answer: unknown): string {
+  if (typeof answer === "string") return answer;
+  if (!Array.isArray(answer)) return "";
+  return answer
+    .map((b) => {
+      if (typeof b !== "object" || b === null) return "";
+      const rec = b as Record<string, unknown>;
+      if (typeof rec.content === "string" && (rec.type === "text" || !("type" in rec))) return rec.content;
+      if (typeof rec.type === "string") return `[${rec.type} omitted — text-only fallback]`;
+      return "";
+    })
+    .filter((s) => s.length > 0)
+    .join("\n");
+}
+
 /** Flatten any message content to a wire string — text blocks, compound fragments, tool faces. Media blocks contribute a short descriptor (never base64). */
 function toWireText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -94,7 +117,7 @@ function toWireText(content: unknown): string {
       .join("\n");
   }
   if (typeof content === "object" && content !== null && "answer" in content) {
-    return String((content as { answer: unknown }).answer);
+    return answerText((content as { answer: unknown }).answer);
   }
   return String(content ?? "");
 }
@@ -112,14 +135,18 @@ function toWireParts(content: unknown): { type: string; text?: unknown }[] {
   const parts: { type: string; text?: unknown }[] = [];
   for (const b of content) {
     if (typeof b !== "object" || b === null) continue;
+    const rec = b as Record<string, unknown>;
+    // typeless compound fragments { id, content } are text — same rule as toBlockList.
+    if (!("type" in rec) || typeof rec.type !== "string") {
+      if (typeof rec.content === "string") parts.push({ type: "text", text: rec.content });
+      continue;
+    }
     // custom wire-ready parts (video_url, image_url, input_audio, file, ...) pass verbatim —
     // the user knows what their provider eats. Known blocks map via toWirePart.
-    if ("type" in b && typeof (b as { type: unknown }).type === "string") {
-      const t = (b as { type: string }).type;
-      if (t.includes("_") || t === "file") {
-        parts.push({ ...(b as Record<string, unknown>) } as { type: string });
-        continue;
-      }
+    const t = rec.type;
+    if (t.includes("_") || t === "file") {
+      parts.push({ ...rec } as { type: string });
+      continue;
     }
     const part = toWirePart(b);
     if (part) parts.push(part as { type: string; text?: unknown });
@@ -137,7 +164,8 @@ export function concatBlocks(
   for (const p of parts) {
     out.push({ ...p });
   }
-  // join runs of adjacent text (the old toWireText join, block-safe)
+  // join runs of adjacent text with blank lines — uniform rule, intra- and
+  // inter-message alike (deliberate: merged fragments read as paragraphs).
   const joined: { type: string; content?: string; data?: string; mimeType?: string; name?: string; processing?: string }[] = [];
   for (const p of out) {
     const prev = joined[joined.length - 1];
@@ -159,8 +187,14 @@ function toBlockList(content: unknown): BlockLike[] {
   const list: BlockLike[] = [];
   for (const b of content) {
     if (typeof b !== "object" || b === null) continue;
-    if (!("type" in b) || typeof (b as { type: unknown }).type !== "string") continue;
-    list.push({ ...(b as Record<string, string>) } as BlockLike);
+    const rec = b as Record<string, unknown>;
+    // typeless compound fragments { id, content } are text — the old toWireText
+    // included them; dropping them here silently loses system/user content.
+    if (!("type" in rec) || typeof rec.type !== "string") {
+      if (typeof rec.content === "string" && rec.content.length > 0) list.push({ type: "text", content: rec.content });
+      continue;
+    }
+    list.push({ ...(rec as Record<string, string>) } as BlockLike);
   }
   return list;
 }
@@ -272,9 +306,10 @@ export interface SimpleModelOptions {
   /**
    * Network-level retries — the honest loop the error path already promises
    * ("Adapter retries first"). Bounded, retryable-only: transport failures +
-   * HTTP 429/5xx. Non-retryable (4xx, bad finish_reason, parse) throws on the
-   * first attempt. The loop-level decision stays the filter's (the `error`
-   * event carries everything after retries exhaust). Default 3 attempts total.
+   * HTTP 429/5xx + UNCLEAN finish reasons (see stopReasons). Non-retryable
+   * (4xx, aborts, parse) throws on the first attempt. The loop-level decision
+   * stays the filter's (the `error` event carries everything after retries
+   * exhaust). Default 3 attempts total.
    */
   retries?: number;
   /**
@@ -303,6 +338,23 @@ export interface SimpleModelOptions {
    * status line, or enforce a custom stop policy (consecutive-429 cap, ...).
    */
   onRetry?: (attempt: RetryAttempt) => void | false | Promise<void | false>;
+  /**
+   * Finish reasons that count as a CLEAN stop — anything else retries (then
+   * throws loud when attempts/budget/veto give out). Default ["stop"]: only
+   * `stop` lands; `length`, `content_filter`, provider-specific reasons are
+   * RETRY CANDIDATES, never silent results. Tool calls bypass this check
+   * (a response carrying tool_calls is work, whatever the reason says).
+   * Override per provider: Anthropic `["stop","end_turn"]`, Google
+   * `["STOP"]`, llama.cpp `["stop"]`. Empty array = every reason retries.
+   */
+  stopReasons?: string[];
+  /**
+   * Transport override — same signature as global fetch. Default: globalThis.fetch.
+   * Test seam for chaos providers (NightmareModel) and offline harnesses: the
+   * retry loop, stream assembly, and finish validation all run unchanged on
+   * top of whatever this returns. Production code leaves it unset.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 export class SimpleModel {
@@ -327,6 +379,10 @@ export class SimpleModel {
   retryMaxDelayMs: number;
   /** Per-attempt hook, awaited before the backoff sleep. False/throw = stop. */
   onRetry?: (attempt: RetryAttempt) => void | false | Promise<void | false>;
+  /** Finish reasons that land clean (see options). Default ["stop"]. */
+  stopReasons: string[];
+  /** Transport override (see options). Default: globalThis.fetch, resolved per call. */
+  fetchImpl?: typeof fetch;
   /** The runtime's open bag — satisfies ModelContract's index signature. */
   [key: string]: unknown;
 
@@ -346,6 +402,8 @@ export class SimpleModel {
     this.retryDelayMs = opts.retryDelayMs ?? 500;
     this.retryMaxDelayMs = opts.retryMaxDelayMs ?? 10_000;
     this.onRetry = opts.onRetry;
+    this.stopReasons = opts.stopReasons ?? ["stop"];
+    this.fetchImpl = opts.fetchImpl;
   }
 
   // ==========================================================================
@@ -398,20 +456,22 @@ export class SimpleModel {
     if (tools.length > 0) body.tools = tools;
 
     // THE HONEST LOOP — "Adapter retries first" (see fail() in agent.ts).
-    // Retryable-only: transport failures + HTTP 429/5xx. Everything else
-    // (4xx, aborts, parse) throws on the first attempt. Retry STOPS when any
-    // of these fires: attempt cap reached, budget spent, onRetry vetoes, abort
-    // lands (even mid-backoff). The final throw carries `attempts` + the
-    // terminal `elapsedMs` — errorFacts forwards both onto the `error` event.
-    // `retries: Infinity` + no budget + no veto = retries forever; backoff
-    // still paces each sleep so a dead provider never gets hammered.
+    // Retryable: transport failures + HTTP 429/5xx + UNCLEAN finish reasons
+    // (length, content_filter, provider-specific — see stopReasons). Permanent:
+    // 4xx, aborts, parse errors. Retry STOPS when any of these fires: attempt
+    // cap reached, budget spent, onRetry vetoes, abort lands (even mid-backoff).
+    // The final throw carries `attempts` + the terminal `elapsedMs` —
+    // errorFacts forwards both onto the `error` event. `retries: Infinity` +
+    // no budget + no veto = retries forever; backoff still paces each sleep
+    // so a dead provider never gets hammered.
     const maxAttempts = this.retries === Infinity ? Infinity : Math.max(1, Math.floor(this.retries) || 1);
     const budgetMs = this.retryBudgetMs;
     const startedAt = Date.now();
     let lastErr: unknown;
     for (let attempt = 1; ; attempt++) {
       try {
-        const res = await fetch(url, {
+        const fetchImpl = this.fetchImpl ?? globalThis.fetch;
+        const res = await fetchImpl(url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -424,10 +484,14 @@ export class SimpleModel {
         if (!res.ok) {
           throw await this.providerError(res);
         }
-        if (this.stream && sink) {
-          return await this.streamAndAssemble(res, sink, agent);
-        }
-        return await res.json();
+        const completion = this.stream && sink
+          ? await this.streamAndAssemble(res, sink, agent)
+          : await res.json();
+        // finish validation runs INSIDE the loop: an unclean stop reason is a
+        // RETRY CANDIDATE, not a terminal error (process agents must survive
+        // a truncated reply). Exhaustion still throws loud with reason stamped.
+        this.validateFinish(completion);
+        return completion;
       } catch (err) {
         lastErr = err;
         // abort = the loop's own kill signal — NEVER retried, thrown as-is.
@@ -627,6 +691,36 @@ export class SimpleModel {
   // ==========================================================================
   // Response → our normal message
   // ==========================================================================
+  /**
+   * Is this finish reason UNCLEAN (a retry candidate)? Default: anything not
+   * in stopReasons. Tool calls bypass: a response CARRYING tool_calls is work
+   * no matter what the reason says. Protected seam — adapters with their own
+   * reason vocabularies (PiAdapterModel) override instead of forking the loop.
+   */
+  protected badStopReason(finishReason: string | undefined, hasToolCalls: boolean): boolean {
+    if (hasToolCalls) return false;
+    if (finishReason === undefined) return false; // absent reason = old/silent provider — lands
+    return !this.stopReasons.includes(finishReason);
+  }
+
+  /**
+   * Finish validation, called INSIDE the retry loop (callApi): an unclean
+   * reason throws a RETRYABLE error (stamped reason/truncated/retryable) so
+   * the loop retries; exhaustion throws loud with attempts/elapsedMs.
+   * ADAPTER-AUTHORED FACTS — errorFacts() forwards them verbatim.
+   */
+  protected validateFinish(completion: unknown): void {
+    const choice = (completion as { choices?: Array<{ message?: { tool_calls?: unknown[] }; finish_reason?: string }> }).choices?.[0];
+    const finishReason = choice?.finish_reason;
+    const hasToolCalls = Array.isArray(choice?.message?.tool_calls) && (choice.message.tool_calls.length ?? 0) > 0;
+    if (!this.badStopReason(finishReason, hasToolCalls)) return;
+    const err = new Error(`[sanity] provider finished with bad reason: ${finishReason}`) as ProviderError & { reason?: string; truncated?: boolean };
+    err.reason = finishReason;
+    err.retryable = true;
+    if (finishReason === "length") err.truncated = true;
+    throw err;
+  }
+
   protected parseResponse(response: unknown, inputMessages?: Message[]): TurnResult {
     const completion = response as {
       choices?: { message?: { content?: string | null; tool_calls?: unknown[]; reasoning_content?: string }; finish_reason?: string }[];
@@ -636,17 +730,10 @@ export class SimpleModel {
     };
     const choice = completion.choices?.[0];
 
-    // ADAPTER RESPONSIBILITY (item 21.5): bad outcomes are ERRORS, not results.
+    // NOTE: finish validation lives in validateFinish() (called inside the
+    // retry loop) — parseResponse only SHAPES. Direct callers of parseResponse
+    // (tests, custom adapters) get shaping without gating.
     const finishReason = choice?.finish_reason;
-    if (finishReason === "length" || finishReason === "content_filter") {
-      // ADAPTER-AUTHORED FACTS — stamp structured facts on the throw; the core's
-      // errorFacts() forwards them verbatim on the `error` event payload.
-      const err = new Error(`[sanity] provider finished with bad reason: ${finishReason}`) as Error & { reason?: string; truncated?: boolean };
-      err.reason = finishReason;
-      if (finishReason === "length") err.truncated = true;
-      throw err;
-    }
-
     const content = choice?.message?.content ?? "";
     const toolCalls = choice?.message?.tool_calls;
     const reasoningContent = choice?.message?.reasoning_content;
@@ -752,18 +839,6 @@ export class SimpleModel {
             : {}),
         };
       }
-      case "assistant": {
-        const reasoned = m as ReasonedMessage;
-        return {
-          role: "assistant",
-          content: this.toText(m.content),
-          // replay thinking ONLY when preserveThinking is on and the message
-          // actually carries it — default: the next request never sees it
-          ...(this.preserveThinking && reasoned.reasoningContent
-            ? { reasoning_content: reasoned.reasoningContent }
-            : {}),
-        };
-      }
       case "toolCall": {
         const face = m.content as { answer: string; stored: ToolCallRecord[] };
         // canonical stored shape { id, type, name, parameters } → OpenAI wire
@@ -786,15 +861,16 @@ export class SimpleModel {
       }
       case "toolResult": {
         const face = m.content as ToolResultContent | null;
-        const answer = face?.answer ?? "[tool failed catastrophically — no result produced]";
-        // tool results ride the answer face; media blocks ride along when present
-        const extra = face !== null && typeof face === "object" && "media" in face && Array.isArray((face as { media: unknown }).media) ? ((face as { media: unknown[] }).media ?? []) : [];
-        const mediaParts = extra.map((b) => toWirePart(b)).filter((p) => p !== undefined);
+        // null content = catastrophic failure — feed the model a synthetic answer anyway
+        if (face === null) {
+          return { role: "tool", tool_call_id: (m as ToolResultMessage).toolCallId, content: "[tool failed catastrophically — no result produced]" };
+        }
+        // the answer IS the content now: string → text, blocks → multipart.
+        // toWireContent keeps pure text a string (llama.cpp/Qwen prefer it).
         return {
           role: "tool",
           tool_call_id: (m as ToolResultMessage).toolCallId,
-          // null content = catastrophic failure — feed the model a synthetic answer anyway
-          content: mediaParts.length === 0 ? answer : [{ type: "text", text: answer }, ...mediaParts],
+          content: toWireContent(face.answer),
         };
       }
       default:

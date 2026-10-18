@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import {
     Agent,
     SimpleModel,
+    answerText,
     normalizeForAlternation,
 } from "@sanityloop/core";
 import type { GodObject, Message, MessageStats, TurnResult } from "@sanityloop/core";
@@ -60,7 +61,7 @@ test("normalizeForAlternation: order absolute — same-type merges in place, too
         text("u1", "user", "go"),
     ]);
     assert.deepEqual(out.map((m) => m.id), ["system", "u1"], "head = merged systems, then user");
-    assert.deepEqual(out[0].content, [{ type: "text", content: "alpha\nbeta\n\ncatalog\n\npreload" }], "all system text merged");
+    assert.deepEqual(out[0].content, [{ type: "text", content: "alpha\n\nbeta\n\ncatalog\n\npreload" }], "all system text merged, uniform blank-line joins");
 
     // a trailing assistant STAYS — order is absolute, never popped
     out = normalizeForAlternation([text("u1", "user", "go"), text("a1", "assistant", "done")]);
@@ -160,4 +161,65 @@ test("contextUsage appears ONLY when maxContext is set (derived ratio)", async (
     kick(agent);
     await awaitIdle(agent);
     assert.equal(agent.stats.contextUsage, 0.1); // latest input / maxContext, capped at 1
+});
+
+test("REGRESSION: typeless compound fragments survive BOTH merge and wire paths", () => {
+    // V-MEDIA-001: the media-blocks refactor replaced string flattening with
+    // block concat; typeless { id, content } fragments were dropped in BOTH
+    // normalizeForAlternation (merge) and prepareMessages (wire). Silent
+    // content loss — system/user text never reached the provider.
+    const model = new SimpleModel({ modelId: "m", stream: false });
+    const frag = { id: "f1", content: "fragment-text" }; // NO type field — the compound shape
+    // merge path: normalizeForAlternation must keep the fragment's text
+    const merged = normalizeForAlternation([
+        { id: "system", enabled: true, type: "system-compound", content: [frag] },
+        { id: "s2", enabled: true, type: "system", content: [{ type: "text", content: "tail" }] },
+    ] as Message[]);
+    assert.equal(merged.length, 1);
+    assert.deepEqual(merged[0].content, [{ type: "text", content: "fragment-text\n\ntail" }]);
+    // wire path: prepareMessages must emit the fragment's text (no provider call)
+    const wire = model.prepareMessages([
+        { id: "system", enabled: true, type: "system-compound", content: [frag] },
+    ] as Message[]) as Array<{ role: string; content: string }>;
+    assert.deepEqual(wire, [{ role: "system", content: "fragment-text" }]);
+});
+
+test("answerText: the ONE normalizer — strings, blocks, fragments, garbage", () => {
+    assert.equal(answerText("plain"), "plain");
+    assert.deepEqual(answerText([{ type: "text", content: "a" }, { type: "text", content: "b" }]), "a\nb");
+    assert.equal(answerText([{ id: "f", content: "frag" }]), "frag", "typeless fragments are text");
+    assert.equal(answerText([{ type: "image", data: "xx", mimeType: "image/png" }]), "[image omitted — text-only fallback]");
+    assert.equal(
+        answerText([{ type: "text", content: "shot:" }, { type: "image", data: "xx", mimeType: "image/png" }]),
+        "shot:\n[image omitted — text-only fallback]",
+    );
+    assert.equal(answerText([]), "");
+    assert.equal(answerText(undefined), "");
+    assert.equal(answerText(null), "");
+    assert.equal(answerText(42), "");
+    assert.equal(answerText([null, 42, "x"]), "");
+});
+
+test("UNION wire: block toolResults emit multipart; strings stay strings", () => {
+    const model = new SimpleModel({ modelId: "m", stream: false });
+    // string answer → string content (llama.cpp/Qwen shape preserved)
+    const str = model.prepareMessages([
+        { id: "r", enabled: true, type: "toolResult", toolCallId: "c1", content: { answer: "plain text" } },
+    ] as Message[]) as Array<{ role: string; content: unknown }>;
+    assert.deepEqual(str, [{ role: "tool", tool_call_id: "c1", content: "plain text" }]);
+    // block answer → multipart array, image mapped to image_url
+    const multi = model.prepareMessages([
+        {
+            id: "r2", enabled: true, type: "toolResult", toolCallId: "c2",
+            content: { answer: [{ type: "text", content: "shot:" }, { type: "image", data: "aGk=", mimeType: "image/png" }] },
+        },
+    ] as Message[]) as Array<{ role: string; content: Array<Record<string, unknown>> }>;
+    assert.equal(multi[0].role, "tool");
+    assert.deepEqual(multi[0].content[0], { type: "text", text: "shot:" });
+    assert.deepEqual(multi[0].content[1], { type: "image_url", image_url: { url: "data:image/png;base64,aGk=" } });
+    // null content → synthetic catastrophic answer (unchanged)
+    const dead = model.prepareMessages([
+        { id: "r3", enabled: true, type: "toolResult", toolCallId: "c3", content: null },
+    ] as Message[]) as Array<{ content: string }>;
+    assert.match(dead[0].content, /catastrophically/);
 });

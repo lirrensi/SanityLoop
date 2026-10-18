@@ -31,8 +31,15 @@ export function estimateMessageTokens(message: Message): number {
 				chars += block.content.length;
 		}
 	} else if (c && typeof c === "object") {
-		const obj = c as { answer?: string; stored?: unknown };
+		const obj = c as { answer?: string | Array<{ content?: unknown; data?: string }>; stored?: unknown };
+		// block answers: text contributes, media data does NOT (base64 never
+		// rides the wire as tokens — descriptors do, and they're short)
 		if (typeof obj.answer === "string") chars += obj.answer.length;
+		else if (Array.isArray(obj.answer)) {
+			for (const b of obj.answer) {
+				if (typeof b?.content === "string") chars += b.content.length;
+			}
+		}
 		if (obj.stored !== undefined) chars += JSON.stringify(obj.stored).length;
 	}
 	return Math.ceil(chars / 4);

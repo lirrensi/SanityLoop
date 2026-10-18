@@ -254,3 +254,24 @@ test("settled() on an un-run agent answers NOW from current state (no hang)", as
     assert.ok(Date.now() - t0 < 1000, "immediate answer — no heartbeat to wait on");
     assert.deepEqual(r, { state: "idle", timedOut: false });
 });
+
+test("settled() AFTER terminate() answers NOW with terminated (dead heart, no hang)", async () => {
+    // REGRESSION: settled() registered a waiter no beat would ever notify —
+    // the loops broke, terminate()'s sweep already ran. Hung forever.
+    // Dead hearts answer NOW: terminated, not a timeout.
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    const runP = agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.terminate();
+    await runP;
+    const t0 = Date.now();
+    const r = await agent.settled(); // NO timeout — must not hang
+    assert.ok(Date.now() - t0 < 1000, "immediate answer — the heart is dead");
+    assert.deepEqual(r, { state: "terminated", timedOut: false });
+    // states filter still applies: unwanted rest → timedOut, still NOW
+    const r2 = await agent.settled({ states: ["idle"] });
+    assert.deepEqual(r2, { state: "terminated", timedOut: true });
+});

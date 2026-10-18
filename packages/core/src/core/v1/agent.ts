@@ -40,6 +40,7 @@
 
 import { FilterBus } from "./filter-bus.ts";
 import type {
+    ContentBlock,
     CycleState,
     ErrorFacts,
     ErrorSource,
@@ -117,7 +118,7 @@ function sleep(ms: number): Promise<void> {
  *   - a valid ToolResult passes through untouched
  *   - null/undefined (no return) → a synthesized error result
  *   - a non-object (string/number/...) → a synthesized error result
- *   - a result without a string `answer` → a synthesized error result
+ *   - a result without an `answer` (string, or text/media blocks) → a synthesized error result
  * DELIBERATE null is NOT a skip — skipping would break the
  * every-call-gets-an-answer insurance. Skips live in filters
  * (preResolved), never in returns.
@@ -141,11 +142,11 @@ function normalizeToolResult(raw: unknown, name: string): ToolResult {
         };
     }
     const r = raw as ToolResult;
-    if (typeof r.answer !== "string") {
+    if (typeof r.answer !== "string" && !Array.isArray(r.answer)) {
         return {
-            answer: `Tool ${name} returned a result without a string "answer" field — this is a tool bug. answer is what the model sees.`,
+            answer: `Tool ${name} returned a result without an "answer" field — this is a tool bug. answer (text, or text/media blocks) is what the model sees.`,
             error: true,
-            errorMessage: "result missing string answer",
+            errorMessage: "result missing answer",
             stored: { returned: raw },
         };
     }
@@ -171,7 +172,7 @@ export interface ToolCallRecord {
     /** A filter pre-resolved this call's outcome BEFORE the batch executes — the
      * result is PREDETERMINED: a denial, a cached result, or crash-healing.
      * `error` is a SEPARATE dimension — denial/heal = true; a cache hit omits it. */
-    preResolved?: { answer: string; stored?: unknown; error?: boolean; errorMessage?: string };
+    preResolved?: { answer: string | ContentBlock[]; stored?: unknown; error?: boolean; errorMessage?: string };
 }
 
 /**
@@ -805,8 +806,10 @@ export class Agent implements GodObject {
         // settled() waiters must never hang on a dead heart: the loops break
         // at their next beat, so no beat will ever notify them again. Answer
         // NOW — terminated, not a timeout — then let run() resolve below.
+        // No clock guard here: on a dead heart there IS no next beat, so a
+        // same-tick registration deserves the answer, not a hang.
         for (const w of [...this.settleWaiters]) {
-            if (w.done || this.ticks <= w.t0) continue;
+            if (w.done) continue;
             if (w.want !== undefined && !w.want.has("terminated")) continue;
             w.finish({ state: "terminated", timedOut: false });
         }
@@ -838,10 +841,13 @@ export class Agent implements GodObject {
     settled(opts: SettledOptions = {}): Promise<SettledResult> {
         const want = opts.states !== undefined ? new Set<SettledState>(opts.states) : undefined;
         return new Promise<SettledResult>((resolve) => {
-            // un-run agents have no heartbeat — nothing will EVER beat, so
-            // answer from current state NOW instead of hanging. (run() flips
-            // runDriven synchronously at start, so a live loop never hits this.)
-            if (!this.runDriven) {
+            // DEAD HEARTS ANSWER NOW — un-run (no heartbeat exists YET) or
+            // terminated (no beat will EVER come: the loops broke). Registering
+            // a waiter here would hang forever — nothing notifies it again.
+            // (run() flips runDriven synchronously at start, so a live loop
+            // never hits this. aborted/errored hearts still beat — their
+            // waiters resolve on the next tick via notifySettleWaiters.)
+            if (!this.runDriven || this.terminated) {
                 const live = this.loopState;
                 const match = live !== "running" && (want === undefined || want.has(live));
                 resolve({ state: live as SettledState, timedOut: !match });
@@ -1648,6 +1654,10 @@ export class Agent implements GodObject {
             },
         };
         this.messages.push(resultMsg);
+        // toolEnd readers (toolAnswer, doom counters, read-traversal) see the
+        // RESULT, not the stale toolCall: repoint before dispatch. bus.run has
+        // no turn concept, so the commit owns it (fire() owns toolStart's).
+        this.currentTurn = resultMsg;
         await this.bus.run(EVENTS.toolEnd, { call: outcome.call, result: outcome.result });
     }
 
