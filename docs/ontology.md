@@ -1,3 +1,11 @@
+---
+node_type: reference
+title: Documentation Ontology — node types, links, invariants
+status: active
+updated: 2026-10-18
+tags: [ontology, docs, conventions]
+---
+
 # Documentation Ontology
 
 Every document in `docs/` is a typed **object** in the ontology — inspired by Palantir Foundry's ontology model and GitMark's code-ontology. Each document has a `node_type` (what kind of thing it is), frontmatter **properties** (metadata), and typed **links** (relationships to other docs and code).
@@ -26,6 +34,7 @@ Each document has exactly one `node_type`. Choose based on what the document IS,
 | `change-tasks` | Implementation checklist | `docs/changes/<name>/tasks.md` |
 | `index` | Folder table of contents | Any `INDEX.md` |
 | `story` | Dated narrative of an engineering session — debug, migration, implementation, incident | `docs/stories/` |
+| `log` | Durable chronological record of engineering events — what landed, when, and why | `docs/` (root `log.md`) |
 
 **Creating new types:** You MAY create new `node_type` values if none of the existing types fit your document. However, every new type MUST be:
 1. Documented in `docs/ontology.md` (the project's ontology registry) with a clear explanation of what it is, where it lives, and why it exists.

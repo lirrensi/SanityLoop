@@ -1,6 +1,6 @@
 ---
 node_type: index
-updated: 2026-08-23
+updated: 2026-10-18
 ---
 
 # reference Index
@@ -16,6 +16,7 @@ updated: 2026-08-23
   → /packages/core/src/core/v1/agent.ts (documents)
   → /packages/core/src/core/v1/tool.ts (documents)
   ← /architecture/core.md (depends_on)
+  ← /guides/adopting.md (depends_on)
   ← /guides/cookbook.md (depends_on)
   ← /reference/extensions.md (depends_on)
   ← /verification/strategy.md (depends_on)
@@ -24,6 +25,7 @@ updated: 2026-08-23
   → /architecture/core.md (depends_on)
   → /packages/core/src/core/v1/types.ts (documents)
   → /packages/core/src/core/v1/types.ts (implemented_by)
+  ← /architecture/swarm.md (depends_on)
   ← /guides/cookbook.md (depends_on)
   ← /reference/api.md (depends_on)
   ← /verification/strategy.md (depends_on)
@@ -33,15 +35,19 @@ updated: 2026-08-23
   → /guides/packaging.md (depends_on)
   → /packages/extras/ (documents)
   → /packages/swarm/ (documents)
+  ← /guides/adopting.md (depends_on)
+  ← /guides/coding-agent.md (depends_on)
+  ← /guides/mini-map.md (depends_on)
   ← /verification/strategy.md (depends_on)
 - [The State Model — SessionData, the tape, restore 🟢](state.md)
 
   → /architecture/core.md (depends_on)
   → /packages/core/src/core/v1/types.ts (documents)
   → /packages/extras/base-storage/ (documents)
-  → /packages/extras/base-storage/src/session.ts (implemented_by)
-  → /packages/extras/base-storage/src/jsonl.ts (implemented_by)
+  → /packages/extras/base-storage/session.ts (implemented_by)
+  → /packages/extras/base-storage/jsonl.ts (implemented_by)
   ← /architecture/core.md (depends_on)
+  ← /guides/adopting.md (depends_on)
   ← /guides/cookbook.md (depends_on)
   ← /reference/api.md (depends_on)
   ← /verification/strategy.md (depends_on)
@@ -51,4 +57,4 @@ updated: 2026-08-23
 `api` `catalog` `contract` `core` `events` `extensions` `extras` `packages` `persistence` `reference` `restore` `state`
 
 ---
-*Auto-generated. Last rebuilt: 2026-08-23*
+*Auto-generated. Last rebuilt: 2026-10-18*

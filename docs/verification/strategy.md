@@ -2,7 +2,7 @@
 node_type: verification
 title: Sanity Verification Strategy
 status: active
-updated: 2026-08-23
+updated: 2026-10-18
 tags: [verification, testing]
 links:
   depends_on: [/overview/product.md, /architecture/core.md, /reference/events.md, /reference/state.md, /reference/api.md, /reference/extensions.md]
@@ -54,7 +54,8 @@ is closed at component scale; fleet-scale chaos is still unproven.
 | Tool | Version / source | Purpose | Evidence produced |
 | --- | --- | --- | --- |
 | `tsc` | typescript ^7.0.2 (root devDep) | type-check the whole workspace (`npm run typecheck`) | exit status |
-| `npm run verify` (`scripts/verify.ts`) | repo script, node built-ins only | THE ONE GATE — runs type → unit → e2e → templates → live, prints the board, writes `.agents/reports/verify-latest.json` | per-tier pass/fail/skip + the JSON report |
+| `npm run docs:check` (`scripts/docs.ts`) | repo script, node built-ins only | documentation invariants — frontmatter + registered node types, resolving links (frontmatter and body), orphans against `INDEX.md`, generated-index presence, catalog and core-truth-file coverage | exit status + per-finding report |
+| `npm run verify` (`scripts/verify.ts`) | repo script, node built-ins only | THE ONE GATE — runs docs → type → unit → e2e → templates → live, prints the board, writes `.agents/reports/verify-latest.json` | per-tier pass/fail/skip + the JSON report |
 | node ≥ 22.6 with `--experimental-strip-types` (+ `--experimental-transform-types` when TS-only syntax is present) | runtime | run templates + the test suite | stdout assertions, exit status |
 | `@sanityloop/test-kit` | workspace package — `.` entry: bounded waits + temp dirs; `./core` entry: `StubModel` + harness (`kick`, `withDriver`, `makeAgent`); core is a peerDependency | shared fixtures for every package's suite | shared fixture code |
 | `templates/simple-agent.ts` | demo agent | full lifecycle proof (permission gate → park → resume → tool → land) with a stubbed model | run output |
@@ -87,6 +88,7 @@ asserting real reply text).
 
 | Tier | Command | Prerequisites | Approx. runtime | Cadence / gate | Evidence |
 | --- | --- | --- | --- | --- | --- |
+| Docs | `npm run docs:check` (or `npm run verify -- --tier=docs`) | node only | <1s | before any doc change; first tier of the gate | the `DOCS GREEN` line / findings |
 | THE GATE | `npm run verify` | node + `npm install` at repo root | ~1 min | local before every push; CI on every push/PR | the board + `.agents/reports/verify-latest.json` |
 | Fast / typecheck | `npm run verify -- --tier=type` | same | seconds | after every change | exit 0 |
 | The suite | `npm run verify -- --tier=unit` | none (stub models) | ~30s | after every change | counts in the verify report |
@@ -151,8 +153,9 @@ de-facto gates for the architecture.
 | No CI | everything | nothing runs on commit | ~~wire `typecheck` + `npm test` into a workflow~~ DONE 2026-10-18: `.github/workflows/ci.yml` runs `npm run verify` (type→unit→e2e→templates→live) on every push/PR | closed |
 | Swarm fleet-scale chaos (multi-worker failure injection) | V-SWRM-001 | fleet regressions under failure silent | a chaos e2e (kill -9 a worker mid-turn) | open |
 | Crash-heal tested at component scale, not process-kill scale | V-CRASH-HEAL | OS-level kill mid-batch unproven | a subprocess-kill e2e test | open |
-| Docs can drift again | docs ↔ code | the anti-drift guarantee weakens | sync passes when the breadcrumb gap grows past ~10 commits | process |
+| Docs can drift again | docs ↔ code | the anti-drift guarantee weakens | structure is gated: `npm run docs:check --strict` (inside `verify`) fails on broken links, orphans, unknown node types, and unanchored catalog/truth files. Semantic doc↔code drift still needs the sync pass | closed for structure, process for semantics |
 | W2 recoverable-error seam not built | `/architecture/core.md` error path | errors are terminal-only | W2 remains the known next core change | open |
+| `npm run verify` is green on Linux (CI) but red on Windows | the gate's "run it locally" claim | a Windows contributor sees environmental red: swarm worker e2e (daemon spawn), fake-docker shim (ENOENT without `.cmd`), REPL tmux banner | CI stays authoritative; per-test Windows fixes outstanding (core unit tier is 110/110 on Windows) | open |
 
 ## Maintenance Triggers
 

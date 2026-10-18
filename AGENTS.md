@@ -30,6 +30,30 @@ Currently we are on pure SDK stage where we create a pattern when the agent is a
 
 
 
+## Map — read before exploring
+
+- **The reading spine is `docs/guides/start-here.md`.** Four ordered routes:
+  understand the machine / build an agent / adopt an existing one / change the SDK.
+  Pick one; every route assumes the page before it.
+- **The truth is five files** in `packages/core/src/core/v1/`: `types.ts`
+  (vocabulary) → `agent.ts` (the two clocks, step, park, terminate) →
+  `filter-bus.ts` (dispatch) → `tool.ts` (tool + batch) → `simple-model.ts`
+  (the model seam). Everything else composes them. Read these before grepping.
+
+| Task | Read first |
+| --- | --- |
+| add/modify an extension | `docs/reference/extensions.md`, `docs/reference/api.md` |
+| touch the loop, state, or parking | `docs/architecture/core.md`, `docs/reference/state.md` |
+| adopt/port an existing agent | `docs/guides/adopting.md` |
+| build a new agent | `docs/guides/mini-map.md`, `templates/template-agent.ts` |
+| release | `docs/guides/releasing.md` |
+| verify | `docs/verification/strategy.md` — `npm run verify` |
+
+- **Docs are an ontology** (`docs/ontology.md`). `INDEX.md` files are generated —
+  never hand-edit them. `npm run docs:check` (also inside `npm run verify`) is the
+  gate: frontmatter, resolving links, orphans, coverage. A behavior change updates
+  its doc in the same commit.
+
 ## Releases — the contract (read `docs/guides/releasing.md` before touching this)
 
 - **A push to main is inert.** Only `ci.yml` runs (verify). npm is NEVER touched by a push.

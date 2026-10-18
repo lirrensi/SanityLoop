@@ -8,7 +8,7 @@ confidence: decided
 links:
   depends_on: [/architecture/core.md]
   documents: [/packages/core/src/core/v1/types.ts, /packages/extras/base-storage/]
-  implemented_by: [/packages/extras/base-storage/src/session.ts, /packages/extras/base-storage/src/jsonl.ts]
+  implemented_by: [/packages/extras/base-storage/session.ts, /packages/extras/base-storage/jsonl.ts]
   verified_by: [/verification/strategy.md]
 sync_status: verified
 last_synced: 2026-08-23

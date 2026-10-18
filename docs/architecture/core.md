@@ -8,10 +8,10 @@ confidence: decided
 links:
   depends_on: [/overview/product.md, /reference/state.md, /reference/api.md]
   documents: [/packages/core/src/core/v1/]
-  implemented_by: [/packages/core/src/core/v1/agent.ts, /packages/core/src/core/v1/filter-bus.ts, /packages/core/src/core/v1/types.ts]
+  implemented_by: [/packages/core/src/core/v1/agent.ts, /packages/core/src/core/v1/filter-bus.ts, /packages/core/src/core/v1/types.ts, /packages/core/src/core/v1/tool.ts, /packages/core/src/core/v1/simple-model.ts, /packages/core/src/core/v1/index.ts, /packages/core/src/core/v1/token-estimate.ts, /packages/core/src/core/v1/stats-format.ts]
   verified_by: [/verification/strategy.md]
 sync_status: verified
-last_synced: 2026-08-23
+last_synced: 2026-10-18
 ---
 
 # Core Architecture

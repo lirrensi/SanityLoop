@@ -1,3 +1,10 @@
+---
+node_type: log
+title: Project Log — dated record of what landed
+status: active
+updated: 2026-09-05
+tags: [log, history]
+---
 
 ## 2026-09-05
 
@@ -17,3 +24,7 @@
 - `12:50` **index** rebuilt 19 docs across 9 folders (at commit 6b4b058)
 - `19:00` **index** rebuilt 14 docs across 8 folders (at commit 81bf370)
 - `12:32` **index** rebuilt 14 docs across 8 folders (at commit aca2487)
+## 2026-10-18
+
+- `20:01` **index** rebuilt 20 docs across 8 folders (at commit e761d59)
+- `20:02` **index** rebuilt 20 docs across 8 folders (at commit e761d59)

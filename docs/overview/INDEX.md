@@ -1,6 +1,6 @@
 ---
 node_type: index
-updated: 2026-08-23
+updated: 2026-10-18
 ---
 
 # overview Index
@@ -16,7 +16,9 @@ updated: 2026-08-23
   → /packages/core/src/core/v1/agent.ts (documents)
   → /packages/core/src/core/v1/ (implemented_by)
   ← /architecture/core.md (depends_on)
+  ← /guides/coding-agent.md (depends_on)
   ← /guides/cookbook.md (depends_on)
+  ← /guides/start-here.md (depends_on)
   ← /stories/2026-08-16-entity-refactor.md (relates_to)
   ← /verification/strategy.md (depends_on)
 
@@ -25,4 +27,4 @@ updated: 2026-08-23
 `agent` `doctrine` `ease` `origin` `philosophy` `sdk`
 
 ---
-*Auto-generated. Last rebuilt: 2026-08-23*
+*Auto-generated. Last rebuilt: 2026-10-18*

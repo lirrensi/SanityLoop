@@ -1,6 +1,6 @@
 ---
 node_type: index
-updated: 2026-08-23
+updated: 2026-10-18
 ---
 
 # stories Index
@@ -18,4 +18,4 @@ updated: 2026-08-23
 `architecture` `refactor` `story`
 
 ---
-*Auto-generated. Last rebuilt: 2026-08-23*
+*Auto-generated. Last rebuilt: 2026-10-18*

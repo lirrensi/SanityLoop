@@ -8,6 +8,8 @@
 
 SanityLoop is a small agent SDK you bring into any of your apps — so you keep control over the harness and build it yourself out of building blocks. It is not a framework that owns your agent. The agent is a single file you own, and everything around it is Lego.
 
+> **Start here.** [The map](docs/guides/start-here.md) — four ordered routes: understand the machine, build an agent, adopt an existing one, change the SDK. Building something? [The mini-map](docs/guides/mini-map.md) routes you to bricks. Migrating an existing agent over? [Adopting](docs/guides/adopting.md).
+
 ---
 
 ## What it is
@@ -347,14 +349,16 @@ Delete any of these folders and the core still runs.
 | [`templates/simple-agent.ts`](templates/simple-agent.ts) | The proof — raw classes wired by hand, stub model included, runs with zero keys. |
 | [`templates/template-agent.ts`](templates/template-agent.ts) | THE template — an annotated menu: every option commented with *what it does, when you want it, how to remove it*. Uncomment your way to an agent. |
 | [`templates/repl-agent.ts`](templates/repl-agent.ts) | Interactive coding-agent session composed entirely from plugins. |
-| [`templates/worker.ts`](templates/worker.ts) + [`worker.json`](templates/worker.json) | Swarm worker — spawned by the daemon, env-configured, persistent. |
-| [`templates/admin.ts`](templates/admin.ts) + [`admin.json`](templates/admin.json) | Fleet admin — attach to the hub and command workers. |
+| [`templates/swarm/worker.ts`](templates/swarm/worker.ts) + [`worker.json`](templates/swarm/worker.json) | Swarm worker — spawned by the daemon, env-configured, persistent. |
+| [`templates/swarm/admin.ts`](templates/swarm/admin.ts) + [`admin.json`](templates/swarm/admin.json) | Fleet admin — attach to the hub and command workers. |
 
 ## Documentation
 
 Deeper doctrine, references, and guides live in [`docs/`](docs/):
 
-- [The mini-map](docs/guides/mini-map.md) — "I want to build…" → which bricks, which recipe. Start here.
+- [Start Here — the map, in reading order](docs/guides/start-here.md) — four routes, ordered. **Start here.**
+- [The mini-map](docs/guides/mini-map.md) — "I want to build…" → which bricks, which recipe.
+- [Adopting — migrating an existing agent](docs/guides/adopting.md) — old concept → brick, the checklist, the four traps.
 - [Build your own coding agent](docs/guides/coding-agent.md) — the full assembly: tools, skills, MCP, sub-agents, and REPL-vs-your-own-UI.
 - [Philosophy](docs/overview/philosophy.md) — why this exists and why it had to be easy.
 - [Product & doctrine](docs/overview/product.md) — the seven rules that never change.

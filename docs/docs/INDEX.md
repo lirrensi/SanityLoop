@@ -1,15 +1,19 @@
 ---
 node_type: index
-updated: 2026-08-23
+updated: 2026-10-18
 ---
 
 # Documentation Index
 
 ## Contents
 
-- [Cookbook 🟢](cookbook.md)
+- [The Sanity Cookbook (superseded by /guides/cookbook.md) 🔴](cookbook.md)
 
   ← /guides/cookbook.md (supersedes)
 
+## Tags
+
+`cookbook` `deprecated`
+
 ---
-*Auto-generated. Last rebuilt: 2026-08-23*
+*Auto-generated. Last rebuilt: 2026-10-18*

@@ -131,8 +131,8 @@ emitLog; sinks subscribe; neither knows the other.
 **Same process:** [`subagents`](../../packages/extras/subagents/) — agents as tools
 (`agentAsTool`, `createSubAgents`), parent delegates, sub results flow back as tool answers.
 **Across machines:** [`swarm`](../../packages/swarm/) — dumb daemon hub + join extension;
-workers spawn from their own files ([`templates/worker.ts`](../../templates/worker.ts)),
-an admin commands the fleet ([`templates/admin.ts`](../../templates/admin.ts)).
+workers spawn from their own files ([`templates/swarm/worker.ts`](../../templates/swarm/worker.ts)),
+an admin commands the fleet ([`templates/swarm/admin.ts`](../../templates/swarm/admin.ts)).
 
 ---
 

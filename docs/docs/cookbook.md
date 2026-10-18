@@ -1,3 +1,11 @@
+---
+node_type: guide
+title: The Sanity Cookbook (superseded by /guides/cookbook.md)
+status: deprecated
+updated: 2026-08-22
+tags: [cookbook, deprecated]
+---
+
 # The Sanity Cookbook
 
 > How to build anything on the sanity loop. One entity, one rule, every door open.

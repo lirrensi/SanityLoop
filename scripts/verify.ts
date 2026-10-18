@@ -1,9 +1,9 @@
 // scripts/verify.ts — THE ONE COMMAND. `npm run verify` runs every tier and
-// prints the board: typecheck → unit → e2e → templates → live (opt-in).
+// prints the board: docs → typecheck → unit → e2e → templates → live (opt-in).
 // Exit 0 = everything green (skips are honest, never silent). Exit 1 = red.
 //
 //   npm run verify                  everything runnable here (live tiers skip without keys)
-///  npm run verify -- --tier=unit    only unit (comma: type,unit,e2e,templates,live)
+///  npm run verify -- --tier=unit    only unit (comma: docs,type,unit,e2e,templates,live)
 //   npm run verify -- --with-live    attempt live tiers (needs keys / local model)
 //   npm run verify -- --json         machine output only
 //
@@ -13,6 +13,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 interface TierResult {
     tier: string;
@@ -25,7 +26,8 @@ interface TierResult {
     detail: string;
 }
 
-const ROOT = new URL("..", import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
 const NODE_FLAGS = ["--experimental-strip-types", "--experimental-transform-types"];
 const args = process.argv.slice(2);
 const onlyTiers = new Set(
@@ -34,31 +36,32 @@ const onlyTiers = new Set(
 const withLive = args.includes("--with-live");
 const jsonOnly = args.includes("--json");
 
-function run(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: Record<string, string>; timeoutMs?: number } = {}): Promise<{ code: number; out: string; ms: number; timedOut: boolean }> {
-    return new Promise((resolve) => {
-        const t0 = Date.now();
-        const child = spawn(cmd, cmdArgs, {
-            cwd: opts.cwd ?? ROOT,
-            env: { ...process.env, ...opts.env },
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        let out = "";
-        let timedOut = false;
-        const timer = opts.timeoutMs !== undefined
-            ? setTimeout(() => {
-                timedOut = true;
-                child.kill("SIGKILL");
-            }, opts.timeoutMs)
-            : undefined;
-        timer?.unref?.();
-        child.stdout.on("data", (d) => { out += String(d); });
-        child.stderr.on("data", (d) => { out += String(d); });
-        child.on("error", (e) => resolve({ code: 1, out: out + String(e), ms: Date.now() - t0, timedOut }));
-        child.on("close", (code) => {
-            clearTimeout(timer);
-            resolve({ code: code ?? 1, out, ms: Date.now() - t0, timedOut });
-        });
+function run(cmd: string, cmdArgs: string[], opts: { cwd?: string; env?: Record<string, string>; timeoutMs?: number; shell?: boolean } = {}): Promise<{ code: number; out: string; ms: number; timedOut: boolean }> {
+    const t0 = Date.now();
+    const { promise, resolve } = Promise.withResolvers<{ code: number; out: string; ms: number; timedOut: boolean }>();
+    const child = spawn(cmd, cmdArgs, {
+        cwd: opts.cwd ?? ROOT,
+        env: { ...process.env, ...opts.env },
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: opts.shell ?? false,
     });
+    let out = "";
+    let timedOut = false;
+    const timer = opts.timeoutMs !== undefined
+        ? setTimeout(() => {
+            timedOut = true;
+            child.kill("SIGKILL");
+        }, opts.timeoutMs)
+        : undefined;
+    timer?.unref?.();
+    child.stdout.on("data", (d) => { out += String(d); });
+    child.stderr.on("data", (d) => { out += String(d); });
+    child.on("error", (e) => resolve({ code: 1, out: out + String(e), ms: Date.now() - t0, timedOut }));
+    child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? 1, out, ms: Date.now() - t0, timedOut });
+    });
+    return promise;
 }
 
 /** Failing test names + their first assertion line (enough to aim the fix). */
@@ -100,7 +103,7 @@ async function tierType(): Promise<TierResult> {
 
 async function tierUnit(): Promise<TierResult> {
     const t0 = Date.now();
-    const r = await run("npm", ["run", "test", "--silent"], { timeoutMs: 900_000 });
+    const r = await run(NPM, ["run", "test", "--silent"], { timeoutMs: 900_000, shell: process.platform === "win32" });
     const c = parseCounts(r.out);
     const failing = failingDetail(r.out);
     return {
@@ -253,7 +256,21 @@ async function tierLive(): Promise<TierResult> {
     };
 }
 
+async function tierDocs(): Promise<TierResult> {
+    const t0 = Date.now();
+    const r = await run("node", [...NODE_FLAGS, "scripts/docs.ts", "--strict"], { timeoutMs: 120_000 });
+    const lines = r.out.trim().split("\n").filter(Boolean);
+    const board = lines.slice(-1)[0] ?? "";
+    const failing = lines.filter((l) => l.startsWith("✖")).slice(0, 8).join("\n");
+    return {
+        tier: "docs", ms: Date.now() - t0, tests: 0, pass: 0, fail: 0, skipped: 0,
+        status: r.code === 0 ? "pass" : "fail",
+        detail: r.code === 0 ? board : failing !== "" ? failing : r.out.slice(-500),
+    };
+}
+
 const TIERS: Array<{ name: string; run: () => Promise<TierResult> }> = [
+    { name: "docs", run: tierDocs },
     { name: "type", run: tierType },
     { name: "unit", run: tierUnit },
     { name: "e2e", run: tierE2e },
