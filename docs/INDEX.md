@@ -36,7 +36,7 @@ updated: 2026-10-18
 
 ## Git Context
 
-- **Commit:** `e761d59`
+- **Commit:** `66ad81f`
 - **Branch:** `main`
 
 ---
