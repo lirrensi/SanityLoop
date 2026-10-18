@@ -30,4 +30,18 @@ Currently we are on pure SDK stage where we create a pattern when the agent is a
 
 
 
+## Releases — the contract (read `docs/guides/releasing.md` before touching this)
+
+- **A push to main is inert.** Only `ci.yml` runs (verify). npm is NEVER touched by a push.
+- **"release" means: do it end to end, silently, without asking.** Bump if needed → commit
+  → push main → tag → push the tag. CI publishes to npm. Never run `npm publish` from this
+  machine, never ask which tag, never ask whether to push.
+- Version bumps: `npm run release:core -- --patch` / `npm run release:extras -- --minor`
+  (`scripts/release.ts` does bump → commit → push → tag → push tag).
+- Triggers are `core-vX.Y.Z` / `extras-vX.Y.Z` only; the workflow validates the tag against
+  that package's own version file (`packages/core/package.json`, `packages/extras/shelf.json`).
+- If a release fails: the symptom table in `docs/guides/releasing.md` covers the failure
+  modes already paid for (credential scope, unpushed tree, silent gate, tag/version drift).
+  Fix, re-tag, push — do not hand-publish to npm.
+
 ## Any changes in the core API must be confirmed by me. Do not make core changes without me understanding how it would look like. 

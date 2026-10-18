@@ -1,6 +1,6 @@
 ---
 node_type: index
-updated: 2026-08-23
+updated: 2026-10-18
 ---
 
 # guides Index
@@ -28,10 +28,13 @@ updated: 2026-08-23
 - [Packaging — the monorepo, the names, the versions 🟢](packaging.md)
 
   ← /reference/extensions.md (depends_on)
+- [Releasing — "say release, then walk off" 🟢](releasing.md)
+
+  → /guides/packaging.md (relates_to)
 
 ## Tags
 
-`coding-agent` `cookbook` `guide` `minimap` `monorepo` `packaging` `recipes` `router` `versioning` `workspaces`
+`ci` `coding-agent` `cookbook` `guide` `minimap` `monorepo` `npm` `packaging` `recipes` `release` `router` `versioning` `workspaces`
 
 ---
 *Auto-generated. Last rebuilt: 2026-08-23*
