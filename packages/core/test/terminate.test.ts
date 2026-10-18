@@ -169,7 +169,11 @@ test("terminate() on an idle agent still fires signal + abort family (no orphans
 
 test("terminate() is idempotent; a dead agent cannot be driven again", async () => {
     const { agent } = makeAgent({ script: [] });
-    agent.run();
+    // the zero-message run() REJECTS by law — hold the promise so the
+    // rejection is observed, not floating (a later test's settled-timer
+    // activity would otherwise surface it as async-after-end noise).
+    const runP = agent.run();
+    runP.catch(() => {});
     await agent.terminate();
     await agent.terminate(); // second call resolves too, fires nothing new
     await agent.run(); // dead stays dead — immediate resolve, no new clocks
@@ -183,4 +187,70 @@ test("terminate() before run(): born dead — run() resolves immediately", async
     await agent.run();
     assert.equal(agent.messages.length, 0, "no turn ever ran");
     assert.equal(agent.loopState, "terminated");
+});
+
+// ---------------------------------------------------------------------------
+// settled() — the caller-SDK wait. Resolves, never polls, never throws.
+// ---------------------------------------------------------------------------
+
+test("settled() resolves idle when the turn lands (the worker pattern)", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("done")] });
+    seedUserMessage(agent, "hi");
+    agent.run();
+    const r = await agent.settled({ timeoutMs: 5000 });
+    assert.deepEqual(r, { state: "idle", timedOut: false });
+    assert.equal(agent.messages.at(-1)?.type, "assistant");
+    await agent.terminate();
+});
+
+test("settled() resolves awaiting when the loop parks (a rest, not a hang)", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("never")] });
+    seedUserMessage(agent, "hi");
+    agent.park({ type: "test/ask", id: "x1" });
+    agent.run();
+    const r = await agent.settled({ timeoutMs: 5000 });
+    assert.deepEqual(r, { state: "awaiting", timedOut: false });
+    await agent.terminate();
+});
+
+test("settled() timeout RESOLVES timedOut:true — never throws", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("slow")] });
+    seedUserMessage(agent, "hi");
+    agent.run();
+    const r = await agent.settled({ timeoutMs: 30, states: ["awaiting"] });
+    assert.equal(r.timedOut, true, "deadline fired, promise resolved");
+    assert.equal(typeof r.state, "string", "live state sampled at the deadline");
+    await agent.terminate();
+});
+
+test("settled() states filter skips non-wanted rests", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("ok")] });
+    seedUserMessage(agent, "hi");
+    agent.park({ type: "test/ask", id: "x1" });
+    agent.run();
+    // awaiting arrives first — the idle-only waiter must NOT resolve on it
+    const p = agent.settled({ timeoutMs: 5000, states: ["idle"] });
+    await sleep(80);
+    agent.pendingAwaits.splice(0, 1); // answer the park → turn runs → lands idle
+    const r = await p;
+    assert.deepEqual(r, { state: "idle", timedOut: false });
+    await agent.terminate();
+});
+
+test("settled() resolves the terminal state after abort()", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    agent.run();
+    setTimeout(() => agent.abort("test"), 30);
+    const r = await agent.settled({ timeoutMs: 5000 });
+    assert.deepEqual(r, { state: "aborted", timedOut: false });
+    await agent.terminate();
+});
+
+test("settled() on an un-run agent answers NOW from current state (no hang)", async () => {
+    const { agent } = makeAgent({ script: [] });
+    const t0 = Date.now();
+    const r = await agent.settled({ timeoutMs: 5000 });
+    assert.ok(Date.now() - t0 < 1000, "immediate answer — no heartbeat to wait on");
+    assert.deepEqual(r, { state: "idle", timedOut: false });
 });

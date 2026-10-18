@@ -176,6 +176,27 @@ export interface Input {
  * silently forever; a terminated one does not tick at all. */
 export type LoopState = "idle" | "running" | "awaiting" | "stopped" | "aborted" | "errored" | "terminated";
 
+/** Where settled() can land — every state in which nothing more happens
+ * without outside action. `running` is the only exclusion: motion, not rest. */
+export type SettledState = Exclude<LoopState, "running">;
+
+/** What settled() answers. NEVER throws on timeout — the caller branches. */
+export interface SettledResult {
+ /** The state the loop rests in (or was in when the deadline fired). */
+ state: SettledState;
+ /** True when the deadline fired before any rest state arrived. */
+ timedOut: boolean;
+}
+
+/** Options for settled() — the caller-SDK wait. */
+export interface SettledOptions {
+ /** Hard ceiling in ms. Omit = wait forever (the eternal heartbeat owes you nothing). */
+ timeoutMs?: number;
+ /** Also resolve on these rest states. Default: every SettledState. Narrow it
+  * when you only care about one landing (e.g. `["idle"]` for the strict
+  * "turn fully done, nothing parked" wait). */
+ states?: SettledState[];
+}
 /** runState — MANY, OPEN. The introspectable truth. Extensions can add states. */
 export type RunState =
   | "none"
@@ -556,6 +577,13 @@ export interface GodObject extends Session {
    * Idempotent; fire-and-forget safe (a defensive catch logs late loop
    * crashes instead of surfacing unhandled rejections). */
   terminate(reason?: string): Promise<void>;
+  /** THE CALLER-SDK WAIT — resolve when the loop rests (idle/awaiting/
+   * stopped/terminal), WITHOUT polling. Pure additive sugar over the same
+   * derivation the supervisor beats on; the loop itself is untouched.
+   * The promise NEVER rejects on timeout — it resolves `{ timedOut: true }`
+   * with the state sampled at the deadline, and the caller branches
+   * (abort/terminate/retry). Omit `timeoutMs` to wait forever. */
+  settled(opts?: SettledOptions): Promise<SettledResult>;
   /** The halt states — READ (and mutated by the core's own stop()/pause()/abort()).
    * The chain checks these before EVERY filter: set = nothing behind runs. */
   readonly stopRequested: boolean;

@@ -59,6 +59,9 @@ import type {
     Stats,
     StreamEvent,
     StreamSink,
+    SettledOptions,
+    SettledResult,
+    SettledState,
     Tool,
     ToolResult,
     ToolResultMessage,
@@ -342,6 +345,14 @@ export class Agent implements GodObject {
     private pendingAsync: Input[] = [];
     /** True while run() is the active driver (the endless loop owns waking). */
     private runDriven = false;
+    /** settled() waiters — notified (never consulted) by the supervisor beat
+     * after deriveLoopState. Pure sugar: the loop's decisions never read this. */
+    private settleWaiters: Array<{
+        t0: number;
+        want: Set<SettledState> | undefined;
+        done: boolean;
+        finish: (r: SettledResult) => void;
+    }> = [];
     /** THE OFF SWITCH — set by terminate(); both loops check it every beat and
      * exit when true. The ONLY thing that ends run(). */
     private terminated = false;
@@ -791,12 +802,75 @@ export class Agent implements GodObject {
         // no-op for the loop but still fires the cleanup channel for listeners.
         this.abort(reason);
         this.loopState = "terminated";
+        // settled() waiters must never hang on a dead heart: the loops break
+        // at their next beat, so no beat will ever notify them again. Answer
+        // NOW — terminated, not a timeout — then let run() resolve below.
+        for (const w of [...this.settleWaiters]) {
+            if (w.done || this.ticks <= w.t0) continue;
+            if (w.want !== undefined && !w.want.has("terminated")) continue;
+            w.finish({ state: "terminated", timedOut: false });
+        }
         // fire-and-forget insurance: nobody holding the promise must never
         // mean an unhandled rejection if a loop crashes mid-death.
         this.runPromise?.catch((err) =>
             console.error("[sanity] loop crashed while terminating:", err),
         );
         return this.runPromise ?? Promise.resolve();
+    }
+
+    /**
+     * THE CALLER-SDK WAIT — `await agent.settled()` resolves when the loop
+     * RESTS: idle, awaiting, stopped, or terminal. No polling: waiters hang
+     * off the supervisor's own derivation — each beat re-checks them right
+     * after deriveLoopState, and the FIRST beat after entry is the earliest
+     * a rest sample can count (a pre-tick idle must never short-circuit the
+     * wait — same clock-awareness as test-kit's awaitLanded).
+     *
+     * Pure sugar, zero loop change: waiters are notified, never consulted;
+     * the derivation they read is the supervisor's own. NEVER rejects on
+     * timeout — resolves `{ state, timedOut: true }` with the live state at
+     * the deadline; the caller branches (abort/terminate/retry). Narrow
+     * `states` when you only care about one landing (e.g. `["idle"]` =
+     * strict "fully done, nothing parked"). A waiter registered on an
+     * already-resting loop resolves on the next beat (<=1 quantum) — prompt
+     * enough for the worker pattern, honest about the heartbeat.
+     */
+    settled(opts: SettledOptions = {}): Promise<SettledResult> {
+        const want = opts.states !== undefined ? new Set<SettledState>(opts.states) : undefined;
+        return new Promise<SettledResult>((resolve) => {
+            // un-run agents have no heartbeat — nothing will EVER beat, so
+            // answer from current state NOW instead of hanging. (run() flips
+            // runDriven synchronously at start, so a live loop never hits this.)
+            if (!this.runDriven) {
+                const live = this.loopState;
+                const match = live !== "running" && (want === undefined || want.has(live));
+                resolve({ state: live as SettledState, timedOut: !match });
+                return;
+            }
+            const waiter = {
+                t0: this.ticks,
+                want,
+                done: false,
+                finish: (_r: SettledResult): void => {},
+            };
+            waiter.finish = (r: SettledResult): void => {
+                if (waiter.done) return;
+                waiter.done = true;
+                clearTimeout(timer);
+                const i = this.settleWaiters.indexOf(waiter);
+                if (i >= 0) this.settleWaiters.splice(i, 1);
+                resolve(r);
+            };
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (opts.timeoutMs !== undefined) {
+                timer = setTimeout(() => {
+                    waiter.finish({ state: this.loopState as SettledState, timedOut: true });
+                }, opts.timeoutMs);
+                // a caller-SDK wait must never hold the process open
+                (timer as unknown as { unref?: () => void }).unref?.();
+            }
+            this.settleWaiters.push(waiter);
+        });
     }
 
     /** GENTLE request — a flag only. No controller abort, no stream kill:
@@ -994,6 +1068,10 @@ export class Agent implements GodObject {
 
             // The truth, refreshed every beat.
             this.deriveLoopState();
+            // settled() waiters — notified, never consulted. Reads the
+            // derivation above; the loop's decisions never touch the array.
+            // Additive-only: an empty array = a no-op.
+            this.notifySettleWaiters();
 
             // Chores.
             if (this.isTerminal()) {
@@ -1019,6 +1097,21 @@ export class Agent implements GodObject {
         if (this.stopRequested || this.pauseRequested) { this.loopState = "stopped"; return; }
         if (this.hasWorkerWork()) { this.loopState = "running"; return; }
         this.loopState = "idle";
+    }
+
+    /** Wake the settled() waiters whose rest state arrived. Clock-aware: the
+     * heartbeat must beat AFTER a waiter registered before its sample
+     * counts — a pre-tick rest must never short-circuit the wait. Private:
+     * the notification half of settled(), called only from loop1. */
+    private notifySettleWaiters(): void {
+        if (this.settleWaiters.length === 0) return;
+        const state = this.loopState;
+        if (state === "running") return; // motion, not rest — nobody resolves
+        for (const w of [...this.settleWaiters]) {
+            if (w.done || this.ticks <= w.t0) continue;
+            if (w.want !== undefined && !w.want.has(state)) continue;
+            w.finish({ state, timedOut: false });
+        }
     }
 
     /** Does the worker have anything to walk? Pure derivation.
