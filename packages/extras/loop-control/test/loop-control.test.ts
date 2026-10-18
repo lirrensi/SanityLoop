@@ -117,6 +117,110 @@ test("maxConsecutiveTools reaction=stop: warns + interrupts the tool chain, mode
     assert.ok(texts.some((t) => t.includes("consecutive tool calls")), "stop message pushed");
 });
 
+test("retry: transient tool error recovers on the second attempt, attempts stamped", async () => {
+    let n = 0;
+    const flaky = Tool.define({
+        name: "flaky",
+        description: "fails once transiently, then works",
+        inputSchema: { type: "object" },
+        async execute() {
+            n++;
+            if (n === 1) return { answer: "boom", error: true, errorMessage: "timeout after 1ms" };
+            return { answer: "recovered", stored: { n } };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("flaky", {}, "r-1")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [flaky], agentId: "retry-test" });
+    agent.use(loopControl({ retry: { enabled: true, attempts: 3, backoff: { baseMs: 5 } } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(n, 2, "executed twice: original + one retry");
+    const result = [...agent.messages].reverse().find((m) => m.type === "toolResult");
+    assert.ok(result, "a toolResult committed");
+    const content = result!.content as { answer: string; error?: boolean; stored?: { attempts?: number } };
+    assert.equal(content.answer, "recovered");
+    assert.equal(content.error, undefined, "recovered result commits clean");
+    assert.equal(content.stored?.attempts, 2, "attempts stamped in stored");
+    const st = agent.state.loopControl as { lastAction?: string; attempts?: number } | undefined;
+    assert.equal(st?.lastAction, "retry-recovered");
+    assert.equal(st?.attempts, 2);
+});
+
+test("retry: permanent errors never retry (invalid_arguments + custom predicate)", async () => {
+    let n = 0;
+    const bad = Tool.define({
+        name: "bad",
+        description: "always fails permanently",
+        inputSchema: { type: "object" },
+        async execute() {
+            n++;
+            return { answer: "nope", error: true, errorMessage: "invalid_arguments" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("bad", {}, "p-1")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [bad], agentId: "retry-perm" });
+    agent.use(loopControl({ retry: { enabled: true, attempts: 3, backoff: { baseMs: 5 } } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(n, 1, "permanent error: no retry, the model sees it");
+});
+
+test("retry: exhaustion commits the final error, fallback substitutes", async () => {
+    let n = 0;
+    const down = Tool.define({
+        name: "down",
+        description: "always 500s",
+        inputSchema: { type: "object" },
+        async execute() {
+            n++;
+            return { answer: "boom", error: true, errorMessage: "500 internal" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("down", {}, "e-1")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [down], agentId: "retry-exhaust" });
+    agent.use(loopControl({
+        retry: {
+            enabled: true, attempts: 2, backoff: { baseMs: 5 },
+            fallback: ({ attempts }) => ({ answer: "upstream unavailable", errorMessage: `gave up after ${attempts}` }),
+        },
+    }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(n, 2, "two attempts, then fallback");
+    const result = [...agent.messages].reverse().find((m) => m.type === "toolResult");
+    const content = result!.content as { answer: string; error?: boolean; errorMessage?: string };
+    assert.equal(content.answer, "upstream unavailable");
+    assert.equal(content.errorMessage, "gave up after 2");
+    const st = agent.state.loopControl as { lastAction?: string } | undefined;
+    assert.equal(st?.lastAction, "retry-exhausted");
+});
 test("maxSteps abort=true HARD-stops: the turn dies (aborted), no silent resume", async () => {
     const { agent, executed, seedAndKick } = makeAgent(
         [

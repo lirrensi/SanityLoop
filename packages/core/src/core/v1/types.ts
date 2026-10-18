@@ -523,6 +523,8 @@ export interface GodObject extends Session {
 
   // ---- plugins (named batches of registrations, observable) ----
   install(plugin: Plugin): Promise<this>;
+  /** Web-pattern alias for install() — same call, same semantics, shorter word. */
+  use(plugin: Plugin): Promise<this>;
   uninstall(pluginId: string): boolean;
   readonly plugins: Plugin[];
 

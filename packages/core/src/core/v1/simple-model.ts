@@ -116,6 +116,22 @@ export function normalizeForAlternation(list: Message[]): Message[] {
   }
   return out;
 }
+/** The error shape the adapter throws for non-OK provider responses. Stamped
+ * with structured facts errorFacts() forwards verbatim onto the `error` event. */
+export type ProviderError = Error & { code?: string; status?: number; retryable?: boolean; attempts?: number; elapsedMs?: number };
+
+/** One failed attempt, handed to `onRetry` before the backoff sleep. */
+export interface RetryAttempt {
+  /** 1-based: the attempt that just failed. */
+  attempt: number;
+  /** The error that failed it (provider error or transport failure). */
+  error: unknown;
+  /** How long the whole callApi has been running (ms). */
+  elapsedMs: number;
+  /** How long we are about to sleep (ms, jitter already applied). */
+  waitMs: number;
+}
+
 export interface SimpleModelOptions {
   api?: "chat_completions" | "responses" | string;
   modelId: string;
@@ -145,6 +161,40 @@ export interface SimpleModelOptions {
    * that want thinking replayed on every assistant message.
    */
   preserveThinking?: boolean;
+  /**
+   * Network-level retries — the honest loop the error path already promises
+   * ("Adapter retries first"). Bounded, retryable-only: transport failures +
+   * HTTP 429/5xx. Non-retryable (4xx, bad finish_reason, parse) throws on the
+   * first attempt. The loop-level decision stays the filter's (the `error`
+   * event carries everything after retries exhaust). Default 3 attempts total.
+   */
+  retries?: number;
+  /**
+   * Total wall-clock budget for the whole callApi in ms — attempts + backoffs
+   * included. Checked after every failure BEFORE deciding to retry: when the
+   * budget is spent, the last error throws immediately (no trailing sleep).
+   * Omit = unbounded. Pair `retries: Infinity` with a budget for "retry
+   * forever until the provider comes back, but give up after an hour".
+   */
+  retryBudgetMs?: number;
+  /**
+   * Base delay between retries in ms (exponential: base * 2^(attempt-1),
+   * capped by retryMaxDelayMs, plus ±50% jitter). Default 500.
+   */
+  retryDelayMs?: number;
+  /**
+   * Ceiling for a single backoff sleep in ms. Default 10_000. Lower it when
+   * the provider recovers fast and you want tight polling; raise it for
+   * hour-long budget runs so a dead provider doesn't get hammered.
+   */
+  retryMaxDelayMs?: number;
+  /**
+   * Called after each failed retryable attempt, BEFORE the backoff sleep.
+   * Sync or async — awaited. Throwing/returning false vetoes the retry: the
+   * original error throws immediately. Use it to log attempts, update a
+   * status line, or enforce a custom stop policy (consecutive-429 cap, ...).
+   */
+  onRetry?: (attempt: RetryAttempt) => void | false | Promise<void | false>;
 }
 
 export class SimpleModel {
@@ -159,7 +209,16 @@ export class SimpleModel {
   /** The strategy applied before the provider call (see options). */
   normalizeMessages: (messages: Message[]) => Message[];
   /** Whether thinking (reasoning_content) is kept in history + replayed (see options). */
-  preserveThinking: boolean;
+  /** Total network attempts (1 = no retry, Infinity = until budget/abort/veto). Default 3. Zero/negative/NaN → 1. Infinity passes through. */
+  retries: number;
+  /** Total wall-clock budget in ms. Omit (undefined) = unbounded. Zero/negative = no retries at all. */
+  retryBudgetMs?: number;
+  /** Base retry delay in ms. Default 500. */
+  retryDelayMs: number;
+  /** Single-backoff ceiling in ms. Default 10_000. */
+  retryMaxDelayMs: number;
+  /** Per-attempt hook, awaited before the backoff sleep. False/throw = stop. */
+  onRetry?: (attempt: RetryAttempt) => void | false | Promise<void | false>;
   /** The runtime's open bag — satisfies ModelContract's index signature. */
   [key: string]: unknown;
 
@@ -174,7 +233,11 @@ export class SimpleModel {
     this.maxOutputTokens = opts.maxOutputTokens;
     this.maxContext = opts.maxContext;
     this.normalizeMessages = opts.normalizeMessages ?? normalizeForAlternation;
-    this.preserveThinking = opts.preserveThinking ?? false;
+    this.retries = opts.retries ?? 3;
+    this.retryBudgetMs = opts.retryBudgetMs;
+    this.retryDelayMs = opts.retryDelayMs ?? 500;
+    this.retryMaxDelayMs = opts.retryMaxDelayMs ?? 10_000;
+    this.onRetry = opts.onRetry;
   }
 
   // ==========================================================================
@@ -226,42 +289,125 @@ export class SimpleModel {
     }));
     if (tools.length > 0) body.tools = tools;
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      // the abort controller — abort() reaches into the in-flight call
-      signal: agent.abortSignal,
-    });
-    if (!res.ok) {
-      // informative provider errors: model + endpoint + TRUNCATED body, plus
-      // structured facts (code/status/retryable) forwarded verbatim by errorFacts.
-      let bodyText: string;
+    // THE HONEST LOOP — "Adapter retries first" (see fail() in agent.ts).
+    // Retryable-only: transport failures + HTTP 429/5xx. Everything else
+    // (4xx, aborts, parse) throws on the first attempt. Retry STOPS when any
+    // of these fires: attempt cap reached, budget spent, onRetry vetoes, abort
+    // lands (even mid-backoff). The final throw carries `attempts` + the
+    // terminal `elapsedMs` — errorFacts forwards both onto the `error` event.
+    // `retries: Infinity` + no budget + no veto = retries forever; backoff
+    // still paces each sleep so a dead provider never gets hammered.
+    const maxAttempts = this.retries === Infinity ? Infinity : Math.max(1, Math.floor(this.retries) || 1);
+    const budgetMs = this.retryBudgetMs;
+    const startedAt = Date.now();
+    let lastErr: unknown;
+    for (let attempt = 1; ; attempt++) {
       try {
-        bodyText = await res.text();
-      } catch {
-        bodyText = "(body unavailable)";
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body: JSON.stringify(body),
+          // the abort controller — abort() reaches into the in-flight call
+          signal: agent.abortSignal,
+        });
+        if (!res.ok) {
+          throw await this.providerError(res);
+        }
+        if (this.stream && sink) {
+          return await this.streamAndAssemble(res, sink, agent);
+        }
+        return await res.json();
+      } catch (err) {
+        lastErr = err;
+        // abort = the loop's own kill signal — NEVER retried, thrown as-is.
+        if (agent.abortSignal?.aborted) throw err;
+        if (err instanceof Error && err.name === "AbortError") throw err;
+        const stop = (error: unknown): never => {
+          if (error instanceof Error) {
+            const stamped = error as ProviderError;
+            stamped.attempts = attempt;
+            stamped.elapsedMs = Date.now() - startedAt;
+          }
+          throw error;
+        };
+        // retryable = our stamped provider errors (429/5xx) + raw transport
+        // failures (fetch threw before a response existed = TypeError). 4xx is
+        // permanent — auth/billing/shape — throws on the first attempt. A
+        // mid-stream death retries too: the next attempt re-emits the stream
+        // from scratch (a second streamStarted, no textEnd for the dead one).
+        const tagged = err as { retryable?: unknown; status?: unknown } | null;
+        const retryable =
+          (typeof tagged?.retryable === "boolean" ? tagged.retryable : undefined) ??
+          (typeof tagged?.status === "number" ? (tagged.status === 429 || tagged.status >= 500) : undefined) ??
+          err instanceof TypeError;
+        if (!retryable) stop(err);
+        if (attempt >= maxAttempts) stop(err);
+        // wall-clock budget: attempts + backoffs. Spent = throw NOW, no trailing sleep.
+        const elapsedMs = Date.now() - startedAt;
+        if (budgetMs !== undefined && (budgetMs <= 0 || elapsedMs >= budgetMs)) stop(err);
+        // exponential backoff + jitter, capped by retryMaxDelayMs
+        const waitMs = Math.min(this.retryMaxDelayMs, this.retryDelayMs * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2);
+        // the hook runs BEFORE the sleep: observe, or veto (false/throw = stop).
+        if (this.onRetry !== undefined) {
+          let verdict: void | false;
+          try {
+            verdict = await this.onRetry({ attempt, error: err, elapsedMs, waitMs });
+          } catch {
+            stop(err); // the hook's own throw vetoes — the ORIGINAL error throws
+            verdict = false; // unreachable (stop throws) — satisfies definite assignment
+          }
+          if (verdict === false) stop(err);
+        }
+        // abort-aware sleep: abort() mid-backoff throws the ORIGINAL error
+        // immediately (no waiting out the timer, no AbortError swap — the
+        // provider failure is the truth, the abort just ends the waiting).
+        const signal = agent.abortSignal;
+        if (signal?.aborted) throw err;
+        // executor form, not Promise.withResolvers — target is ES2022 (see
+        // shell-tool/bash.ts for the same call). Stored resolver: the abort
+        // listener AND the timer release the same sleep.
+        let release!: () => void;
+        const backoff = new Promise<void>((res) => { release = res; });
+        const timer = setTimeout(release, waitMs);
+        if (signal !== undefined) {
+          signal.addEventListener("abort", release, { once: true });
+          await backoff;
+          signal.removeEventListener("abort", release);
+        } else {
+          await backoff;
+        }
+        clearTimeout(timer);
+        if (signal?.aborted) throw err;
       }
-      const capped =
-        bodyText.length > 400
-          ? `${bodyText.slice(0, 400)}…[truncated, ${bodyText.length} chars total]`
-          : bodyText;
-      const perr = new Error(
-        `[sanity] provider error ${res.status} for model "${this.modelId}" @ ${this.baseUrl ?? "https://api.openai.com/v1"}: ${capped}`,
-      ) as Error & { code?: string; status?: number; retryable?: boolean };
-      perr.code = "provider_error";
-      perr.status = res.status;
-      perr.retryable = res.status >= 500 || res.status === 429;
-      throw perr;
     }
+    throw lastErr;
+  }
 
-    if (this.stream && sink) {
-      return this.streamAndAssemble(res, sink, agent);
+  /** Build the informative provider error from a non-OK response. Own function
+   * so subclasses (pi-ai) can reuse the shape without the fetch. */
+  protected async providerError(res: Response): Promise<ProviderError> {
+    // informative provider errors: model + endpoint + TRUNCATED body, plus
+    // structured facts (code/status/retryable) forwarded verbatim by errorFacts.
+    let bodyText: string;
+    try {
+      bodyText = await res.text();
+    } catch {
+      bodyText = "(body unavailable)";
     }
-    return res.json();
+    const capped =
+      bodyText.length > 400
+        ? `${bodyText.slice(0, 400)}…[truncated, ${bodyText.length} chars total]`
+        : bodyText;
+    const perr: ProviderError = new Error(
+      `[sanity] provider error ${res.status} for model "${this.modelId}" @ ${this.baseUrl ?? "https://api.openai.com/v1"}: ${capped}`,
+    );
+    perr.code = "provider_error";
+    perr.status = res.status;
+    perr.retryable = res.status >= 500 || res.status === 429;
+    return perr;
   }
 
   /**

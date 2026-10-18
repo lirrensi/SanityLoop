@@ -156,6 +156,138 @@ export function defaultResolve(answer: unknown, call: ToolCallRecord | undefined
   call.preResolved = { answer: `The user answered: ${text}. Continue accordingly.` };
 }
 
+// ============================================================================
+// APPROVE — the one-line entry factory. Sugar over the gate/resolve pair:
+// compatible with every tool because it only uses the two rendezvous names
+// (PERMISSION_AWAIT ↔ PERMISSION_ANSWER) and the classic choice set — the
+// same contract askAll/classicResolve already speak. Any channel that answers
+// a classic ask answers this.
+// ============================================================================
+
+export interface ApproveOptions {
+  /** Bind the approval to the EXACT arguments (stable-hash): a "once" for
+   * `rm {f: a}` never covers `rm {f: b}`. Default true (anti-drift). */
+  bindArgs?: boolean;
+  /** Auto-deny when nobody answers within this long. Omit = wait forever. */
+  timeoutMs?: number;
+  /** What a "no" hands the model: "reason" (default — the human's reason via
+   * no_explain semantics) or "short" (bare "the human declined"). */
+  onDeny?: "reason" | "short";
+  /** Ask title. Default `Run <tool>?`. */
+  title?: string;
+}
+
+/** Stable stringify — key order independent, so equivalent args hash the same. */
+function stableArgs(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "?";
+  if (Array.isArray(value)) return `[${value.map(stableArgs).join(",")}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableArgs((value as Record<string, unknown>)[k])}`).join(",")}}`;
+}
+
+function argsFingerprint(name: string, parameters: Record<string, unknown>): string {
+  let h = 5381;
+  const s = `${name}:${stableArgs(parameters)}`;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/** The one-line approval entry — `tools: { "*": approve() }`. */
+export function approve(opts: ApproveOptions = {}): PermissionEntry {
+  const bindArgs = opts.bindArgs ?? true;
+  const timeoutMs = opts.timeoutMs;
+  const onDeny = opts.onDeny ?? "reason";
+  // in-process timers: restore starts clean (a restored park waits forever —
+  // honest, since the process that owned the deadline died with it).
+  const timers = new Map<string, NodeJS.Timeout>();
+
+  const gate: PermissionGate = (agent, _rules, call) => {
+    classicAsk(agent, call, {
+      title: opts.title ?? `Run ${call.name}?`,
+      detail: {
+        tool: call.name,
+        parameters: call.parameters,
+        ...(bindArgs ? { argsFingerprint: argsFingerprint(call.name, call.parameters) } : {}),
+      },
+    });
+    if (timeoutMs !== undefined) {
+      const t = setTimeout(() => {
+        timers.delete(call.id);
+        const idx = agent.pendingAwaits.findIndex(
+          (a) => a.type === PERMISSION_AWAIT && a.id === call.id,
+        );
+        if (idx < 0) return; // answered in time — nothing to do
+        agent.pendingAwaits.splice(idx, 1);
+        recordDenial(agent, call, `approval timed out after ${timeoutMs}ms — auto-denied`);
+        call.preResolved = {
+          answer: `denied: approval for ${call.name} timed out after ${timeoutMs}ms`,
+          error: true,
+          errorMessage: "approval timeout",
+        };
+        agent.wake(); // the park released — the loop must notice now
+      }, timeoutMs);
+      // a test-speed timer must never hold the process open
+      if (typeof (t as { unref?: unknown }).unref === "function") {
+        (t as unknown as { unref(): void }).unref();
+      }
+      timers.set(call.id, t);
+    }
+  };
+
+  const resolve: PermissionResolve = (answer, call, agent) => {
+    if (call?.id !== undefined) {
+      const t = timers.get(call.id);
+      if (t !== undefined) {
+        clearTimeout(t);
+        timers.delete(call.id);
+      }
+    }
+    const obj =
+      typeof answer === "object" && answer !== null ? (answer as Record<string, unknown>) : undefined;
+    const choice = String(obj?.choice ?? answer ?? "once");
+    const reason = obj?.reason === undefined ? undefined : String(obj.reason);
+    if (choice !== "no" && choice !== "no_explain" && bindArgs && call) {
+      // ANTI-DRIFT: the approval covers THESE args only. A "session"
+      // remembering a folder/path stays classicResolve's job — here we only
+      // guard the "once" path: same call id = same params by construction
+      // (the parked call never mutates), so the fingerprint in the schema is
+      // the audit trail, and a replayed answer for DIFFERENT args (a reused
+      // ref across calls) is denied. Refs are call ids — unique per call —
+      // so this fires only when a channel reuses a stale ref.
+      const aw = agent.pendingAwaits.find((a) => a.type === PERMISSION_AWAIT && a.id === call.id);
+      const detail = (aw?.schema as { detail?: unknown } | undefined)?.detail;
+      const want =
+        typeof detail === "object" && detail !== null && "argsFingerprint" in detail
+          ? (detail as { argsFingerprint?: unknown }).argsFingerprint
+          : undefined;
+      if (
+        typeof want === "string" &&
+        want !== argsFingerprint(call.name, call.parameters ?? {})
+      ) {
+        recordDenial(agent, call, "arguments changed since the ask — approval refused (anti-drift)");
+        call.preResolved = {
+          answer: `denied: arguments for ${call.name} changed since the approval was asked`,
+          error: true,
+          errorMessage: "args drift",
+        };
+        return;
+      }
+    }
+    if (choice === "no" && onDeny === "reason") {
+      // "reason" posture: a bare "no" still carries the human's reason when
+      // the channel sent `{ choice: "no", reason }` — classicResolve already
+      // does this via no_explain; route "no"+reason through it.
+      if (reason !== undefined) {
+        classicResolve({ choice: "no_explain", reason }, call, agent);
+        return;
+      }
+    }
+    classicResolve(answer, call, agent);
+  };
+
+  return { gate, resolve };
+}
+
 /** Find the tool's entry: exact and wildcard patterns, LAST match wins.
  * `"*"` matches everything; `"pre*"` matches by prefix. */
 export function matchEntry(

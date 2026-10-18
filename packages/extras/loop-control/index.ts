@@ -145,6 +145,35 @@ export interface SpinGuardOptions {
 	message?: string;
 }
 
+export interface RetryBackoffOptions {
+	/** Base delay in ms. Default 500. */
+	baseMs?: number;
+	/** Exponential factor. Default 2. */
+	factor?: number;
+	/** Add ±50% jitter. Default true. */
+	jitter?: boolean;
+	/** Single-sleep ceiling in ms. Default 10_000. */
+	maxMs?: number;
+}
+
+export interface RetryOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Tool name globs to retry (`"fetch_*"`, `"*"`). Default ["*"]. */
+	tools?: string[];
+	/** Total attempts per call (1 = no retry). Default 3. */
+	attempts?: number;
+	/** Backoff between attempts. */
+	backoff?: RetryBackoffOptions;
+	/** Which error results are worth another attempt. Default: transient-only
+	 * (errorMessage matches /timeout|429|5\d\d|ECONN|ENOTFOUND|temporar/i, or an
+	 * `invalid_arguments` NEVER retries — bad args are the model's job). */
+	retryOn?: (info: { name: string; parameters: Record<string, unknown>; answer: string; errorMessage?: string }) => boolean;
+	/** Last resort: substitute a typed result so the turn continues instead of
+	 * committing the final error. Omit = the final error commits honestly. */
+	fallback?: (info: { name: string; parameters: Record<string, unknown>; answer: string; errorMessage?: string; attempts: number }) => { answer: string; error?: boolean; errorMessage?: string };
+}
+
 export interface LoopControlOptions {
 	doomLoop?: DoomLoopOptions;
 	maxTurns?: MaxTurnsOptions;
@@ -156,6 +185,9 @@ export interface LoopControlOptions {
 	 * nothing) means the loop is stuck at 100Hz. Counts consecutive
 	 * `cycleDiscarded` events; resets on any committed cycle. */
 	spinGuard?: SpinGuardOptions;
+	/** Tool-call retry — re-invoke erroring tools at the afterTool patch point
+	 * (before commit) with backoff. Transient-only by default. */
+	retry?: RetryOptions;
 	/** Where loop-control activity lives in session state. Default "loopControl". */
 	stateKey?: string;
 }
@@ -209,6 +241,21 @@ const DEFAULT_SPIN_GUARD: Required<SpinGuardOptions> = {
 	message:
 		"**[loop-control]** The loop discarded several cycles without committing anything — a filter may be stuck in a veto loop. Investigate before continuing.",
 };
+
+const TRANSIENT_RE = /timeout|429|5\d\d|ECONN|ENOTFOUND|EAI_AGAIN|temporar|rate.limit|overloaded|unavailable/i;
+
+/** Default retry predicate: transient-only, never invalid_arguments. */
+export function defaultRetryOn(info: { errorMessage?: string; answer: string }): boolean {
+	if (info.errorMessage === "invalid_arguments") return false;
+	return TRANSIENT_RE.test(`${info.errorMessage ?? ""} ${info.answer}`);
+}
+
+/** `*` = anything (glob-ish, single-pattern). Case-sensitive tool names. */
+function toolGlobMatch(pattern: string, name: string): boolean {
+	if (pattern === "*") return true;
+	const re = pattern.split("*").map((s) => s.replace(/[.+^${}()|[\]\\?]/g, "\\$&")).join(".*");
+	return new RegExp(`^${re}$`).test(name);
+}
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -291,6 +338,17 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	const maxSteps = { ...DEFAULT_MAX_STEPS, ...(opts.maxSteps ?? {}) };
 	const maxConsTools = { ...DEFAULT_MAX_CONSECUTIVE_TOOLS, ...(opts.maxConsecutiveTools ?? {}) };
 	const spinGuard = { ...DEFAULT_SPIN_GUARD, ...(opts.spinGuard ?? {}) };
+	const retryCfg = opts.retry ?? {};
+	const retryEnabled = retryCfg.enabled === true;
+	const retryTools = retryCfg.tools ?? ["*"];
+	const retryAttempts = Math.max(1, Math.floor(retryCfg.attempts ?? 3));
+	const retryBackoff = {
+		baseMs: retryCfg.backoff?.baseMs ?? 500,
+		factor: retryCfg.backoff?.factor ?? 2,
+		jitter: retryCfg.backoff?.jitter ?? true,
+		maxMs: retryCfg.backoff?.maxMs ?? 10_000,
+	};
+	const retryOn = retryCfg.retryOn ?? defaultRetryOn;
 
 	// the hot counters — plugin closure (fast, no patch storm)
 	const counts = new Map<string, number>(); // key → consecutive error count
@@ -380,7 +438,92 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	return {
 		id: "loop-control",
 		install(agent) {
-			// ---- DOOM-LOOP: count consecutive erroring calls at toolEnd ----
+			// ---- RETRY: re-invoke erroring tools at the afterTool patch point
+			// (BEFORE commit — the push waits for this filter). Same tool, same
+			// params, exponential backoff; the rewritten result commits as if the
+			// final attempt were the only one (attempts stamped in stored).
+			// Crashes between attempts are safe: nothing commits until we return.
+			agent.addFilter({
+				event: EVENTS.afterTool,
+				id: "loop-control/retry",
+				priority: 50,
+				fn: async (agent, payload) => {
+					if (!retryEnabled) return;
+					if (payload === undefined || typeof payload !== "object") return;
+					if (!("call" in payload) || !("result" in payload)) return;
+					const call = payload.call;
+					const result = payload.result;
+					if (typeof call !== "object" || call === null || !("name" in call)) return;
+					if (typeof result !== "object" || result === null || !("answer" in result)) return;
+					const name = call.name;
+					if (typeof name !== "string") return;
+					if (!retryTools.some((g) => toolGlobMatch(g, name))) return;
+					const res = result as { answer: string; error?: boolean; errorMessage?: string; stored?: unknown };
+					if (res.error !== true) return; // success commits untouched
+					const params =
+						"parameters" in call && typeof call.parameters === "object" && call.parameters !== null
+							? (call.parameters as Record<string, unknown>)
+							: {};
+					const info = { name, parameters: params, answer: res.answer, errorMessage: res.errorMessage };
+					if (!retryOn(info)) return; // permanent — the model's job
+					const tool = agent.tools.find((t) => t.name === name);
+					if (!tool || tool.disabled) return; // gone/disabled mid-flight — commit honestly
+					let answer = res.answer;
+					let errorMessage = res.errorMessage;
+					let succeeded = false;
+					let attemptsMade = 1; // the original execution already happened
+					for (let n = 2; n <= retryAttempts; n++) {
+						const wait = Math.min(
+							retryBackoff.maxMs,
+							retryBackoff.baseMs * retryBackoff.factor ** (n - 2),
+						) * (retryBackoff.jitter ? 0.5 + Math.random() / 2 : 1);
+						await new Promise((r) => setTimeout(r, wait));
+						if (agent.abortSignal.aborted) return; // abort wins — commit the original error
+						attemptsMade = n;
+						try {
+							const raw = await tool.execute(params, agent);
+							answer = raw.answer;
+							if (raw.error === true) {
+								errorMessage = raw.errorMessage;
+								if (!retryOn({ name, parameters: params, answer, errorMessage })) break;
+							} else {
+								succeeded = true;
+								errorMessage = undefined;
+								res.stored = raw.stored;
+								break;
+							}
+						} catch (err) {
+							const message = err instanceof Error ? err.message : String(err);
+							answer = `Tool ${name} failed: ${message}`;
+							errorMessage = message;
+							if (!retryOn({ name, parameters: params, answer, errorMessage })) break;
+						}
+					}
+					if (succeeded) {
+						res.answer = answer;
+						res.error = undefined;
+						res.errorMessage = undefined;
+						if (typeof res.stored === "object" && res.stored !== null) {
+							(res.stored as Record<string, unknown>).attempts = attemptsMade;
+						}
+					} else if (retryCfg.fallback) {
+						const fb = retryCfg.fallback({ ...info, answer, errorMessage, attempts: attemptsMade });
+						res.answer = fb.answer;
+						res.error = fb.error;
+						res.errorMessage = fb.errorMessage;
+					} else {
+						res.answer = answer;
+						res.errorMessage = errorMessage;
+					}
+					record(agent, stateKey, {
+						lastAction: succeeded ? "retry-recovered" : "retry-exhausted",
+						tool: name,
+						attempts: attemptsMade,
+						at: Date.now(),
+					});
+				},
+			});
+
 			agent.addFilter({
 				event: EVENTS.toolEnd,
 				id: "loop-control/doom/count",

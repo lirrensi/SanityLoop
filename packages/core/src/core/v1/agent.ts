@@ -580,6 +580,17 @@ export class Agent implements GodObject {
         return run(0);
     }
 
+    /**
+     * Web-pattern alias for install(): `agent.use(plugin)` — same call, same
+     * semantics, shorter word. Sugar only: every rule of install() applies
+     * (duplicate id throws, async steps awaited as a bad pattern, uninstall by
+     * id). Exists so the single-file agent reads `import { x } from
+     * "@sanityloop/x"; agent.use(x())` — one line per capability.
+     */
+    use(plugin: Plugin): Promise<this> {
+        return this.install(plugin);
+    }
+
     /** Uninstall a plugin by id: its uninstall() removes everything it registered. */
     uninstall(pluginId: string): boolean {
         const plugin = this.pluginMap.get(pluginId);
@@ -1519,6 +1530,12 @@ export class Agent implements GodObject {
     protected async commitToolResult(
         outcome: { call: ToolCallRecord; result: ToolResult },
     ): Promise<void> {
+        // afterTool = the patch point — filters rewrite the result before commit.
+        // AWAITED inline: the snapshot below reads the REWRITTEN result, then
+        // the push lands and toolEnd announces the committed truth. (The message
+        // MUST be built after the wall — a pre-wall snapshot would silently
+        // discard every filter rewrite, e.g. loop-control's retry.)
+        await this.bus.run(EVENTS.afterTool, { call: outcome.call, result: outcome.result });
         const resultMsg: ToolResultMessage = {
             id: `toolresult-${crypto.randomUUID().slice(0, 8)}`,
             enabled: true,
@@ -1527,7 +1544,7 @@ export class Agent implements GodObject {
             // harness metadata — the loop's bookkeeping, NOT part of the result
             toolCallId: outcome.call.id,
             toolName: outcome.call.name,
-            // the execution RESULT — what the run produced
+            // the execution RESULT — what the run produced (post-filter rewrite)
             content: {
                 answer: outcome.result.answer,
                 // RAW — the tool's stored payload passes through verbatim, never spread/mutated
@@ -1537,10 +1554,6 @@ export class Agent implements GodObject {
                 errorMessage: outcome.result.errorMessage,
             },
         };
-        // afterTool = the patch point — filters rewrite the result before commit.
-        // AWAITED inline: the push waits for every afterTool filter to settle,
-        // then toolEnd announces the committed truth.
-        await this.bus.run(EVENTS.afterTool, { call: outcome.call, result: outcome.result });
         this.messages.push(resultMsg);
         await this.bus.run(EVENTS.toolEnd, { call: outcome.call, result: outcome.result });
     }
@@ -1604,7 +1617,7 @@ export class Agent implements GodObject {
         if (this.stopRequested) facts.stopRequested = true;
         if (this.abortController.signal.aborted) facts.aborted = true;
         // adapter/tool-authored structured facts — forwarded verbatim
-        for (const k of ["reason", "code", "status", "retryable", "truncated"] as const) {
+        for (const k of ["reason", "code", "status", "retryable", "truncated", "attempts", "elapsedMs"] as const) {
             const v = (err as Record<string, unknown> | null)?.[k];
             if (v !== undefined) facts[k] = v;
         }

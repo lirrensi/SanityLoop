@@ -41,7 +41,7 @@
 // Independent from swarm: swarm = multi-process hypervisor. This = one process.
 // ============================================================================
 
-import { Agent, EVENTS, Tool } from "@sanityloop/core";
+import { Agent, EVENTS, Tool, validateToolArgs } from "@sanityloop/core";
 import type {
     GodObject,
     Input,
@@ -216,6 +216,294 @@ function resolveTimeout(name: string, spec: TimeoutSpec): ResolvedTimeout {
         throw new Error(`[subagents] "${name}": graceMs must be >= 0 (got ${r.graceMs}).`);
     }
     return r;
+}
+
+// ============================================================================
+// FORK — copy the parent's live state onto a fresh agent, then diverge.
+// ============================================================================
+// ONE primitive for every "parallel session that returns": fork the parent,
+// override what differs (messages slice, system, tools, model, state), run
+// either ONE provider call or the FULL LOOP until it lands, terminate, return.
+// The parent never pauses, its provider prefix cache never invalidates, and
+// nothing the child does lands in the parent's history. Structured extraction
+// (sideCall) is the same shape: a fork whose single answer is parsed as JSON.
+// JSDoc below each function; the file's two modes stay untouched.
+
+/** What to carry from the parent into the fork. Defaults copy everything. */
+export interface ForkOptions {
+    /** Builder for the child. Omit = same model/tools/cwd as the parent. */
+    agent?: AgentBuilder;
+    /** Messages the child starts with. Numbers = slice of the PARENT's live
+     * messages by index (negatives from the end, like Array.slice). Omit =
+     * the parent's whole history, deep-copied. Pass [] for a blank child. */
+    messages?: Message[] | { from: number; to?: number };
+    /** Extra messages appended AFTER the slice (the task, the extraction
+     * prompt, the classifier question). */
+    append?: Message[];
+    /** Tools the child sees. Omit = the parent's tool list (same refs —
+     * tools are stateless definitions; per-call state lives in ToolCallRecord). */
+    tools?: ToolType[];
+    /** State the child starts with. Omit = deep copy of the parent's state.
+     * NEVER shared by reference: the child's writes must not leak back. */
+    state?: Record<string, unknown>;
+    /** Where, and as whom. Omit = parent's cwd + agentId + "-fork". */
+    cwd?: string;
+    agentId?: string;
+}
+
+/** Build a message of any type from raw text (extractors/classifiers need systems too). */
+export function textMessage(type: Message["type"], text: string): Message {
+    return {
+        id: `fork-${crypto.randomUUID().slice(0, 8)}`,
+        enabled: true,
+        type,
+        committedAt: Date.now(),
+        content: [{ type: "text", content: text }],
+    };
+}
+
+/** Deep copy through the SAME round-trip the tape uses (JSON stringify →
+ * parse): structuredClone chokes on the observer Proxy the god object hands
+ * out, while JSON walks the traps cleanly. Functions and class instances
+ * never survive the tape either — the fork copies exactly what a
+ * crash-restore would. */
+function deepCopy<T>(v: T): T {
+    return JSON.parse(JSON.stringify(v)) as T;
+}
+
+/** Copy the parent's live state onto a fresh, UN-RUN agent. The child shares
+ * NOTHING mutable with the parent (messages + state deep-copied); tools carry
+ * over by reference (stateless definitions). The caller mutates the child
+ * freely, then passes it to runOnce / runUntilSettled — which terminate it. */
+export function fork(parent: Agent, opts: ForkOptions = {}): Agent {
+    const messages =
+        opts.messages === undefined
+            ? deepCopy(parent.messages)
+            : Array.isArray(opts.messages)
+              ? deepCopy(opts.messages)
+              : deepCopy(parent.messages.slice(opts.messages.from, opts.messages.to));
+    if (opts.append !== undefined) messages.push(...deepCopy(opts.append));
+    const builder = opts.agent;
+    if (builder !== undefined) {
+        const child = builder();
+        if (!(child instanceof Agent)) {
+            throw new Error(
+                `[subagents] fork: builder returned ${child === null ? "null" : typeof child} instead of an Agent instance — build + decorate + return, never run.`,
+            );
+        }
+        if (child.messages.length === 0) child.messages.push(...messages);
+        return child;
+    }
+    return new Agent({
+        model: parent.model,
+        messages,
+        tools: opts.tools ?? [...parent.tools],
+        state: opts.state !== undefined ? deepCopy(opts.state) : deepCopy(parent.state),
+        agentId: opts.agentId ?? `${parent.agentId}-fork`,
+        cwd: opts.cwd ?? parent.cwd,
+        description: `fork of ${parent.agentId}`,
+    });
+}
+
+/** What a returned run carries: the child is ALWAYS terminated before this
+ * resolves — alive exactly for the call. */
+export interface ForkResult {
+    /** The child's final assistant text (collectFinalAnswer over its messages). */
+    answer?: string;
+    /** True when the child never produced an assistant reply (terminal without
+     * text, or a hard timeout). Check before trusting `answer`. */
+    error: boolean;
+    /** Human line for the failure case; undefined on success. */
+    errorMessage?: string;
+    /** The child's full message list — inspect, diff, or archive it. */
+    messages: Message[];
+    /** Stats the child accumulated (tokens, cost) — roll into your own ledger. */
+    stats: Agent["stats"];
+    loopState: Agent["loopState"];
+    subId: string;
+    timedOut: boolean;
+}
+
+/** Settle a forked child: run its heartbeat, wait for the landing, terminate.
+ * Shared by runOnce + runUntilSettled. Same timeout semantics as agentAsTool:
+ * graceful = stop() + grace window, hard = abort() = oblivion. */
+async function settleFork(child: Agent, name: string, timeout: TimeoutSpec | undefined): Promise<{ timedOut: boolean; limit: ResolvedTimeout | undefined }> {
+    const limit = timeout !== undefined ? resolveTimeout(name, timeout) : undefined;
+    void child.run(); // signals never start loops — but owed work does
+    const deadline = limit !== undefined ? Date.now() + limit.ms : undefined;
+    let timedOut = false;
+    while (!landed(child)) {
+        if (TERMINAL_STATES.has(child.loopState)) break; // dead children never land idle
+        if (deadline !== undefined && Date.now() > deadline) {
+            timedOut = true;
+            break;
+        }
+        await sleep(10);
+    }
+    if (timedOut && limit) {
+        if (limit.mode === "hard") {
+            child.abort(`${name}: timed out (hard)`); // oblivion — no leftovers
+        } else {
+            child.stop(); // graceful — give the step room, then inspect
+            const graceEnd = Date.now() + limit.graceMs;
+            while (!settled(child) && Date.now() < graceEnd) {
+                await sleep(10);
+            }
+            if (!settled(child)) child.abort(`${name}: timed out (grace expired)`);
+        }
+    }
+    return { timedOut, limit };
+}
+
+/** Package a settled child into a ForkResult — ALWAYS terminates the child. */
+async function collectFork(child: Agent, name: string, timedOut: boolean): Promise<ForkResult> {
+    const final = collectFinalAnswer(child.messages);
+    await child.terminate(); // heart stops, promise resolves, GC reaps
+    if (timedOut) {
+        return {
+            answer: final,
+            error: final === undefined,
+            errorMessage: final === undefined ? `${name}: timed out without producing an assistant reply.` : undefined,
+            messages: child.messages,
+            stats: child.stats,
+            loopState: child.loopState,
+            subId: child.id,
+            timedOut: true,
+        };
+    }
+    if (final === undefined) {
+        return {
+            error: true,
+            errorMessage: `${name}: child ended in "${child.loopState}" without producing an assistant reply.`,
+            messages: child.messages,
+            stats: child.stats,
+            loopState: child.loopState,
+            subId: child.id,
+            timedOut: false,
+        };
+    }
+    return {
+        answer: final,
+        error: false,
+        messages: child.messages,
+        stats: child.stats,
+        loopState: child.loopState,
+        subId: child.id,
+        timedOut: false,
+    };
+}
+
+/** Run EXACTLY ONE provider call on a forked child, then terminate it.
+ * The child carries the parent's tools — but ONE call means the model either
+ * answers text or emits tool calls; emitted calls are returned UNEXECUTED in
+ * `messages` (the loop that would gate them never runs). For extraction and
+ * classification pass `tools: []` on the fork so the model MUST answer. */
+export async function runOnce(child: Agent, opts: { name?: string; timeout?: TimeoutSpec } = {}): Promise<ForkResult> {
+    const name = opts.name ?? "runOnce";
+    const limit = opts.timeout !== undefined ? resolveTimeout(name, opts.timeout) : undefined;
+    const deadline = limit !== undefined ? Date.now() + limit.ms : undefined;
+    void child.run();
+    let timedOut = false;
+    // ONE provider round-trip = exactly one new message committed past the seed.
+    const seedLen = child.messages.length;
+    while (child.messages.length <= seedLen) {
+        if (TERMINAL_STATES.has(child.loopState)) break;
+        if (deadline !== undefined && Date.now() > deadline) {
+            timedOut = true;
+            break;
+        }
+        await sleep(10);
+    }
+    child.stop(); // the call landed — freeze before the loop spends a second one
+    return collectFork(child, name, timedOut);
+}
+
+/** Run the FULL agentic loop on a forked child until it lands (idle, no owed
+ * work), then terminate it. Same wait/terminate shape as agentAsTool, minus
+ * the tool wrapper: the slash-command "parallel session that returns". */
+export async function runUntilSettled(child: Agent, opts: { name?: string; timeout?: TimeoutSpec } = {}): Promise<ForkResult> {
+    const name = opts.name ?? "runUntilSettled";
+    const { timedOut } = await settleFork(child, name, opts.timeout);
+    return collectFork(child, name, timedOut);
+}
+
+export interface SideCallOptions<T = unknown> {
+    /** The contract the answer must satisfy — validated with the SAME wall
+     * tool args pass (validateToolArgs). Omit = unvalidated JSON. */
+    schema?: JsonSchema;
+    /** What to do when the answer isn't valid JSON or fails the schema:
+     * strict = error; warn = error:false + errorMessage + raw text in answer;
+     * fallback = error:false + fallbackValue as the object. Default strict. */
+    onError?: "strict" | "warn" | "fallback";
+    fallbackValue?: T;
+    /** The child's message override — default: the parent's whole history +
+     * an extraction system prompt. Pass a slice to fork less. */
+    messages?: ForkOptions["messages"];
+    /** Tools the extractor sees. Default [] — it must answer, never call. */
+    tools?: ToolType[];
+    /** Side model (cheaper extractor). Omit = the parent's model. */
+    model?: Agent["model"];
+    /** Extra system line prepended before the extraction contract. */
+    system?: string;
+    timeout?: TimeoutSpec;
+    name?: string;
+}
+
+export interface SideCallResult<T = unknown> {
+    /** The parsed object — or the fallback. Undefined ONLY on strict failure. */
+    object?: T;
+    /** The child's raw assistant text (the JSON source). */
+    text?: string;
+    /** True when fallbackValue stands in for a failed extraction. */
+    usedFallbackValue: boolean;
+    error: boolean;
+    errorMessage?: string;
+    stats: Agent["stats"];
+}
+
+/** Structured extraction as ONE disposable fork call: copy the parent's live
+ * messages onto a child, append the extraction contract, runOnce, parse the
+ * answer as JSON, validate against the schema, terminate. The parent's loop
+ * never pauses and its provider cache never invalidates — this is the whole
+ * point of the fork over toggling response_format mid-loop. */
+export async function sideCall<T = unknown>(parent: Agent, opts: SideCallOptions<T> = {}): Promise<SideCallResult<T>> {
+    const name = opts.name ?? "sideCall";
+    const contract =
+        (opts.system !== undefined ? `${opts.system}\n\n` : "") +
+        "Reply with ONLY a single JSON value matching this schema — no prose, no fences:" +
+        (opts.schema !== undefined ? `\n${JSON.stringify(opts.schema)}` : "");
+    const child = fork(parent, {
+        messages: opts.messages,
+        append: [textMessage("system", contract)],
+        tools: opts.tools ?? [],
+    });
+    if (opts.model !== undefined) child.model = opts.model;
+    const run = await runOnce(child, { name, timeout: opts.timeout });
+    const fail = (errorMessage: string): SideCallResult<T> => {
+        if (opts.onError === "fallback" && opts.fallbackValue !== undefined) {
+            return { object: opts.fallbackValue, text: run.answer, usedFallbackValue: true, error: false, stats: run.stats };
+        }
+        if (opts.onError === "warn") {
+            return { text: run.answer, usedFallbackValue: false, error: false, errorMessage, stats: run.stats };
+        }
+        return { text: run.answer, usedFallbackValue: false, error: true, errorMessage, stats: run.stats };
+    };
+    if (run.error || run.answer === undefined) {
+        return fail(run.errorMessage ?? `${name}: the extraction call produced no answer.`);
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(run.answer);
+    } catch {
+        return fail(`${name}: the answer is not valid JSON: ${run.answer.slice(0, 200)}`);
+    }
+    if (opts.schema !== undefined) {
+        const problems = validateToolArgs(opts.schema, parsed);
+        if (problems.length > 0) {
+            return fail(`${name}: the answer fails the schema: ${problems.join("; ")}`);
+        }
+    }
+    return { object: parsed as T, text: run.answer, usedFallbackValue: false, error: false, stats: run.stats };
 }
 
 // ============================================================================

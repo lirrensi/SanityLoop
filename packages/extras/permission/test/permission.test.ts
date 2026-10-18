@@ -17,6 +17,7 @@ import {
     askAll,
     denyAll,
     allowAll,
+    approve,
     fsPathGate,
     bashGate,
     classicResolve,
@@ -591,4 +592,62 @@ test("classicResolve 'session' on a command tool remembers the CANONICAL command
     const st = agent.state.permission as { approvals?: Array<{ tool?: string; cmd?: string }> };
     assert.equal(st.approvals?.[0]?.cmd, "npm run check && echo done", "approval stored canonical");
     assert.equal(st.approvals?.length, 1, "only one approval — spacing didn't duplicate it");
+});
+
+test("approve(): once answer executes the real tool (silent approval, no preResolve trap)", async () => {
+    const { agent, spy, seedAndKick } = makePermAgent(singleCallScript());
+    agent.use(createPermissions({ tools: { "*": approve() } }));
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitAwaiting(agent, { what: "approve() parks the ask" });
+        const ref = agent.pendingAwaits[0].id;
+        answerOnce(agent, ref, { choice: "once" });
+        await awaitLanded(agent);
+    });
+    assert.equal(spy.executes, 1, "approved call executed for real");
+    assert.equal(agent.pendingAwaits.length, 0, "park released");
+});
+
+test("approve(): timeout auto-denies, the model sees the denial", async () => {
+    const { agent, spy, seedAndKick } = makePermAgent(singleCallScript());
+    agent.use(createPermissions({ tools: { "*": approve({ timeoutMs: 30 }) } }));
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitAwaiting(agent, { what: "approve() parks the ask" });
+        // nobody answers — the 30ms deadline fires through the live heartbeat
+        await awaitLanded(agent, { timeout: 5000, what: "auto-denial to land" });
+    });
+    assert.equal(spy.executes, 0, "timed-out call never executed");
+    const result = lastToolResult(agent);
+    const content = result.content as { answer: string; error?: boolean; errorMessage?: string };
+    assert.equal(content.error, true);
+    assert.equal(content.errorMessage, "approval timeout");
+    assert.ok(content.answer.includes("timed out"), "the model reads the timeout");
+});
+
+test("approve(): bindArgs denies when the args drift since the ask", async () => {
+    const { agent, spy, seedAndKick } = makePermAgent(singleCallScript());
+    agent.use(createPermissions({ tools: { "*": approve({ bindArgs: true }) } }));
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitAwaiting(agent, { what: "approve() parks the ask" });
+        // tamper with the parked call's params before answering — the drift
+        // the fingerprint exists to catch. The resolver finds the call via
+        // findCallById (content.stored), so tamper there, observably.
+        const msg = agent.messages.find((m) => m.type === "toolCall");
+        const content = msg?.content as unknown as { stored?: Array<{ parameters?: unknown }> } | undefined;
+        assert.ok(content?.stored?.[0], "parked call present in transcript");
+        content.stored[0].parameters = { path: "/etc/shadow" };
+        // sanity: the tamper landed where findCallById reads
+        const again = (msg?.content as unknown as { stored?: Array<{ parameters?: unknown }> }).stored?.[0]?.parameters;
+        assert.deepEqual(again, { path: "/etc/shadow" });
+        const ref = agent.pendingAwaits[0].id;
+        answerOnce(agent, ref, { choice: "once" });
+        await awaitLanded(agent);
+    });
+    assert.equal(spy.executes, 0, "drifted call never executed");
+    const result = lastToolResult(agent);
+    const content = result.content as { answer: string; error?: boolean; errorMessage?: string };
+    assert.equal(content.error, true);
+    assert.equal(content.errorMessage, "args drift");
 });
