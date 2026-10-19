@@ -66,6 +66,15 @@ test("open daemon: register/report folds state; peer agents_list/get/events/list
 		const get2 = await p.rpc({ op: "agents_get", sessionId: "w1" });
 		assert.equal(get2.data.state, "paused");
 
+		// shutdown + reset ride the same control door (server is type-blind:
+		// forward + optimistic state, no new logic)
+		for (const action of ["shutdown", "reset"]) {
+			const cP = w.waitFor("control");
+			const r = await p.rpc({ op: "control", target: "w1", action });
+			assert.equal(r.data.ok, true);
+			assert.equal((await cP).action, action);
+		}
+
 		// broadcast
 		const bP = w.waitFor("input");
 		await p.rpc({ op: "broadcast", body: { type: "input_followup", text: "all" } });

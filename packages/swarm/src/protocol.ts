@@ -151,7 +151,7 @@ export interface ControlFrame {
 	op: "control";
 	id?: string;
 	target: string;
-	action: "stop" | "abort" | "pause" | "wake";
+	action: "stop" | "abort" | "pause" | "wake" | "shutdown" | "reset";
 }
 
 export interface DropFrame {
@@ -347,7 +347,7 @@ export interface InputToWorkerFrame {
 /** A control routed TO this worker. */
 export interface ControlToWorkerFrame {
 	op: "control";
-	action: "stop" | "abort" | "pause" | "wake";
+	action: "stop" | "abort" | "pause" | "wake" | "shutdown" | "reset";
 }
 
 /** A drop routed TO this worker — teardown, suppress reconnect, stay gone
@@ -447,7 +447,7 @@ export interface AgentInfo {
 export type WorkerInfo = AgentInfo;
 
 /** The control actions a peer/admin may send a worker. */
-export const CONTROL_ACTIONS = ["stop", "abort", "pause", "wake"] as const;
+export const CONTROL_ACTIONS = ["stop", "abort", "pause", "wake", "shutdown", "reset"] as const;
 export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 
 /** Default port the daemon listens on — the well-known local address. */

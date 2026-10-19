@@ -33,5 +33,5 @@ test("constants are sane", () => {
 	assert.ok(STREAM_EVENTS.includes("textDelta"));
 	assert.ok(LIFECYCLE_EVENTS.includes("agentStart"));
 	assert.ok(LIFECYCLE_EVENTS.includes("error"));
-	assert.deepEqual([...CONTROL_ACTIONS], ["stop", "abort", "pause", "wake"]);
+	assert.deepEqual([...CONTROL_ACTIONS], ["stop", "abort", "pause", "wake", "shutdown", "reset"]);
 });

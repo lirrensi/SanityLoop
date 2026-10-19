@@ -7,8 +7,10 @@
 //     · register with the daemon (sessionId, agentId, description, mode, persistent)
 //     · report UP: stream events + lifecycle only — voices, never memories (patched
 //       stays local, the worker's own storage owns it)
-//     · receive DOWN: input → agent.input(), control → stop/abort/pause/wake — the
-//       SAME doors a human REPL would use, so a worker never knows who steers it
+//     · receive DOWN: input → agent.input(), control → stop/abort/pause/wake/
+//       shutdown/reset — the SAME doors a human REPL would use, so a worker
+//       never knows who steers it. shutdown = graceful terminate (corpse kept),
+//       reset = wipe to identity (loop alive). No destroy on the wire, ever.
 //     · reconnect + heartbeat (the daemon dies? we come back)
 //     · tools per mode: peer (agents_list/agents_get/send/listen/control),
 //       admin (+proc/task/drop/broadcast). worker gets none — it just reports.
@@ -145,6 +147,8 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					else if (a === "abort") agent.abort("swarm/control");
 					else if (a === "pause") agent.pause();
 					else if (a === "wake") agent.wake();
+					else if (a === "shutdown") agent.input({ type: "input_terminate" } as never);
+					else if (a === "reset") agent.input({ type: "request_reset" } as never);
 				}
 				return;
 			case "drop":
@@ -386,14 +390,14 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 				{
 					name: "swarm_control",
 					description:
-						"Send a control action to a worker: stop, abort, pause, wake.",
+						"Send a control action to a worker: stop, abort, pause, wake, shutdown (graceful terminate, corpse kept), reset (wipe to identity, loop alive).",
 					inputSchema: {
 						type: "object",
 						properties: {
 							target: { type: "string" },
 							action: {
 								type: "string",
-								enum: ["stop", "abort", "pause", "wake"],
+								enum: ["stop", "abort", "pause", "wake", "shutdown", "reset"],
 							},
 						},
 						required: ["target", "action"],
