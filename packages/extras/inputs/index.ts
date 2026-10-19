@@ -8,6 +8,10 @@
 // Vocabulary (the canon — there is NO prompt type; followup replaced it):
 //   input_abort    → agent.abort()   — holds everything immediately
 //   input_stop     → agent.stop()    — graceful stop
+//   input_terminate→ agent.terminate() — the agent's exit(). Default ON.
+//   input_destroy  → agent.destroy() — the husk-maker. Default OFF, gated by
+//                    createDefaultInputs({ allowDestroy: true }); logs loudly
+//                    when honored.
 //   input_steer    → real message. Received instantly, stored in
 //                    `state.inputSteer`, INSERTED after the current tool batch
 //                    (interrupts remaining tools — pi's Enter)
@@ -40,11 +44,13 @@
 import { randomUUID } from "node:crypto";
 import { EVENTS, emptySessionStats } from "@sanityloop/core";
 import type { Filter, GodObject, Input, Message, Plugin } from "@sanityloop/core";
-import { expandBackticks, removeFiltersByPrefix } from "@sanityloop/util";
+import { emitLog, expandBackticks, removeFiltersByPrefix } from "@sanityloop/util";
 
 export const InputTypes = {
   abort: "input_abort",
   stop: "input_stop",
+  terminate: "input_terminate",
+  destroy: "input_destroy",
   steer: "input_steer",
   followup: "input_followup",
   clear: "request_clear",
@@ -68,6 +74,16 @@ export interface ClearInput extends Input {
 
 export interface ResetInput extends Input {
   type: typeof InputTypes.reset;
+}
+
+/** The agent's `exit()`: graceful death, corpse kept for inspection. Default ON. */
+export interface TerminateInput extends Input {
+  type: typeof InputTypes.terminate;
+}
+
+/** The husk-maker: terminate + strip. Default OFF — see `allowDestroy`. */
+export interface DestroyInput extends Input {
+  type: typeof InputTypes.destroy;
 }
 
 export interface FollowupInput extends Input {
@@ -115,7 +131,13 @@ function resetSession(agent: GodObject): void {
   agent.stats = emptySessionStats();
 }
 
-export function createDefaultInputs(): Plugin {
+export interface DefaultInputsOptions {
+  /** Honor `input_destroy` (default false). When false the vocab is inert. */
+  allowDestroy?: boolean;
+}
+
+export function createDefaultInputs(opts: DefaultInputsOptions = {}): Plugin {
+  const allowDestroy = opts.allowDestroy ?? false;
   function addUserMessage(agent: GodObject, text: string): void {
     const msg: Message = {
       id: `input-${randomUUID().slice(0, 8)}`,
@@ -141,6 +163,19 @@ export function createDefaultInputs(): Plugin {
         case InputTypes.stop:
           agent.stop();
           return;
+        case InputTypes.terminate:
+          // The agent's exit(): graceful death, corpse kept. Default ON.
+          void agent.terminate("input_terminate");
+          return;
+        case InputTypes.destroy: {
+          // GATED — inert unless allowDestroy. The husk-maker: no leak possible.
+          if (!allowDestroy) return;
+          const msg = `inputs: input_destroy honored — destroying agent ${agent.agentId}`;
+          console.log(`[sanity] ${msg}`);
+          emitLog(agent, "warn", "inputs", msg, { agentId: agent.agentId });
+          void agent.destroy("input_destroy");
+          return;
+        }
         case InputTypes.steer:
           // mid-turn → store it, insert after the current tools; idle → now
           if (agent.inTurn) {
@@ -230,11 +265,13 @@ export function createDefaultInputs(): Plugin {
       agent.addFilter(insertSteers);
       agent.addFilter(drainFollowups);
       agent.addFilter(runReset);
-      agent.addDeclaredCapability({ id: "inputs", description: "input vocabulary (abort/stop/steer/followup/clear/reset)" });
+      agent.addDeclaredCapability({ id: "inputs", description: "input vocabulary (abort/stop/terminate/destroy/steer/followup/clear/reset)" });
       agent.addDeclaredInput({ id: "clear-request", schema: null, description: "hide the conversation from the context window (history preserved)" });
       agent.addDeclaredInput({ id: "reset-request", schema: null, description: "reset the session to its starting state (process kept alive)" });
       agent.addDeclaredInput({ id: "steer", schema: null, description: "real message inserted after the current tool batch; optional backticksCommand evaluates `cmd` spans at insertion" });
       agent.addDeclaredInput({ id: "followup", schema: null, description: "real message inserted at the landing; optional backticksCommand evaluates `cmd` spans at insertion" });
+      agent.addDeclaredInput({ id: "terminate-request", schema: null, description: "terminate the agent (exit, corpse kept)" });
+      agent.addDeclaredInput({ id: "destroy-request", schema: null, description: "destroy the agent (terminate + strip); honored only with allowDestroy" });
     },
     uninstall(agent) {
       removeFiltersByPrefix(agent, "inputs/");
@@ -243,6 +280,8 @@ export function createDefaultInputs(): Plugin {
       agent.removeDeclaredInput("reset-request");
       agent.removeDeclaredInput("steer");
       agent.removeDeclaredInput("followup");
+      agent.removeDeclaredInput("terminate-request");
+      agent.removeDeclaredInput("destroy-request");
     },
   };
 }

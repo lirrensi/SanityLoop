@@ -527,7 +527,7 @@ export interface DeclaredCapability {
   description: string;
 }
 
-/** A declared EVENT — what a plugin PRODUCES. Built-ins (the 38 core events) are pre-loaded. */
+/** A declared EVENT — what a plugin PRODUCES. Built-ins (the 41 core events) are pre-loaded. */
 export interface DeclaredEvent {
   id: string;
   description?: string;
@@ -572,12 +572,13 @@ export interface GodObject extends Session {
   stop(): void;
   /** Stop the loop after the current message commits. */
   pause(): void;
-  /** THE OFF SWITCH — stops the HEART: aborts anything in flight (an idle
-   * agent dies quietly — no fake abort events), both loops break at their
-   * next beat, and run() RESOLVES. The only thing that ends run().
-   * Idempotent; fire-and-forget safe (a defensive catch logs late loop
-   * crashes instead of surfacing unhandled rejections). */
+  /** See `terminate` on the Agent class — the full contract lives there. */
   terminate(reason?: string): Promise<void>;
+  /** THE HUSK-MAKER — terminate() + strip: fires `beforeDestroy` after
+   * terminate, uninstalls ALL plugins (reverse install order), empties
+   * filters, nulls guts (messages/state/stats/bus refs/lastResponse).
+   * Inert, unrevivable. Idempotent; run() after destroy resolves immediately. */
+  destroy(reason?: string): Promise<void>;
   /** THE CALLER-SDK WAIT — resolve when the loop rests (idle/awaiting/
    * stopped/terminal), WITHOUT polling. Pure additive sugar over the same
    * derivation the supervisor beats on; the loop itself is untouched.
@@ -661,7 +662,7 @@ export interface GodObject extends Session {
   removeDeclaredCapability(id: string): boolean;
   listDeclaredCapabilities(): DeclaredCapability[];
   getDeclaredCapability(id: string): DeclaredCapability | undefined;
-  /** Built-in events (the 38 from EVENTS) are pre-loaded; add/delete manage the rest. */
+  /** Built-in events (the 41 from EVENTS) are pre-loaded; add/delete manage the rest. */
   addDeclaredEvent(entry: DeclaredEvent): void;
   removeDeclaredEvent(id: string): boolean;
   listDeclaredEvents(): DeclaredEvent[];
@@ -1006,7 +1007,7 @@ export interface SessionData {
 }
 
 // ============================================================================
-// THE 39 CORE EVENTS (constants — loop-emitted, guaranteed, versioned)
+// THE 41 CORE EVENTS (constants — loop-emitted, guaranteed, versioned)
 // ============================================================================
 
 export const EVENTS = {
@@ -1030,6 +1031,8 @@ export const EVENTS = {
   stop: "stop",
   beforeAbort: "beforeAbort",
   abort: "abort",
+  beforeTerminate: "beforeTerminate",
+  beforeDestroy: "beforeDestroy",
   beforeRunEnd: "beforeRunEnd",
   error: "error",
   handlerError: "handlerError",

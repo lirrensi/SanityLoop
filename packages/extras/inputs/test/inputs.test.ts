@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { Agent, EVENTS } from "@sanityloop/core";
 import type { Input, Tool, TurnResult } from "@sanityloop/core";
 import { createDefaultInputs, InputTypes } from "@sanityloop/inputs";
+import type { LogEntry } from "@sanityloop/util";
 import { StubModel, assistantTurn, callTo, toolCallTurn } from "@sanityloop/test-kit/core";
 import { awaitAwaiting, awaitIdle, sleep, waitUntil } from "@sanityloop/test-kit";
 import { withDriver } from "@sanityloop/test-kit/core";
@@ -39,6 +40,8 @@ function seed(agent: Agent, text = "go"): void {
 test("the default vocabulary constants are exact", () => {
     assert.equal(InputTypes.abort, "input_abort");
     assert.equal(InputTypes.stop, "input_stop");
+    assert.equal(InputTypes.terminate, "input_terminate");
+    assert.equal(InputTypes.destroy, "input_destroy");
     assert.equal(InputTypes.steer, "input_steer");
     assert.equal(InputTypes.followup, "input_followup");
     assert.equal(InputTypes.clear, "request_clear");
@@ -48,9 +51,11 @@ test("the default vocabulary constants are exact", () => {
 test("install registers the capability + declared inputs", () => {
     const { agent } = inputAgent([]);
     assert.ok(agent.getDeclaredCapability("inputs"));
-    assert.match(agent.getDeclaredCapability("inputs")!.description, /abort\/stop\/steer\/followup/);
+    assert.match(agent.getDeclaredCapability("inputs")!.description, /abort\/stop\/terminate\/destroy\/steer\/followup/);
     assert.ok(agent.getDeclaredInput("clear-request"));
     assert.ok(agent.getDeclaredInput("reset-request"));
+    assert.ok(agent.getDeclaredInput("terminate-request"));
+    assert.ok(agent.getDeclaredInput("destroy-request"));
 });
 
 test("REGRESSION GUARD: followup becomes a USER MESSAGE and starts a turn", async () => {
@@ -223,4 +228,73 @@ test("stop mid-turn lets the current step finish then lands gracefully", async (
         assert.equal(agent.stopRequested, false, "halt flags reset at the landing");
         assert.ok(agent.messages.some((m) => m.type === "assistant"), "the final answer still committed");
     });
+});
+
+// ---------------------------------------------------------------------------
+// Death verbs: input_terminate (default ON), input_destroy (gated OFF)
+// ---------------------------------------------------------------------------
+
+test("input_terminate terminates the agent (default ON)", async () => {
+    const { agent } = inputAgent([() => assistantTurn("never")]);
+    seed(agent);
+    await withDriver(agent, async () => {
+        agent.input({ type: "__test_kick__" });
+        await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, { what: "turn to land" });
+        agent.input({ type: "input_terminate" });
+        await waitUntil(() => agent.loopState === "terminated", { what: "terminated state" });
+        assert.equal(agent.loopState, "terminated");
+    });
+    assert.ok(agent.messages.length >= 1, "corpse kept — post-mortem inspectable");
+});
+
+test("input_destroy is INERT by default (gate closed)", async () => {
+    const { agent } = inputAgent([() => assistantTurn("ok")]);
+    seed(agent);
+    await withDriver(agent, async () => {
+        agent.input({ type: "__test_kick__" });
+        await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, { what: "turn to land" });
+        const ticksBefore = agent.ticks;
+        agent.input({ type: "input_destroy" });
+        await sleep(60);
+        assert.notEqual(agent.loopState, "terminated", "gated destroy must not kill");
+        assert.ok(agent.ticks > ticksBefore, "heart still beating — destroy ignored");
+    });
+});
+
+test("input_destroy destroys the agent when allowDestroy (loud log)", async () => {
+    const model = new StubModel([() => assistantTurn("ok")]);
+    const agent = new Agent({ model, agentId: "inputs-destroy-test" });
+    agent.install(createDefaultInputs({ allowDestroy: true }));
+    assert.ok(agent.getDeclaredInput("destroy-request"), "destroy vocab declared");
+    // loud-log receipt: both the console line and the shared log channel
+    const seen: string[] = [];
+    agent.addFilter({
+        event: "log", id: "t/log-spy", priority: 0,
+        fn: async (_a, ev) => {
+            const entry = ev as unknown as LogEntry;
+            seen.push(`${entry.source}: ${entry.message}`);
+        },
+    });
+    let logged = "";
+    const origLog = console.log;
+    const stubLog = (...a: unknown[]): void => {
+        logged += a.map(String).join(" ");
+    };
+    console.log = stubLog as typeof console.log;
+    seed(agent);
+    try {
+        await withDriver(agent, async () => {
+            agent.input({ type: "__test_kick__" });
+            await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, { what: "turn to land" });
+            agent.input({ type: "input_destroy" });
+            await waitUntil(() => agent.loopState === "terminated", { what: "terminated state" });
+            assert.equal(agent.messages.length, 0, "husk stripped — messages nulled");
+            assert.deepEqual(agent.state, {}, "husk stripped — state emptied");
+            assert.equal(agent.filters.length, 0, "husk stripped — filters emptied");
+        });
+    } finally {
+        console.log = origLog;
+    }
+    assert.match(logged, /input_destroy honored/, "console line is loud");
+    assert.ok(seen.some((l) => l.includes("inputs") && l.includes("input_destroy")), "log channel carries the honor");
 });

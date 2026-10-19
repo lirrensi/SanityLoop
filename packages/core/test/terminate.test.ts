@@ -8,7 +8,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Agent, EVENTS } from "@sanityloop/core";
+import { Agent, EVENTS, emptySessionStats } from "@sanityloop/core";
 import type { Tool } from "@sanityloop/core";
 import { makeAgent, seedUserMessage } from "@sanityloop/test-kit/core";
 import { assistantTurn, callTo, toolCallTurn } from "@sanityloop/test-kit/core";
@@ -274,4 +274,169 @@ test("settled() AFTER terminate() answers NOW with terminated (dead heart, no ha
     // states filter still applies: unwanted rest → timedOut, still NOW
     const r2 = await agent.settled({ states: ["idle"] });
     assert.deepEqual(r2, { state: "terminated", timedOut: true });
+});
+
+// ---------------------------------------------------------------------------
+// destroy() — THE HUSK-MAKER: terminate() + strip
+// ---------------------------------------------------------------------------
+
+test("destroy() nulls the guts: messages/state/stats/filters/bus refs/lastResponse", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("done")] });
+    seedUserMessage(agent, "hi");
+    agent.state.custom = { nested: true };
+    agent.install({
+        id: "test/stuff",
+        install(a) {
+            a.addFilter({ event: EVENTS.agentEnd, id: "test/stuff-end", priority: 0, fn: async () => {} });
+        },
+        uninstall(a) {
+            a.removeFilter(EVENTS.agentEnd, "test/stuff-end");
+        },
+    });
+    const runP = agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    assert.ok(agent.messages.length > 0, "precondition: corpse has messages");
+    assert.ok(agent.filters.length > 0, "precondition: filters registered");
+    await agent.destroy();
+    await runP;
+    assert.equal(agent.loopState, "terminated");
+    assert.deepEqual(agent.messages, [], "messages nulled");
+    assert.deepEqual(agent.state, {}, "state emptied");
+    assert.deepEqual(agent.stats, emptySessionStats(), "stats zeroed to fresh shape");
+    assert.deepEqual(agent.filters, [], "filters emptied");
+    assert.equal(agent.bus.has(EVENTS.agentEnd), false, "bus registry stripped");
+    assert.equal(agent.plugins.length, 0, "plugins uninstalled");
+    assert.equal(agent.lastResponse, -1, "lastResponse reset");
+    assert.equal(agent.pendingInputs.sync.length, 0, "no pending sync");
+    assert.equal(agent.pendingAwaits.length, 0, "no pending awaits");
+});
+
+test("destroy() uninstalls plugins in REVERSE install order", async () => {
+    const { agent } = makeAgent({ script: [] });
+    const order: string[] = [];
+    for (const id of ["p/a", "p/b", "p/c"]) {
+        agent.install({
+            id,
+            install() {},
+            uninstall() {
+                order.push(id);
+            },
+        });
+    }
+    await agent.destroy();
+    assert.deepEqual(order, ["p/c", "p/b", "p/a"], "reverse install order");
+});
+
+test("destroy() is idempotent; a second call returns the same settlement", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    const runP = agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.destroy();
+    await agent.destroy("again");
+    await agent.destroy();
+    await runP;
+    assert.equal(agent.loopState, "terminated");
+    assert.deepEqual(agent.messages, [], "still a husk after repeat destroys");
+});
+
+test("run() after destroy() resolves immediately (dead stays dead)", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    await agent.destroy(); // born dead — never ran
+    const t0 = Date.now();
+    await agent.run();
+    assert.ok(Date.now() - t0 < 1000, "immediate resolve — the husk never ticks");
+    assert.equal(agent.ticks, 0, "zero ticks after destroy");
+});
+
+test("terminate() keeps the corpse: state stays inspectable (destroy contrast)", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("done")] });
+    seedUserMessage(agent, "hi");
+    const runP = agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.terminate();
+    await runP;
+    assert.ok(agent.messages.length >= 2, "terminate preserves the post-mortem");
+});
+
+// ---------------------------------------------------------------------------
+// Death events: beforeTerminate + beforeDestroy fire once, and only once
+// ---------------------------------------------------------------------------
+
+test("beforeTerminate fires ONCE, sync, inside terminate() after the abort channel", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    const seen: string[] = [];
+    let abortSeenAt = -1;
+    agent.addFilter({
+        event: EVENTS.abort, id: "t/abort-spy", priority: 0,
+        fn: async () => {
+            abortSeenAt = seen.length;
+        },
+    });
+    agent.addFilter({
+        event: EVENTS.beforeTerminate, id: "t/bt-spy", priority: 0,
+        fn: async () => {
+            seen.push("beforeTerminate");
+        },
+    });
+    agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.terminate("test-reason");
+    assert.equal(seen.length, 1, "fires exactly once");
+    assert.ok(abortSeenAt !== -1, "abort channel fired (abort event observed)");
+    assert.equal(agent.loopState, "terminated");
+    // second terminate is a no-op — no second firing
+    await agent.terminate("test-reason");
+    assert.equal(seen.length, 1, "idempotent terminate never re-fires");
+});
+
+test("beforeDestroy fires ONCE inside destroy() after terminate, before the strip", async () => {
+    const { agent } = makeAgent({ script: [() => assistantTurn("x")] });
+    seedUserMessage(agent, "hi");
+    const order: string[] = [];
+    agent.addFilter({
+        event: EVENTS.beforeTerminate, id: "t/bt-order", priority: 0,
+        fn: async () => void order.push("beforeTerminate"),
+    });
+    agent.addFilter({
+        event: EVENTS.beforeDestroy, id: "t/bd-order", priority: 0,
+        fn: async () => void order.push("beforeDestroy"),
+    });
+    const runP = agent.run();
+    await waitUntil(() => agent.loopState === "idle" && !agent.hasWork, {
+        what: "turn to land idle",
+    });
+    await agent.destroy();
+    await runP;
+    assert.deepEqual(order, ["beforeTerminate", "beforeDestroy"], "terminate first, destroy after");
+    await agent.destroy();
+    assert.deepEqual(order, ["beforeTerminate", "beforeDestroy"], "idempotent destroy never re-fires");
+});
+
+test("destroy() abort-channel first: terminate inside destroy fires beforeTerminate once", async () => {
+    const { agent } = makeAgent({ script: [] });
+    let bt = 0;
+    let bd = 0;
+    agent.addFilter({
+        event: EVENTS.beforeTerminate, id: "t/bt-count", priority: 0,
+        fn: async () => void bt++,
+    });
+    agent.addFilter({
+        event: EVENTS.beforeDestroy, id: "t/bd-count", priority: 0,
+        fn: async () => void bd++,
+    });
+    await agent.destroy("born-dead");
+    assert.equal(bt, 1, "terminate half fires beforeTerminate exactly once");
+    assert.equal(bd, 1, "destroy half fires beforeDestroy exactly once");
+    assert.equal(agent.abortSignal.aborted, true, "abort channel fired even when idle");
 });

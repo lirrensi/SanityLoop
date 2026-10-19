@@ -276,7 +276,7 @@ export class Agent implements GodObject {
     /** ---- declared registries (private Maps — the agent's contract surface) ---- */
     private declaredInputs: Map<string, DeclaredInput> = new Map();
     private declaredCapabilities: Map<string, DeclaredCapability> = new Map();
-    /** Built-in core events (the 38 from EVENTS) — `delete` is a no-op on them. */
+    /** Built-in core events (from EVENTS) — `delete` is a no-op on them. */
     private declaredEvents: Map<string, DeclaredEvent> = new Map();
     private coreEventIds: Set<string> = new Set(Object.values(EVENTS));
     // ---- machinery ----
@@ -360,6 +360,10 @@ export class Agent implements GodObject {
     /** The stored two-clocks promise — terminate() returns it, so callers can
      * await an actually-dead agent instead of a flag flip. */
     private runPromise: Promise<void> | undefined;
+    /** THE HUSK FLAG — set by destroy(); run() after destroy resolves immediately. */
+    private destroyed = false;
+    /** The stored destroy promise — destroy() returns it, so callers can await a cold husk. */
+    private destroyPromise: Promise<void> | undefined;
     /** A turn has begun (first turnStart) and not yet landed — the mid-turn signal. */
     private startedTurn = false;
     /** Total ticks executed — the heartbeat counter. (NOT observed — 100/sec would drown the stream.) */
@@ -405,7 +409,7 @@ export class Agent implements GodObject {
         this.bus = new FilterBus(this);
         this.data = this.observe(this.data, ""); // the path-tracking observer wraps the whole container
 
-        // Pre-populate declared events with the 38 core events — they exist before any plugin loads.
+        // Pre-populate declared events with the core events — they exist before any plugin loads.
         for (const id of Object.values(EVENTS)) {
             this.declaredEvents.set(id, { id });
         }
@@ -802,6 +806,11 @@ export class Agent implements GodObject {
         // abort() is idempotent + terminal-guarded; an idle agent's abort is a
         // no-op for the loop but still fires the cleanup channel for listeners.
         this.abort(reason);
+        // THE DEATH RATTLE, ONCE, SYNC — after the abort channel, before the
+        // loops break. Storage flush, servers close, join extension, last rites.
+        // No veto: terminate proceeds regardless of what listeners do. Sync
+        // fire by design — no await point where a dying heart could hang.
+        this.fire(EVENTS.beforeTerminate, { reason }, true);
         this.loopState = "terminated";
         // settled() waiters must never hang on a dead heart: the loops break
         // at their next beat, so no beat will ever notify them again. Answer
@@ -819,6 +828,55 @@ export class Agent implements GodObject {
             console.error("[sanity] loop crashed while terminating:", err),
         );
         return this.runPromise ?? Promise.resolve();
+    }
+    /**
+     * THE HUSK-MAKER — terminate() + strip. The heart stops (terminate's full
+     * contract: abort channel, beforeTerminate, loops break, run() resolves),
+     * then the memory goes: `beforeDestroy` fires (last words before the
+     * strip), ALL plugins uninstall in reverse install order, filters empty,
+     * guts null (messages/state/stats/bus refs/lastResponse). The husk is
+     * inert and unrevivable — reach for this when no leak is acceptable.
+     * `terminate` stays the specialist tool (stop + inspect corpse, then null).
+     *
+     * Idempotent — a second call returns the same promise. Dead stays dead:
+     * run() after destroy() resolves immediately without starting anything.
+     * Neither this nor terminate() reaps unbound process children; bound
+     * children (on `abortSignal`) die via the abort channel.
+     */
+    async destroy(reason = "destroyed"): Promise<void> {
+        if (this.destroyed) return this.destroyPromise ?? this.runPromise ?? Promise.resolve();
+        this.destroyed = true;
+        await this.terminate(reason);
+        // LAST WORDS — once, after terminate, before the strip.
+        this.fire(EVENTS.beforeDestroy, { reason }, true);
+        // STRIP — reverse install order, dependency-safe (dependents went first
+        // by construction: uninstall refuses while dependents remain, and
+        // reverse order uninstalls dependents before their deps).
+        for (const id of [...this.pluginMap.keys()].reverse()) {
+            this.uninstall(id);
+        }
+        // EMPTY FILTERS — every live filter off the bus registry too (direct
+        // addFilter calls leave bus entries that uninstall() never sees).
+        for (const f of [...this.filters]) this.removeFilter(f.event, f.id);
+        this.filters = [];
+        this.lane = [];
+        this.pendingSync = [];
+        this.pendingAsync = [];
+        this.currentInput = undefined;
+        this.currentTurn = undefined;
+        this.data.messages = [];
+        this.data.state = {};
+        this.data.lastResponse = -1;
+        // stats keep their SHAPE (MessageStats compat) but lose all content
+        this.data.stats = emptySessionStats();
+        this.data.transient = {};
+        this.data.pendingAwaits = [];
+        this.data.pendingQuestions = [];
+        this.data.currentAction = undefined;
+        this.data.tools = [];
+        this.data.tickPlan = [];
+        this.destroyPromise = this.runPromise ?? Promise.resolve();
+        return this.destroyPromise;
     }
 
     /**
@@ -951,6 +1009,7 @@ export class Agent implements GodObject {
      * can await a genuinely-dead agent.
      */
     async run(opts?: { startState?: "idle" }): Promise<void> {
+        if (this.destroyed) return this.destroyPromise;
         if (this.runDriven || this.terminated) return this.runPromise;
         if (opts?.startState === "idle") this.armed = false;
         // THE LAW — a DEFAULT run() with ZERO messages is a HARD ERROR, not a
