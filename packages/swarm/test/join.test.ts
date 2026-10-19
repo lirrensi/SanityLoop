@@ -105,7 +105,7 @@ test("worker-mode join: registers, adds report filters, exposes NO tools", async
 	}
 });
 
-test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_start/kill/send/control/broadcast/listen)", async () => {
+test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_start/drop/send/control/broadcast/listen)", async () => {
 	const home = tmpHome();
 	const tdir = join(home, "templates");
 	mkdirSync(tdir, { recursive: true });
@@ -179,13 +179,14 @@ test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_sta
 		}
 		assert.ok(got2, "admin received relayed swarm/event");
 
-		// kill = terminate signal: the target gets a stop control
-		const killP = target.waitFor("control");
-		const killed = JSON.parse(
-			(await findTool(agent, "swarm_kill")!.execute({ sessionId: "target1" })).answer,
+		// drop = server-side removal: the target gets a drop frame, the entry is gone
+		const dropP = target.waitFor("drop");
+		const dropped = JSON.parse(
+			(await findTool(agent, "swarm_drop")!.execute({ sessionId: "target1" })).answer,
 		);
-		assert.equal(killed.ok, true);
-		assert.equal((await killP).action, "stop");
+		assert.equal(dropped.ok, true);
+		assert.equal((await dropP).op, "drop");
+		assert.equal(server.api.agents.get("target1"), null);
 
 		// stop the forked process
 		const stopped = JSON.parse(
@@ -217,5 +218,65 @@ test("join rejects a bad admin token (never registers)", async () => {
 		if (plugin) plugin.uninstall(agent as unknown as GodObject);
 		rmHome(home);
 		await server.stop();
+	}
+});
+
+test("drop suppresses reconnect (stays gone, emits swarm/dropped)", async () => {
+	const home = tmpHome();
+	const server = await startDaemon({ home });
+	const url = `ws://127.0.0.1:${server.port}`;
+	// Integration test: reconnect suppression is real timer behavior against
+	// the platform clock, so a genuine wait past the reconnect beat applies.
+	let plugin: Plugin | undefined;
+	let gone: FakeAgent | undefined;
+	try {
+		gone = new FakeAgent("gone1", "g", "g");
+		plugin = createSwarmJoin({ mode: "worker", server: url });
+		gone.install(plugin);
+		assert.equal(await waitRegistered(server, "gone1"), true);
+		const admin = new WsClient(url);
+		await admin.ready();
+		admin.send({ op: "register", sessionId: "boss", agentId: "admin", mode: "admin" });
+		await admin.waitFor("welcome");
+		await admin.rpc({ op: "drop", sessionId: "gone1" });
+		const dl = Date.now() + 2500;
+		while (Date.now() < dl) {
+			if (gone.emitted.find((e) => e.type === "swarm/dropped")) break;
+			await new Promise((r) => setTimeout(r, 30));
+		}
+		assert.ok(gone.emitted.find((e) => e.type === "swarm/dropped"), "emits swarm/dropped");
+		await new Promise((r) => setTimeout(r, 1800));
+		assert.equal(server.api.agents.get("gone1"), null);
+		admin.close();
+	} finally {
+		if (plugin && gone) plugin.uninstall(gone as unknown as GodObject);
+		rmHome(home);
+		await server.stop();
+	}
+});
+
+test("plain disconnect reconnects (drop flag untouched)", async () => {
+	const home = tmpHome();
+	const server = await startDaemon({ home });
+	const url = `ws://127.0.0.1:${server.port}`;
+	// Integration test: reconnect is real timer behavior, genuine waits apply.
+	let plugin: Plugin | undefined;
+	let back: FakeAgent | undefined;
+	try {
+		back = new FakeAgent("back1", "b", "b");
+		plugin = createSwarmJoin({ mode: "worker", server: url });
+		back.install(plugin);
+		const port = server.port;
+		await server.stop();
+		const server2 = await startDaemon({ home, port });
+		try {
+			assert.equal(await waitRegistered(server2, "back1", 8000), true);
+			assert.ok(!back.emitted.find((e) => e.type === "swarm/dropped"), "no drop emit on plain disconnect");
+		} finally {
+			await server2.stop();
+		}
+	} finally {
+		if (plugin && back) plugin.uninstall(back as unknown as GodObject);
+		rmHome(home);
 	}
 });

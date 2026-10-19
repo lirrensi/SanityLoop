@@ -2,8 +2,8 @@
 // server.test.ts — the daemon hub, end-to-end over raw WS clients.
 // No full agent needed: we speak the wire directly. Covers register/report →
 // state folding, agents_list/agents_get + talk, spawnId→parent echo, wild
-// agents, kill-vs-proc_stop split, proc/task doors, role permissions, and the
-// token gate.
+// agents, drop removes from list (idempotent), proc/task doors, role
+// permissions, and the token gate.
 // ============================================================================
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -86,7 +86,7 @@ test("open daemon: register/report folds state; peer agents_list/get/events/list
 	}
 });
 
-test("spawnId echoes as parent; wild agents list parentless; kill = terminate signal", async () => {
+test("spawnId echoes as parent; wild agents list parentless; drop removes from list", async () => {
 	const home = tmpHome();
 	const server = await startDaemon({ home });
 	const url = `ws://127.0.0.1:${server.port}`;
@@ -114,14 +114,16 @@ test("spawnId echoes as parent; wild agents list parentless; kill = terminate si
 		const wl = (await admin.rpc({ op: "agents_get", sessionId: "w1" })).data;
 		assert.equal(wl.parent, undefined);
 
-		// kill = terminate signal to the one loop: a stop control lands first,
-		// then the socket drops and the agent reads offline.
-		const ctrlP = forked.waitFor("control");
-		const killRes = await admin.rpc({ op: "kill", sessionId: "f1" });
-		assert.equal(killRes.data.ok, true);
-		assert.equal((await ctrlP).action, "stop");
-		const after = (await admin.rpc({ op: "agents_get", sessionId: "f1" })).data;
-		assert.equal(after.status, "offline");
+		// drop = server-side removal: the entry is gone from the list, the
+		// socket is closed, and a re-drop of the ghost succeeds silently.
+		const dropRes = await admin.rpc({ op: "drop", sessionId: "f1" });
+		assert.equal(dropRes.data.ok, true);
+		assert.equal((await admin.rpc({ op: "agents_get", sessionId: "f1" })).data, null);
+		const list = (await admin.rpc({ op: "agents_list" })).data as { sessionId: string }[];
+		assert.ok(!list.find((r) => r.sessionId === "f1"), "dropped agent gone from list");
+		assert.ok(list.find((r) => r.sessionId === "w1"), "wild agent still listed");
+		const redrop = await admin.rpc({ op: "drop", sessionId: "f1" });
+		assert.equal(redrop.data.ok, true);
 
 		// old nouns are dead on the wire
 		for (const dead of ["create", "restart"]) {

@@ -11,7 +11,7 @@
 //       SAME doors a human REPL would use, so a worker never knows who steers it
 //     · reconnect + heartbeat (the daemon dies? we come back)
 //     · tools per mode: peer (agents_list/agents_get/send/listen/control),
-//       admin (+proc/task/kill/broadcast). worker gets none — it just reports.
+//       admin (+proc/task/drop/broadcast). worker gets none — it just reports.
 //
 //   wireSwarm(agent, opts) — the BOOT flow, verified: restore → install storage →
 //   re-key → join. One call instead of a paragraph.
@@ -72,6 +72,9 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 	let registered = false;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	/** Dropped ≠ disconnected: a drop tears down and stays gone until a
+	 *  deliberate re-register (fresh wireSwarm/register clears it). */
+	let dropped = false;
 	let attempt = 0;
 	let seq = 0;
 	const pending = new Map<string, Pending>();
@@ -144,6 +147,14 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					else if (a === "wake") agent.wake();
 				}
 				return;
+			case "drop":
+				teardown();
+				dropped = true;
+				agent.emit("swarm/dropped", {
+					type: "swarm/dropped",
+					reason: frame.reason ?? "dropped",
+				});
+				return;
 			case "result":
 				{
 					const id = frame.id;
@@ -185,7 +196,34 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		}
 	}
 
+	function teardown(): void {
+		if (reconnectTimer) {
+			clearTimeout(reconnectTimer);
+			reconnectTimer = undefined;
+		}
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = undefined;
+		}
+		for (const [, p] of pending) {
+			clearTimeout(p.timer);
+			p.reject(new Error("swarm dropped"));
+		}
+		pending.clear();
+		if (ws) {
+			try {
+				ws.terminate();
+			} catch {
+				/* ignore */
+			}
+			ws = undefined;
+		}
+		connected = false;
+		registered = false;
+	}
+
 	function scheduleReconnect(agent: GodObject): void {
+		if (dropped) return;
 		if (reconnectTimer) return;
 		connected = false;
 		registered = false;
@@ -226,7 +264,8 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 				p.reject(new Error("swarm connection closed"));
 			}
 			pending.clear();
-			scheduleReconnect(agent);
+			// a dropped agent stays gone; a plain disconnect retries
+			if (!dropped) scheduleReconnect(agent);
 		});
 	}
 
@@ -376,9 +415,9 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		if (mode === "admin") {
 			defs.push(
 				{
-					name: "swarm_kill",
+					name: "swarm_drop",
 					description:
-						"Terminate signal to one loop: sends it a stop control, then its socket drops. The process itself is untouched.",
+						"Remove one agent from the swarm: its socket closes and its registry entry is deleted. Idempotent — dropping a ghost succeeds silently. The dropped agent tears down and never reconnects until it deliberately re-registers.",
 					inputSchema: {
 						type: "object",
 						properties: { sessionId: { type: "string" } },
@@ -386,7 +425,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
-							await rpc({ op: "kill", sessionId: String(p.sessionId) }),
+							await rpc({ op: "drop", sessionId: String(p.sessionId) }),
 							null,
 							2,
 						),
@@ -593,6 +632,8 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		id,
 
 		install(agent) {
+			// manual re-register (fresh wireSwarm/install) clears the dropped flag
+			dropped = false;
 			// report filters — the worker's voices, forwarded while connected
 			for (const name of STREAM_EVENTS)
 				agent.addFilter(reportFilter(name) as never);

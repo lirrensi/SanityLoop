@@ -127,7 +127,7 @@ async function main() {
 	console.log(`[demo] worker state: ${server.api.agents.get(sid)?.state}, lastEvent: ${server.api.agents.get(sid)?.lastEvent}`);
 
 	try {
-		await admin.rpc({ op: "kill", sessionId: sid });
+		await admin.rpc({ op: "drop", sessionId: sid });
 	} catch {
 		/* already gone */
 	}

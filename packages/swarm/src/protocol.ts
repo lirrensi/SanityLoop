@@ -5,9 +5,10 @@
 // and so is the hub — frames carry voices, not memories.
 //
 //   worker → server:  register, report (stream + lifecycle), ping
-//   server → worker:  input, control (the same doors a human REPL would use)
+//   server → worker:  input, control (the same doors a human REPL would use),
+//                     drop (you are gone — teardown, never reconnect)
 //   peer   → server:  agents_list, agents_get, listen, input, control
-//   admin  → server:  everything above + proc_*/task_* ops, kill (agent signal),
+//   admin  → server:  everything above + proc_*/task_* ops, drop (agent removal),
 //                     broadcast
 // server → anyone:  welcome, event (relayed streams), result, error, pong, closed
 //
@@ -153,10 +154,11 @@ export interface ControlFrame {
 	action: "stop" | "abort" | "pause" | "wake";
 }
 
-export interface KillFrame {
-	op: "kill";
+export interface DropFrame {
+	op: "drop";
 	id?: string;
-	/** One loop identified — the daemon sends it a stop control signal. */
+	/** One agent identified — the daemon closes its socket and forgets it.
+	 *  Idempotent: dropping a ghost succeeds silently. */
 	sessionId: string;
 }
 
@@ -296,7 +298,7 @@ export type ClientFrame =
 	| TemplatesFrame
 	| InputFrame
 	| ControlFrame
-	| KillFrame
+	| DropFrame
 	| ProcStartFrame
 	| ProcSaveFrame
 	| ProcStopFrame
@@ -348,6 +350,14 @@ export interface ControlToWorkerFrame {
 	action: "stop" | "abort" | "pause" | "wake";
 }
 
+/** A drop routed TO this worker — teardown, suppress reconnect, stay gone
+ *  until a deliberate re-register. Dropped ≠ disconnected: a plain close
+ *  retries, a drop never does. */
+export interface DropToWorkerFrame {
+	op: "drop";
+	reason?: string;
+}
+
 export interface ResultFrame {
 	op: "result";
 	reqOp: string;
@@ -379,6 +389,7 @@ export type ServerFrame =
 	| EventFrame
 	| InputToWorkerFrame
 	| ControlToWorkerFrame
+	| DropToWorkerFrame
 	| ResultFrame
 	| ErrorFrame
 	| PongFrame

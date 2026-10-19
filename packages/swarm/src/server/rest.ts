@@ -12,7 +12,7 @@
 //   GET    /api/v1/agents/:id/events?limit=N  the recent-events ring
 //   GET    /api/v1/history                     every agent ever seen
 //   GET    /api/v1/templates                   spawnable templates (no mode)
-//   DELETE /api/v1/agents/:id                 kill = terminate signal to one loop
+//   DELETE /api/v1/agents/:id                 drop = close socket + forget the agent
 //   GET    /api/v1/processes                   process definitions
 //   POST   /api/v1/processes                   {name, file?|from?, autorestart?, prompt?} = save + fork now
 //   GET    /api/v1/processes/:name
@@ -37,7 +37,7 @@
 // mount point — `?room=` or the `X-Swarm-Room` header (default "global" = see
 // everything). Every route filters through the same prefix check: an ancestor
 // sees its descendants; sideways and upward: invisible — and an agent you
-// can't see doesn't exist (404), can't be steered, and can't be killed.
+// can't see doesn't exist (404), can't be steered, and can't be dropped.
 //
 // input/listen stay WS-only where they are about streams; input is here because
 // steering a worker is fleet management too. Auth: `Authorization: Bearer
@@ -250,7 +250,7 @@ export function handleRest(
 				}
 				if (method === "DELETE") {
 					if (!need("admin")) return;
-					return json(res, 200, opts.api.agents.kill(id, mount));
+					return json(res, 200, opts.api.agents.drop(id, mount));
 				}
 				return fail(res, 405, "method not allowed");
 			}

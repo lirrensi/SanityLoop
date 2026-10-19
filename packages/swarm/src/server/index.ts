@@ -121,7 +121,7 @@ interface Connection {
 }
 
 /** A mirror's live wire back to the daemon it came from. Mirrors route
- *  input/control/kill through this — the remote's tokens decide. */
+ *  input/control/drop through this — the remote's tokens decide. */
 export type MirrorForward = (frame: Record<string, unknown>) => void;
 
 /** Agents only: whoever joined. No pid, no spawn flag — a process/task
@@ -205,8 +205,8 @@ const PERMS: Record<SwarmRole, Set<string>> = {
 		"templates",
 		"input",
 		"control",
-		// kill = terminate signal to ONE loop (never a process murder)
-		"kill",
+	// drop = server-side removal of ONE agent (close socket + delete entry)
+	"drop",
 		"proc_start",
 		"proc_save",
 		"proc_stop",
@@ -243,9 +243,11 @@ export interface AgentApi {
 		under?: string;
 	}): AgentInfo[];
 	get(sessionId: string, under?: string): AgentInfo | null;
-	/** Terminate signal to one loop: a stop control to its socket, then the
-	 *  socket drops. The process itself is untouched (phase 2 owns shutdown). */
-	kill(sessionId: string, under?: string): { ok: boolean; sessionId: string };
+	/** Server-side removal of one agent: send it a drop frame (so the join
+	 *  extension tears down without reconnecting), close its socket, delete
+	 *  the registry entry. Idempotent: dropping a ghost succeeds silently.
+	 *  Wild, owned, already-gone — all the same door. */
+	drop(sessionId: string, under?: string): { ok: boolean; sessionId: string };
 }
 
 export interface ProcessApi {
@@ -267,7 +269,7 @@ export interface ProcessApi {
 	remove(name: string): { ok: boolean; name: string };
 	/** Flip the autorestart policy (PM2 owns enforcement). */
 	setAutorestart(name: string, autorestart: boolean): { ok: boolean; name: string };
-	/** Fresh fork under the same name; optional prompt delivered on re-register. Async: kill, then refork. */
+	/** Fresh fork under the same name; optional prompt delivered on re-register. Async: stop, then refork. */
 	restart(name: string, opts?: { prompt?: string }): Promise<{ ok: boolean; name: string; sessionId?: string; pid?: number }>;
 }
 
@@ -830,25 +832,32 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				return info(e);
 			},
 
-			kill(sessionId, under) {
+			drop(sessionId, under) {
 				const e = resolve(sessionId);
-				if (!e) return { ok: false, sessionId };
-				if (under && !visible(under, e.room)) return { ok: false, sessionId };
+				// idempotent: dropping a ghost succeeds silently
+				if (!e) return { ok: true, sessionId };
+				if (under && !visible(under, e.room)) return { ok: true, sessionId };
 				if (e.origin === "mirrored") {
-					// authority stays home — the remote daemon decides if it may die
-					e.forward?.({ op: "kill", sessionId: e.sessionId });
+					// authority stays home — the remote daemon decides; we follow
+					// by forgetting our mirror (next sync re-adds it if still live).
+					e.forward?.({ op: "drop", sessionId: e.sessionId });
+					const key = addressOf(swarmName, e.room, e.sessionId);
+					registry.delete(key);
+					if (bySessionId.get(e.sessionId) === key) bySessionId.delete(e.sessionId);
 					return { ok: true, sessionId: e.sessionId };
 				}
-				// terminate signal to the one loop, then the socket drops.
-				// The process itself is untouched — wild or forked, killing a
-				// process is processes.stop's job, never the agent door's.
+				// server-side fact, zero agent cooperation needed: tell it it is
+				// dropped (so the join extension tears down without reconnecting),
+				// close the socket, delete the entry. Wild or forked — the
+				// process itself is untouched; that is processes.stop's job.
+				const key = addressOf(swarmName, e.room, e.sessionId);
 				if (e.conn) {
-					send(e.conn, { op: "control", action: "stop" });
+					send(e.conn, { op: "drop" });
 					e.conn.ws.close();
-					e.status = "offline";
 					e.conn = undefined;
-					e.lastSeen = Date.now();
 				}
+				registry.delete(key);
+				if (bySessionId.get(e.sessionId) === key) bySessionId.delete(e.sessionId);
 				return { ok: true, sessionId: e.sessionId };
 			},
 		},
@@ -1429,9 +1438,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					else result(conn, frame, "control", r);
 				}
 				return;
-			case "kill":
-				if (!hasPerm(conn, "kill")) break;
-				result(conn, frame, "kill", api.agents.kill(frame.sessionId));
+			case "drop":
+				if (!hasPerm(conn, "drop")) break;
+				result(conn, frame, "drop", api.agents.drop(frame.sessionId, conn.room));
 				return;
 			case "proc_start":
 				if (!hasPerm(conn, "proc_start")) break;

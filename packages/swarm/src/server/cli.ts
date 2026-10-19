@@ -8,7 +8,7 @@
 //              [--connect ws://B [--as ALIAS]]...
 //   swarm agents [--server ws://...]
 //   swarm agents get <sessionId>               [--server ws://...]
-//   swarm agents kill <sessionId>              [--server ws://...]  (terminate signal)
+//   swarm agents drop <sessionId>             [--server ws://...]  (close socket + forget)
 //   swarm procs list                           [--server ws://...]
 //   swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
 //   swarm procs save <name> <template|file> [--autorestart]
@@ -40,7 +40,7 @@ const HELP = `usage:
               [--name N] [--token <role>=<tok>]... [--connect ws://B [--as ALIAS]]...
   swarm agents [--server ws://H:P]
   swarm agents get <sessionId> [--server ws://H:P]
-  swarm agents kill <sessionId> [--server ws://H:P]
+  swarm agents drop <sessionId> [--server ws://H:P]
   swarm procs list [--server ws://H:P]
   swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
   swarm procs save <name> <template|file> [--autorestart]
@@ -273,7 +273,7 @@ async function main(): Promise<void> {
 						.join(", ")}`,
 				);
 			}
-			// dial every mount — failures don't kill the daemon, they log and retry
+			// dial every mount — failures don't stop the daemon, they log and retry
 			for (let i = 0; i < connects.length; i++) {
 				server.federate({
 					url: connects[i]!,
@@ -296,10 +296,10 @@ async function main(): Promise<void> {
 			} else if (sub === "get") {
 				if (!rest[0]) die(HELP);
 				printJson(await c.send({ op: "agents_get", sessionId: rest[0] }));
-			} else if (sub === "kill") {
+			} else if (sub === "drop") {
 				if (!rest[0]) die(HELP);
-				const res = (await c.send({ op: "kill", sessionId: rest[0] })) as { ok: boolean };
-				console.log(`kill: ${res.ok ? "ok" : "not found / not online"}`);
+				const res = (await c.send({ op: "drop", sessionId: rest[0] })) as { ok: boolean };
+				console.log(`drop: ${res.ok ? "ok" : "not found"}`);
 			} else {
 				die(HELP);
 			}
