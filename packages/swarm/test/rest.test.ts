@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startDaemon, WsClient, tmpHome, rmHome } from "./harness.ts";
 
-test("REST: health/workers/events/history + input/control routing; bad control action 400", async () => {
+test("REST: health/agents/events/history + input/control routing; bad control action 400", async () => {
 	const home = tmpHome();
 	const server = await startDaemon({ home });
 	const base = `http://127.0.0.1:${server.port}/api/v1`;
@@ -22,20 +22,20 @@ test("REST: health/workers/events/history + input/control routing; bad control a
 		assert.equal(health.ok, true);
 		assert.equal(health.online, 1);
 
-		const workers = await (await fetch(base + "/workers")).json();
-		assert.ok(workers.find((r: any) => r.sessionId === "w1"));
+		const agents = await (await fetch(base + "/agents")).json();
+		assert.ok(agents.find((r: { sessionId: string }) => r.sessionId === "w1"));
 
-		const one = await (await fetch(base + "/workers/w1")).json();
+		const one = await (await fetch(base + "/agents/w1")).json();
 		assert.equal(one.sessionId, "w1");
 
-		const events = await (await fetch(base + "/workers/w1/events?limit=10")).json();
+		const events = await (await fetch(base + "/agents/w1/events?limit=10")).json();
 		assert.ok(events.events.length >= 1);
 
 		const hist = await (await fetch(base + "/history")).json();
-		assert.ok(hist.find((r: any) => r.sessionId === "w1"));
+		assert.ok(hist.find((r: { sessionId: string }) => r.sessionId === "w1"));
 
 		const inP = w.waitFor("input");
-		const inRes = await fetch(base + "/workers/w1/input", {
+		const inRes = await fetch(base + "/agents/w1/input", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ type: "input_followup", text: "rest" }),
@@ -44,7 +44,7 @@ test("REST: health/workers/events/history + input/control routing; bad control a
 		assert.deepEqual((await inP).body, { type: "input_followup", text: "rest" });
 
 		const ctrlP = w.waitFor("control");
-		const ctrlRes = await fetch(base + "/workers/w1/control", {
+		const ctrlRes = await fetch(base + "/agents/w1/control", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ action: "pause" }),
@@ -52,12 +52,18 @@ test("REST: health/workers/events/history + input/control routing; bad control a
 		assert.equal(ctrlRes.status, 200);
 		assert.equal((await ctrlP).action, "pause");
 
-		const bad = await fetch(base + "/workers/w1/control", {
+		const bad = await fetch(base + "/agents/w1/control", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ action: "nope" }),
 		});
 		assert.equal(bad.status, 400);
+
+		// processes + tasks doors
+		const procs = await (await fetch(base + "/processes")).json();
+		assert.ok(Array.isArray(procs));
+		const tasks = await (await fetch(base + "/tasks")).json();
+		assert.ok(Array.isArray(tasks));
 	} finally {
 		w?.close();
 		rmHome(home);
@@ -70,25 +76,25 @@ test("REST auth: 401 without token, 200 peer, 403 peer on admin route, 200 admin
 	const server = await startDaemon({ home, tokens: { admin: "A", peer: "P" } });
 	const base = `http://127.0.0.1:${server.port}/api/v1`;
 	try {
-		const noAuth = await fetch(base + "/workers");
+		const noAuth = await fetch(base + "/agents");
 		assert.equal(noAuth.status, 401);
 
-		const peerOk = await fetch(base + "/workers", { headers: { authorization: "Bearer P" } });
+		const peerOk = await fetch(base + "/agents", { headers: { authorization: "Bearer P" } });
 		assert.equal(peerOk.status, 200);
 
-		// peer hitting the admin-only POST /workers
-		const peerOnAdmin = await fetch(base + "/workers", {
+		// peer hitting the admin-only POST /processes
+		const peerOnAdmin = await fetch(base + "/processes", {
 			method: "POST",
 			headers: { authorization: "Bearer P", "content-type": "application/json" },
-			body: JSON.stringify({ template: "x" }),
+			body: JSON.stringify({ name: "x", from: "y" }),
 		});
 		assert.equal(peerOnAdmin.status, 403);
 
-		// admin: authorized, routes to create → unknown template → 404 (not 403)
-		const adminCreate = await fetch(base + "/workers", {
+		// admin: authorized, routes to proc_start → unknown template → 404 (not 403)
+		const adminCreate = await fetch(base + "/processes", {
 			method: "POST",
 			headers: { authorization: "Bearer A", "content-type": "application/json" },
-			body: JSON.stringify({ template: "x" }),
+			body: JSON.stringify({ name: "x", from: "y" }),
 		});
 		assert.equal(adminCreate.status, 404);
 	} finally {

@@ -60,14 +60,14 @@ test("rooms: the daemon stamps the address; a mount sees only its subtree", asyn
 		w2 = await register(url, "w2", "worker", "global/room2");
 
 		// the address is STAMPED: swarm/room/sessionId — workers never claim the swarm
-		const info1 = server.api.get("w1")!;
+		const info1 = server.api.agents.get("w1")!;
 		assert.equal(info1.room, "global/room1");
 		assert.equal(info1.address, "alpha/global/room1/w1");
 		assert.equal(info1.origin, "local");
 
 		// a peer mounted at room1 sees room1 (including itself), and NOTHING else
 		peer = await register(url, "p1", "peer", "global/room1");
-		const peerList = (await peer.rpc({ op: "list" })).data as {
+		const peerList = (await peer.rpc({ op: "agents_list" })).data as {
 			address: string;
 		}[];
 		assert.deepEqual(
@@ -76,15 +76,15 @@ test("rooms: the daemon stamps the address; a mount sees only its subtree", asyn
 		);
 
 		// 404 semantics: a room you can't see doesn't exist
-		const invisible = await peer.rpc({ op: "get", sessionId: "w2" });
+		const invisible = await peer.rpc({ op: "agents_get", sessionId: "w2" });
 		assert.equal(invisible.data, null, "w2 is invisible from the room1 mount");
-		const visibleGet = await peer.rpc({ op: "get", sessionId: "w1" });
+		const visibleGet = await peer.rpc({ op: "agents_get", sessionId: "w1" });
 		assert.equal(visibleGet.data.address, "alpha/global/room1/w1");
 
 		// an admin mounted at global sees the whole tree (filter to workers —
 		// the registry honestly lists peer/admin connections too)
 		admin = await register(url, "a1", "admin");
-		const adminList = ((await admin.rpc({ op: "list" })).data as {
+		const adminList = ((await admin.rpc({ op: "agents_list" })).data as {
 			address: string;
 			mode: string;
 		}[]).filter((r) => r.mode === "worker");
@@ -94,7 +94,7 @@ test("rooms: the daemon stamps the address; a mount sees only its subtree", asyn
 		);
 
 		// full-address targeting works alongside bare sessionIds
-		const byAddress = server.api.get("alpha/global/room2/w2")!;
+		const byAddress = server.api.agents.get("alpha/global/room2/w2")!;
 		assert.equal(byAddress.sessionId, "w2");
 
 		// malformed room paths are rejected, never guessed
@@ -167,7 +167,7 @@ test("rooms: an unnamed daemon is a hermit — but still a full local swarm", as
 		server = await startDaemon({ home }); // no name
 		const url = `ws://127.0.0.1:${server.port}`;
 		c = await register(url, "w1", "worker", "global/room1");
-		const info = server.api.get("w1")!;
+		const info = server.api.agents.get("w1")!;
 		// no swarm segment — the address is room/sessionId
 		assert.equal(info.address, "global/room1/w1");
 		// federation refuses loudly, both directions
@@ -212,22 +212,22 @@ test("federation: A dials B, mirrors its truth, forwards authority, follows it o
 		// the mirror appears under B's declared name, stamped by A —
 		// and UNDER the root room, so the default global mount sees it
 		await until(() =>
-			A!.api
+			A!.api.agents
 				.list()
 				.some((r) => r.address === "alpha/global/beta/global/shared-id"),
 		);
-		const mirror = A.api.get("alpha/global/beta/global/shared-id")!;
+		const mirror = A.api.agents.get("alpha/global/beta/global/shared-id")!;
 		assert.equal(mirror.origin, "mirrored");
-		assert.equal(mirror.spawned, false, "A never spawned it — it can't restart it");
+		assert.equal(mirror.parent, undefined, "mirrors carry no fork backlink from A\u2019s side");
 		assert.equal(mirror.room, "global/beta/global");
 		// same sessionId, different swarms → different addresses, both alive
-		assert.equal(A.api.get("alpha/global/room1/shared-id")!.origin, "local");
+		assert.equal(A.api.agents.get("alpha/global/room1/shared-id")!.origin, "local");
 
 		// state folds from the REMOTE's own reports — never invented
 		b1.send({ op: "report", event: "agentStart", payload: {} });
-		await until(() => A.api.get("alpha/global/beta/global/shared-id")!.state === "busy");
+		await until(() => A.api.agents.get("alpha/global/beta/global/shared-id")!.state === "busy");
 		b1.send({ op: "report", event: "agentSettled", payload: {} });
-		await until(() => A.api.get("alpha/global/beta/global/shared-id")!.state === "idle");
+		await until(() => A.api.agents.get("alpha/global/beta/global/shared-id")!.state === "idle");
 
 		// voices relay: an A-side admin subscribes to the MIRROR ADDRESS and
 		// receives what the B worker reports
@@ -257,11 +257,11 @@ test("federation: A dials B, mirrors its truth, forwards authority, follows it o
 		B.federate({ url: urlC });
 		await until(() =>
 			B!
-				.api.list()
+				.api.agents.list()
 				.some((r) => r.address === "beta/global/gamma/global/c1"),
 		);
 		// A only mirrors B's LOCAL workers — B's mirror of C is invisible from A
-		const aRows = A.api.list().map((r) => r.address);
+		const aRows = A.api.agents.list().map((r) => r.address);
 		assert.ok(
 			!aRows.some((addr) => addr.includes("gamma")),
 			`no transit: A saw ${aRows.join(", ")}`,
@@ -272,7 +272,7 @@ test("federation: A dials B, mirrors its truth, forwards authority, follows it o
 		await B.stop();
 		await until(() =>
 			A!
-				.api.list()
+				.api.agents.list()
 				.every(
 					(r) =>
 						!r.address.startsWith("alpha/global/beta/") || r.status === "offline",
@@ -302,7 +302,7 @@ test("federation: mounting an unnamed (hermit) daemon is refused", async () => {
 		// the mount connects, learns there is no name to stamp under, refuses
 		await new Promise((r) => setTimeout(r, 300));
 		assert.equal(
-			A.api.list().filter((r) => r.origin === "mirrored").length,
+			A.api.agents.list().filter((r) => r.origin === "mirrored").length,
 			0,
 			"nothing mirrored from a hermit",
 		);
@@ -326,7 +326,7 @@ test("federation: mount-name collisions refuse loudly", async () => {
 		await new Promise((r) => setTimeout(r, 300));
 		// mounting a daemon that claims OUR OWN name is refused — no mirror loop
 		assert.equal(
-			A.api.list().filter((r) => r.origin === "mirrored").length,
+			A.api.agents.list().filter((r) => r.origin === "mirrored").length,
 			0,
 			"own-name mount refused",
 		);

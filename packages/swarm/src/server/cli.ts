@@ -3,46 +3,58 @@
 // ONE API, MANY SURFACES: the CLI is a WS client speaking the same ops the
 // REST routes and the frames speak — same server, same tokens, same perms.
 //
-//   swarm serve [--port N] [--addr H] [--templates DIR] [--manifest FILE]
-//              [--name N] [--token admin=TOK --token peer=TOK --token worker=TOK]
-//              [--connect ws://B [--as ALIAS]]... [--resurrect]
-//   swarm create <template> [--session ID] [--prompt TEXT] [--server ws://...]
-//   swarm list    [--server ws://...]
-//   swarm get <sessionId>                        [--server ws://...]
-//   swarm events <sessionId> [--limit N]         [--server ws://...]
-//   swarm history                                [--server ws://...]
-//   swarm templates                              [--server ws://...]
-//   swarm send <sessionId> <text>                [--server ws://...]
+//   swarm serve [--port N] [--addr H] [--templates DIR] [--name N]
+//              [--token admin=TOK --token peer=TOK --token worker=TOK]
+//              [--connect ws://B [--as ALIAS]]...
+//   swarm agents [--server ws://...]
+//   swarm agents get <sessionId>               [--server ws://...]
+//   swarm agents kill <sessionId>              [--server ws://...]  (terminate signal)
+//   swarm procs list                           [--server ws://...]
+//   swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
+//   swarm procs save <name> <template|file> [--autorestart]
+//   swarm procs stop <name> | restart <name> [--prompt TEXT] | remove <name>
+//   swarm procs autorestart <name> <true|false>
+//   swarm procs get <name>
+//   swarm tasks list | define <name> <every|at|manual> [--every-ms N] [--at EPOCH] [--from ...]
+//   swarm tasks fire <name> [--prompt TEXT] | swarm tasks trigger <name> [--context TEXT] [--prompt TEXT]
+//   swarm tasks pause <name> | resume <name> | remove <name> | get <name>
+//   swarm send <sessionId> <text>              [--server ws://...]
 //   swarm control <sessionId> <stop|abort|pause|wake> [--server ws://...]
-//   swarm kill <sessionId>      [--server ws://...]
-//   swarm restart <sessionId> [--prompt TEXT]   [--server ws://...]
+//   swarm history | templates                  [--server ws://...]
 //   swarm scan [--templates DIR]
 //
 // `serve` runs the daemon in-process (it IS the daemon). The rest are clients
 // that talk to a running daemon over the wire — the same protocol the UI will
-// speak. Command the daemon to spawn an admin agent: `swarm create admin`.
+// speak. Boot resubmits every kept process whose desired state is running —
+// there is no resurrect flag; the definitions ARE the desired state.
 // ============================================================================
 import { createSwarmServer } from "./index.ts";
 import { ensureScaffold, homeLayout, loadConfig, resolveHome } from "./config.ts";
-import { Spawner } from "./spawner.ts";
+import { scanTemplates } from "./templates.ts";
 import { DEFAULT_PORT } from "../protocol.ts";
 import type { ControlAction, SwarmRole } from "../protocol.ts";
 import WebSocket from "ws";
-import { randomUUID } from "node:crypto";
 
 const HELP = `usage:
-  swarm serve [--dir HOME] [--port N] [--addr H] [--templates DIR] [--manifest FILE]
-              [--name N] [--token <role>=<tok>]... [--connect ws://B [--as ALIAS]]... [--resurrect]
-  swarm create <template> [--session ID] [--prompt TEXT] [--dir HOME] [--server ws://H:P]
-  swarm list                                  [--dir HOME] [--server ws://H:P]
-  swarm get <sessionId>                       [--dir HOME] [--server ws://H:P]
-  swarm events <sessionId> [--limit N]        [--dir HOME] [--server ws://H:P]
-  swarm history                               [--dir HOME] [--server ws://H:P]
-  swarm templates                             [--dir HOME] [--server ws://H:P]
-  swarm send <sessionId> <text>               [--dir HOME] [--server ws://H:P]
-  swarm control <sessionId> <stop|abort|pause|wake> [--dir HOME] [--server ws://H:P]
-  swarm kill <sessionId>                      [--dir HOME] [--server ws://H:P]
-  swarm restart <sessionId> [--prompt TEXT]   [--dir HOME] [--server ws://H:P]
+  swarm serve [--dir HOME] [--port N] [--addr H] [--templates DIR]
+              [--name N] [--token <role>=<tok>]... [--connect ws://B [--as ALIAS]]...
+  swarm agents [--server ws://H:P]
+  swarm agents get <sessionId> [--server ws://H:P]
+  swarm agents kill <sessionId> [--server ws://H:P]
+  swarm procs list [--server ws://H:P]
+  swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
+  swarm procs save <name> <template|file> [--autorestart]
+  swarm procs stop <name> | swarm procs restart <name> [--prompt TEXT] | swarm procs remove <name>
+  swarm procs autorestart <name> <true|false>
+  swarm procs get <name>
+  swarm tasks list [--server ws://H:P]
+  swarm tasks define <name> <every|at|manual> [--every-ms N] [--at EPOCH] [--from T] [--file F]
+  swarm tasks fire <name> [--prompt TEXT] | swarm tasks trigger <name> [--context TEXT] [--prompt TEXT]
+  swarm tasks pause <name> | swarm tasks resume <name>
+  swarm tasks remove <name> | swarm tasks get <name>
+  swarm send <sessionId> <text> [--server ws://H:P]
+  swarm control <sessionId> <stop|abort|pause|wake> [--server ws://H:P]
+  swarm history | swarm templates [--server ws://H:P]
   swarm scan [--dir HOME] [--templates DIR]
   swarm help`;
 
@@ -147,12 +159,12 @@ function client(
 	return {
 		send(frame: unknown): Promise<unknown> {
 			const id = `c${++seq}`;
-			return new Promise<unknown>((resolve, reject) => {
-				pending.set(id, { resolve, reject });
-				const go = () => ws.send(JSON.stringify({ ...(frame as object), id }));
-				if (ws.readyState === WebSocket.OPEN) go();
-				else queue.push(go);
-			});
+			const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+			pending.set(id, { resolve, reject });
+			const go = () => ws.send(JSON.stringify({ ...(frame as object), id }));
+			if (ws.readyState === WebSocket.OPEN) go();
+			else queue.push(go);
+			return promise;
 		},
 		close() {
 			try {
@@ -167,19 +179,27 @@ function client(
 const printJson = (data: unknown): void =>
 	console.log(JSON.stringify(data, null, 2));
 
-const printWorkerRow = (r: {
+const printAgentRow = (r: {
 	status: string;
 	state?: string;
 	sessionId: string;
 	address?: string;
 	agentId: string;
+	parent?: string;
 	persistent: boolean;
-	spawned: boolean;
-	lastExit?: { code: number | null; signal: string | null; stderrTail?: string };
 }): void =>
 	console.log(
-		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${(r.address ?? r.sessionId).padEnd(40)} ${r.agentId}${r.persistent ? " [persistent]" : ""}${r.spawned ? " [spawned]" : ""}${r.lastExit ? ` [exit ${r.lastExit.code ?? r.lastExit.signal ?? "?"}${r.lastExit.stderrTail ? ` — ${(r.lastExit.stderrTail.trim().split("\n").pop() ?? "").slice(0, 120)}` : ""}]` : ""}`,
+		`${r.status.padEnd(7)} ${(r.state ?? "-").padEnd(7)} ${(r.address ?? r.sessionId).padEnd(40)} ${r.agentId}${r.parent ? ` [parent ${r.parent}]` : ""}${r.persistent ? " [persistent]" : ""}`,
 	);
+
+const flag = (args: Args, key: string): string | undefined =>
+	typeof args.flags.get(key) === "string" ? (args.flags.get(key) as string) : undefined;
+
+const die = (msg: string): never => {
+	console.error(msg);
+	process.exitCode = 1;
+	throw new Error(msg);
+};
 
 async function main(): Promise<void> {
 	const argv = process.argv.slice(2);
@@ -201,8 +221,6 @@ async function main(): Promise<void> {
 					: undefined;
 			const templatesDir =
 				(args.flags.get("templates") as string) ?? layout.templatesDir;
-			const manifestPath =
-				(args.flags.get("manifest") as string) ?? layout.manifestPath;
 			const tokensRaw = flagValues(args.flags, "token");
 			const tokens: Partial<Record<SwarmRole, string>> = {};
 			for (const t of tokensRaw) {
@@ -236,8 +254,6 @@ async function main(): Promise<void> {
 				name,
 				tokens: Object.keys(tokens).length ? tokens : undefined,
 				templatesDir,
-				manifestPath,
-				resurrectOnBoot: args.flags.has("resurrect"),
 			});
 			await server.start();
 			const t =
@@ -269,48 +285,170 @@ async function main(): Promise<void> {
 			await new Promise<void>(() => {});
 			return;
 		}
-		case "create": {
-			if (!a1) {
-				console.error(HELP);
-				process.exitCode = 1;
-				return;
-			}
+		case "agents": {
+			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
-			const res = (await c.send({
-				op: "create",
-				template: a1,
-				sessionId:
-					typeof args.flags.get("session") === "string"
-						? (args.flags.get("session") as string)
-						: undefined,
-				prompt:
-					typeof args.flags.get("prompt") === "string"
-						? (args.flags.get("prompt") as string)
-						: undefined,
-			})) as { sessionId: string; pid?: number };
-			console.log(
-				`created ${res.sessionId}${res.pid ? ` (pid ${res.pid})` : ""}`,
-			);
+			if (sub === "list") {
+				const rows = (await c.send({ op: "agents_list" })) as Parameters<
+					typeof printAgentRow
+				>[0][];
+				for (const r of rows) printAgentRow(r);
+			} else if (sub === "get") {
+				if (!rest[0]) die(HELP);
+				printJson(await c.send({ op: "agents_get", sessionId: rest[0] }));
+			} else if (sub === "kill") {
+				if (!rest[0]) die(HELP);
+				const res = (await c.send({ op: "kill", sessionId: rest[0] })) as { ok: boolean };
+				console.log(`kill: ${res.ok ? "ok" : "not found / not online"}`);
+			} else {
+				die(HELP);
+			}
 			c.close();
 			return;
 		}
-		case "list": {
+		case "procs": {
+			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
-			const rows = (await c.send({ op: "list" })) as Parameters<
-				typeof printWorkerRow
-			>[0][];
-			for (const r of rows) printWorkerRow(r);
+			switch (sub) {
+				case "list":
+					printJson(await c.send({ op: "proc_list" }));
+					break;
+				case "get":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "proc_get", name: rest[0] }));
+					break;
+				case "start": {
+					const [name, src] = rest;
+					if (!name || !src) die(HELP);
+					// source = template id when it resolves, else an agent file path
+					const looksFile = src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js");
+					printJson(
+						await c.send({
+							op: "proc_start",
+							name,
+							...(looksFile ? { file: src } : { from: src }),
+							...(args.flags.has("autorestart") ? { autorestart: true } : {}),
+							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+						}),
+					);
+					break;
+				}
+				case "save": {
+					const [name, src] = rest;
+					if (!name) die(HELP);
+					const looksFile = !!src && (src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js"));
+					printJson(
+						await c.send({
+							op: "proc_save",
+							name,
+							...(src ? (looksFile ? { file: src } : { from: src }) : {}),
+							...(args.flags.has("autorestart") ? { autorestart: true } : {}),
+						}),
+					);
+					break;
+				}
+				case "stop":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "proc_stop", name: rest[0] }));
+					break;
+				case "remove":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "proc_remove", name: rest[0] }));
+					break;
+				case "restart": {
+					if (!rest[0]) die(HELP);
+					printJson(
+						await c.send({
+							op: "proc_restart",
+							name: rest[0],
+							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+						}),
+					);
+					break;
+				}
+				case "autorestart": {
+					const [name, val] = rest;
+					if (!name || (val !== "true" && val !== "false")) die(HELP);
+					printJson(
+						await c.send({ op: "proc_set_autorestart", name, autorestart: val === "true" }),
+					);
+					break;
+				}
+				default:
+					die(HELP);
+			}
 			c.close();
 			return;
 		}
-		case "get": {
-			if (!a1) {
-				console.error(HELP);
-				process.exitCode = 1;
-				return;
-			}
+		case "tasks": {
+			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
-			printJson(await c.send({ op: "get", sessionId: a1 }));
+			switch (sub) {
+				case "list":
+					printJson(await c.send({ op: "task_list" }));
+					break;
+				case "get":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "task_get", name: rest[0] }));
+					break;
+				case "define": {
+					const [name, fire] = rest;
+					if (!name || (fire !== "every" && fire !== "at" && fire !== "manual")) die(HELP);
+					const everyMs = flag(args, "every-ms") ?? flag(args, "everyMs");
+					const at = flag(args, "at");
+					const from = flag(args, "from");
+					const file = flag(args, "file");
+					printJson(
+						await c.send({
+							op: "task_define",
+							name,
+							fire,
+							...(everyMs ? { everyMs: Number(everyMs) } : {}),
+							...(at ? { at: Number(at) } : {}),
+							...(from ? { from } : {}),
+							...(file ? { file } : {}),
+						}),
+					);
+					break;
+				}
+				case "fire": {
+					if (!rest[0]) die(HELP);
+					printJson(
+						await c.send({
+							op: "task_fire",
+							name: rest[0],
+							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+						}),
+					);
+					break;
+				}
+				case "trigger": {
+					if (!rest[0]) die(HELP);
+					printJson(
+						await c.send({
+							op: "task_trigger",
+							name: rest[0],
+							...(flag(args, "context") ? { context: flag(args, "context") } : {}),
+							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+						}),
+					);
+					break;
+				}
+				case "pause":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "task_pause", name: rest[0], paused: true }));
+					break;
+				case "resume":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "task_resume", name: rest[0] }));
+					break;
+				case "remove":
+					if (!rest[0]) die(HELP);
+					printJson(await c.send({ op: "task_remove", name: rest[0] }));
+					break;
+				default:
+					die(HELP);
+			}
 			c.close();
 			return;
 		}
@@ -368,34 +506,13 @@ async function main(): Promise<void> {
 			c.close();
 			return;
 		}
-		case "kill":
-		case "restart": {
-			if (!a1) {
-				console.error(HELP);
-				process.exitCode = 1;
-				return;
-			}
-			const c = client(targetServer(args).url, opToken(args));
-			const res = (await c.send({
-				op: cmd,
-				sessionId: a1,
-				prompt:
-					cmd === "restart" && typeof args.flags.get("prompt") === "string"
-						? (args.flags.get("prompt") as string)
-						: undefined,
-			})) as { ok: boolean };
-			console.log(`${cmd}: ${res.ok ? "ok" : "not spawned / already gone"}`);
-			c.close();
-			return;
-		}
 		case "scan": {
 			const dir =
 				(args.flags.get("templates") as string) ??
 				homeLayout(resolveHome(args.flags)).templatesDir;
-			const s = new Spawner({ templatesDir: dir });
-			for (const t of s.scanTemplates()) {
+			for (const t of scanTemplates(dir)) {
 				console.log(
-					`${(t.id ?? "?").padEnd(20)} ${(t.mode ?? "worker").padEnd(7)} ${t.file} → ${t.path}${t.description ? ` — ${t.description}` : ""}`,
+					`${(t.id ?? "?").padEnd(20)} ${t.file} → ${t.path}${t.description ? ` — ${t.description}` : ""}`,
 				);
 			}
 			return;
@@ -406,7 +523,7 @@ async function main(): Promise<void> {
 	}
 }
 
-main().catch((err) => {
+void main().catch((err) => {
 	console.error(`[swarm] ${err instanceof Error ? err.message : String(err)}`);
-	process.exit(1);
+	process.exitCode ??= 1;
 });

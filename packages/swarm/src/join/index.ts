@@ -10,8 +10,8 @@
 //     · receive DOWN: input → agent.input(), control → stop/abort/pause/wake — the
 //       SAME doors a human REPL would use, so a worker never knows who steers it
 //     · reconnect + heartbeat (the daemon dies? we come back)
-//     · tools per mode: peer (list/get/send/listen/control), admin (+create/kill/
-//       restart/broadcast). worker gets none — it just reports.
+//     · tools per mode: peer (agents_list/agents_get/send/listen/control),
+//       admin (+proc/task/kill/broadcast). worker gets none — it just reports.
 //
 //   wireSwarm(agent, opts) — the BOOT flow, verified: restore → install storage →
 //   re-key → join. One call instead of a paragraph.
@@ -24,11 +24,10 @@ import type {
 	ClientFrame,
 	ServerFrame,
 	SwarmRole,
-	WorkerInfo,
+	AgentInfo,
 } from "../protocol.ts";
 
 export interface SwarmJoinOptions {
-	/** The hat: "worker" (report only) | "peer" (query+talk) | "admin" (+create/kill/broadcast). */
 	mode?: SwarmRole;
 	/** The daemon address. Default ws://127.0.0.1:5317. */
 	server?: string;
@@ -39,6 +38,8 @@ export interface SwarmJoinOptions {
 	token?: string;
 	/** Storage enabled → this session is resumable. Reported at register. */
 	persistent?: boolean;
+	/** Fork backlink — stamped by the daemon as SWARM_SPAWN_ID, echoed as parent. Workers normally leave this unset. */
+	spawnId?: string;
 	/** Heartbeat interval ms. Default 15s. */
 	heartbeatMs?: number;
 	/** Max reconnect delay ms. Default 30s. */
@@ -60,6 +61,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		room,
 		token,
 		persistent = false,
+		spawnId,
 		heartbeatMs = 15_000,
 		maxReconnectMs = 30_000,
 	} = opts;
@@ -95,6 +97,9 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 	}
 
 	function register(agent: GodObject): void {
+		// SWARM_SPAWN_ID (stamped by the daemon at fork) wins over the option —
+		// the fork backlink is the daemon's truth, not the worker's claim.
+		const envSpawn = process.env.SWARM_SPAWN_ID;
 		send({
 			op: "register",
 			sessionId: agent.id,
@@ -104,6 +109,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 			room,
 			persistent,
 			token,
+			spawnId: envSpawn || spawnId,
 		});
 	}
 
@@ -267,16 +273,16 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		if (mode === "peer" || mode === "admin") {
 			defs.push(
 				{
-					name: "swarm_list",
-					description: "List the workers in the swarm (registry snapshot).",
+					name: "swarm_agents_list",
+					description: "List the agents in the swarm (registry snapshot).",
 					inputSchema: { type: "object", properties: {} },
 					execute: async () => ({
-						answer: JSON.stringify(await rpc({ op: "list" }), null, 2),
+						answer: JSON.stringify(await rpc({ op: "agents_list" }), null, 2),
 					}),
 				},
 				{
-					name: "swarm_get",
-					description: "Get one worker's registry info by sessionId.",
+					name: "swarm_agents_get",
+					description: "Get one agent's registry info by sessionId.",
 					inputSchema: {
 						type: "object",
 						properties: { sessionId: { type: "string" } },
@@ -284,7 +290,7 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
-							await rpc({ op: "get", sessionId: String(p.sessionId) }),
+							await rpc({ op: "agents_get", sessionId: String(p.sessionId) }),
 							null,
 							2,
 						),
@@ -370,34 +376,9 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 		if (mode === "admin") {
 			defs.push(
 				{
-					name: "swarm_create",
-					description:
-						"Spawn a worker from a template (the daemon runs it). Returns { sessionId, pid }.",
-					inputSchema: {
-						type: "object",
-						properties: {
-							template: { type: "string" },
-							sessionId: { type: "string" },
-						},
-						required: ["template"],
-					},
-					execute: async (p) => ({
-						answer: JSON.stringify(
-							await rpc({
-								op: "create",
-								template: String(p.template),
-								sessionId:
-									p.sessionId !== undefined ? String(p.sessionId) : undefined,
-							}),
-							null,
-							2,
-						),
-					}),
-				},
-				{
 					name: "swarm_kill",
 					description:
-						"Kill a worker the daemon spawned. Ad-hoc workers can't be killed by the daemon.",
+						"Terminate signal to one loop: sends it a stop control, then its socket drops. The process itself is untouched.",
 					inputSchema: {
 						type: "object",
 						properties: { sessionId: { type: "string" } },
@@ -412,20 +393,169 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					}),
 				},
 				{
-					name: "swarm_restart",
+					name: "swarm_proc_start",
 					description:
-						"Restart a daemon-spawned worker: same sessionId, fresh process (resumes its storage when persistent).",
+						"Remember (creating when missing) + fork a process now. Source: from (template id) or file (agent path). Returns { name, sessionId, pid }.",
 					inputSchema: {
 						type: "object",
-						properties: { sessionId: { type: "string" } },
-						required: ["sessionId"],
+						properties: {
+							name: { type: "string" },
+							from: { type: "string" },
+							file: { type: "string" },
+							autorestart: { type: "boolean" },
+							prompt: { type: "string" },
+						},
+						required: ["name"],
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
-							await rpc({ op: "restart", sessionId: String(p.sessionId) }),
+							await rpc({
+								op: "proc_start",
+								name: String(p.name),
+								from: p.from !== undefined ? String(p.from) : undefined,
+								file: p.file !== undefined ? String(p.file) : undefined,
+								autorestart: typeof p.autorestart === "boolean" ? p.autorestart : undefined,
+								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+							}),
 							null,
 							2,
 						),
+					}),
+				},
+				{
+					name: "swarm_proc_stop",
+					description: "Murder a process's pid. Desired state → stopped.",
+					inputSchema: {
+						type: "object",
+						properties: { name: { type: "string" } },
+						required: ["name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({ op: "proc_stop", name: String(p.name) }),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_proc_restart",
+					description: "Fresh fork under the same process name.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							prompt: { type: "string" },
+						},
+						required: ["name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "proc_restart",
+								name: String(p.name),
+								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_proc_list",
+					description: "List process definitions.",
+					inputSchema: { type: "object", properties: {} },
+					execute: async () => ({
+						answer: JSON.stringify(await rpc({ op: "proc_list" }), null, 2),
+					}),
+				},
+				{
+					name: "swarm_task_define",
+					description:
+						"Create or replace a task definition. fire: every (needs everyMs) | at (needs at epoch ms) | manual.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							from: { type: "string" },
+							file: { type: "string" },
+							fire: { type: "string", enum: ["every", "at", "manual"] },
+							everyMs: { type: "number" },
+							at: { type: "number" },
+						},
+						required: ["name", "fire"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "task_define",
+								name: String(p.name),
+								from: p.from !== undefined ? String(p.from) : undefined,
+								file: p.file !== undefined ? String(p.file) : undefined,
+								fire: p.fire as never,
+								everyMs: typeof p.everyMs === "number" ? p.everyMs : undefined,
+								at: typeof p.at === "number" ? p.at : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_task_fire",
+					description: "Fork a task once through the same fork path. Returns { name, run, sessionId, pid }.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							prompt: { type: "string" },
+						},
+						required: ["name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "task_fire",
+								name: String(p.name),
+								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_task_trigger",
+					description:
+						"Manual run on the paused-immune path: forks even when paused, schedule untouched, transient context delivered as the prompt, at-most-once (busy when a claim is in flight).",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							context: { type: "string" },
+							prompt: { type: "string" },
+						},
+						required: ["name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "task_trigger",
+								name: String(p.name),
+								context: p.context !== undefined ? String(p.context) : undefined,
+								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_task_list",
+					description: "List task definitions.",
+					inputSchema: { type: "object", properties: {} },
+					execute: async () => ({
+						answer: JSON.stringify(await rpc({ op: "task_list" }), null, 2),
 					}),
 				},
 				{

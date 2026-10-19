@@ -23,8 +23,8 @@ export interface DaemonOpts {
 	tokens?: Partial<Record<SwarmRole, string>>;
 	port?: number;
 	templatesDir?: string;
-	manifestPath?: string;
-	resurrectOnBoot?: boolean;
+	processesPath?: string;
+	tasksPath?: string;
 }
 
 /** Start a daemon on a random port, bound to 127.0.0.1. */
@@ -36,8 +36,8 @@ export async function startDaemon(opts: DaemonOpts): Promise<SwarmServer> {
 		name: opts.name,
 		tokens: opts.tokens,
 		templatesDir: opts.templatesDir,
-		manifestPath: opts.manifestPath,
-		resurrectOnBoot: opts.resurrectOnBoot,
+		processesPath: opts.processesPath,
+		tasksPath: opts.tasksPath,
 	});
 	await server.start();
 	return server;

@@ -11,9 +11,10 @@ import {
 	CONTROL_ACTIONS,
 } from "../src/protocol.ts";
 
-test("parseFrame accepts a valid frame", () => {
-	const f = parseFrame(JSON.stringify({ op: "list" }));
-	assert.equal(f?.op, "list");
+test("parseFrame accepts the new nouns", () => {
+	assert.equal(parseFrame(JSON.stringify({ op: "agents_list" }))?.op, "agents_list");
+	assert.equal(parseFrame(JSON.stringify({ op: "proc_start", name: "web" }))?.op, "proc_start");
+	assert.equal(parseFrame(JSON.stringify({ op: "task_fire", name: "poll" }))?.op, "task_fire");
 });
 
 test("parseFrame rejects non-objects and unparseable text", () => {

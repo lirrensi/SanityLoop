@@ -7,21 +7,36 @@
 //
 //   GET    /api/v1                             route index (discovery)
 //   GET    /api/v1/health                      daemon self-description
-//   GET    /api/v1/workers?status=&mode=&agentId=&room=
-//   GET    /api/v1/workers/:id
-//   GET    /api/v1/workers/:id/events?limit=N  the recent-events ring
-//   GET    /api/v1/history                     every worker ever seen
-//   GET    /api/v1/templates                   spawnable templates
-//   POST   /api/v1/workers                     {template, sessionId?, prompt?}
-//   POST   /api/v1/workers/:id/input           <the input object itself>
-//   POST   /api/v1/workers/:id/control         {action: stop|abort|pause|wake}
-//   POST   /api/v1/workers/:id/restart         {prompt?}
-//   DELETE /api/v1/workers/:id                 kill
+//   GET    /api/v1/agents?status=&mode=&agentId=&room=
+//   GET    /api/v1/agents/:id
+//   GET    /api/v1/agents/:id/events?limit=N  the recent-events ring
+//   GET    /api/v1/history                     every agent ever seen
+//   GET    /api/v1/templates                   spawnable templates (no mode)
+//   DELETE /api/v1/agents/:id                 kill = terminate signal to one loop
+//   GET    /api/v1/processes                   process definitions
+//   POST   /api/v1/processes                   {name, file?|from?, autorestart?, prompt?} = save + fork now
+//   GET    /api/v1/processes/:name
+//   POST   /api/v1/processes/:name/start       {file?, from?, autorestart?, prompt?}
+//   POST   /api/v1/processes/:name/save        {file?, from?, autorestart?}
+//   POST   /api/v1/processes/:name/stop        murder the pid
+//   POST   /api/v1/processes/:name/restart      {prompt?}
+//   POST   /api/v1/processes/:name/autorestart  {autorestart}
+//   DELETE /api/v1/processes/:name             stop + forget
+//   GET    /api/v1/tasks                       task definitions
+//   POST   /api/v1/tasks                       {name, file?|from?, fire, everyMs?, at?}
+//   GET    /api/v1/tasks/:name
+//   POST   /api/v1/tasks/:name/fire            {prompt?}
+//   POST   /api/v1/tasks/:name/trigger         {context?, prompt?} — paused-immune, schedule untouched, at-most-once
+//   POST   /api/v1/tasks/:name/pause           {paused?}
+//   POST   /api/v1/tasks/:name/resume
+//   DELETE /api/v1/tasks/:name                 forget the definition
+//   POST   /api/v1/agents/:id/input            <the input object itself>
+//   POST   /api/v1/agents/:id/control          {action: stop|abort|pause|wake}
 //
 // ROOMS: the SAME visibility rule as every other door. The caller presents a
 // mount point — `?room=` or the `X-Swarm-Room` header (default "global" = see
 // everything). Every route filters through the same prefix check: an ancestor
-// sees its descendants; sideways and upward: invisible — and a worker you
+// sees its descendants; sideways and upward: invisible — and an agent you
 // can't see doesn't exist (404), can't be steered, and can't be killed.
 //
 // input/listen stay WS-only where they are about streams; input is here because
@@ -31,18 +46,19 @@
 // 127.0.0.1-bound by default).
 // ============================================================================
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { CONTROL_ACTIONS, ROOT_ROOM, normalizeRoom } from "../protocol.ts";
-import type { ControlAction, SwarmRole } from "../protocol.ts";
+import {
+	CONTROL_ACTIONS,
+	normalizeRoom,
+	type ControlAction,
+	type SwarmRole,
+} from "../protocol.ts";
 import type { FleetApi } from "./index.ts";
 
 export interface RestOptions {
 	api: FleetApi;
-	/** Per-role tokens; empty = open mode (full access — localhost door). */
-	tokens: Partial<Record<SwarmRole, string>>;
-	/** Daemon self-description for /health. */
-	meta(): { port: number; home: string; online: number; total: number; uptimeMs: number };
-	/** Route prefix. Default /api/v1. */
+	tokens?: Partial<Record<SwarmRole, string>>;
 	prefix?: string;
+	meta: () => Record<string, unknown>;
 }
 
 /** Body cap for POST routes — the door stays small. */
@@ -51,7 +67,7 @@ const MAX_BODY_BYTES = 1 << 20;
 const json = (res: ServerResponse, code: number, data: unknown): void => {
 	const body = JSON.stringify(data);
 	res.writeHead(code, {
-		"content-type": "application/json; charset=utf-8",
+		"content-type": "application/json",
 		"content-length": Buffer.byteLength(body),
 	});
 	res.end(body);
@@ -61,19 +77,20 @@ const fail = (res: ServerResponse, code: number, error: string): void =>
 	json(res, code, { error });
 
 const bearer = (req: IncomingMessage): string | undefined => {
-	const raw = req.headers.authorization;
-	if (!raw) return undefined;
-	const m = /^Bearer\s+(.+)$/i.exec(raw.trim());
-	return m ? m[1]!.trim() : undefined;
+	const h = req.headers.authorization;
+	if (!h) return undefined;
+	const m = /^Bearer\s+(.+)$/.exec(h.trim());
+	return m?.[1];
 };
 
 /** The REST identity model: the bearer token IS the role. Open mode → admin. */
 function roleForToken(opts: RestOptions, token: string | undefined): SwarmRole | null {
-	const anyTokens = Object.values(opts.tokens).some((t) => t !== undefined);
+	const tokens = opts.tokens ?? {};
+	const anyTokens = Object.values(tokens).some((t) => t !== undefined);
 	if (!anyTokens) return "admin";
 	if (!token) return null;
 	for (const role of ["admin", "peer", "worker"] as const) {
-		if (opts.tokens[role] !== undefined && opts.tokens[role] === token) return role;
+		if (tokens[role] && tokens[role] === token) return role;
 	}
 	return null;
 }
@@ -89,7 +106,7 @@ function readBody(req: IncomingMessage, cap = MAX_BODY_BYTES): Promise<string> {
 		req.on("data", (c: Buffer) => {
 			size += c.length;
 			if (size > cap) {
-				reject(new Error(`body too large (>${cap} bytes)`));
+				reject(new Error("body too large"));
 				req.destroy();
 				return;
 			}
@@ -102,29 +119,48 @@ function readBody(req: IncomingMessage, cap = MAX_BODY_BYTES): Promise<string> {
 
 /** Parse a POST body as a single JSON object with keys — the one shape we accept. */
 async function readObject(req: IncomingMessage): Promise<Record<string, unknown> | null> {
-	const text = await readBody(req);
-	if (!text.trim()) return {};
 	try {
-		const parsed = JSON.parse(text) as unknown;
+		const text = await readBody(req);
+		if (!text.trim()) return {};
+		const parsed: unknown = JSON.parse(text);
 		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+		if (Object.keys(parsed).length === 0) return null;
 		return parsed as Record<string, unknown>;
 	} catch {
 		return null;
 	}
 }
 
+const str = (v: unknown): string | undefined =>
+	typeof v === "string" && v ? v : undefined;
+
 const ROUTES = [
-	"GET    /api/v1/health",
-	"GET    /api/v1/workers?status=online|offline&mode=worker|peer|admin&agentId=&room=",
-	"POST   /api/v1/workers                      {template, sessionId?, prompt?}",
-	"GET    /api/v1/workers/:id",
-	"GET    /api/v1/workers/:id/events?limit=N",
-	"POST   /api/v1/workers/:id/input            <single object — passed through>",
-	"POST   /api/v1/workers/:id/control          {action: stop|abort|pause|wake}",
-	"POST   /api/v1/workers/:id/restart          {prompt?}",
-	"DELETE /api/v1/workers/:id",
-	"GET    /api/v1/history",
-	"GET    /api/v1/templates",
+	"GET /api/v1",
+	"GET /api/v1/health",
+	"GET /api/v1/agents",
+	"GET /api/v1/agents/:id",
+	"GET /api/v1/agents/:id/events",
+	"DELETE /api/v1/agents/:id",
+	"GET /api/v1/processes",
+	"POST /api/v1/processes",
+	"GET /api/v1/processes/:name",
+	"POST /api/v1/processes/:name/start",
+	"POST /api/v1/processes/:name/save",
+	"POST /api/v1/processes/:name/stop",
+	"POST /api/v1/processes/:name/restart",
+	"POST /api/v1/processes/:name/autorestart",
+	"DELETE /api/v1/processes/:name",
+	"GET /api/v1/tasks",
+	"POST /api/v1/tasks",
+	"GET /api/v1/tasks/:name",
+	"POST /api/v1/tasks/:name/fire",
+	"POST /api/v1/tasks/:name/trigger {context?, prompt?}",
+	"POST /api/v1/tasks/:name/pause",
+	"POST /api/v1/tasks/:name/resume",
+	"DELETE /api/v1/tasks/:name",
+	"GET /api/v1/templates",
+	"POST /api/v1/agents/:id/input",
+	"POST /api/v1/agents/:id/control",
 ] as const;
 
 /** The REST adapter. Always responds — hand it every non-upgrade request. */
@@ -186,13 +222,12 @@ export function handleRest(
 			return json(res, 200, opts.api.templates());
 		}
 
-		// ---- the fleet ----------------------------------------------------
-		if (seg[0] === "workers") {
-			// collection
+		// ---- agents -------------------------------------------------------
+		if (seg[0] === "agents") {
 			if (seg.length === 1) {
 				if (method === "GET") {
 					if (!need("peer")) return;
-					const filter: Parameters<FleetApi["list"]>[0] = {};
+					const filter: Parameters<FleetApi["agents"]["list"]>[0] = {};
 					const status = query.get("status");
 					if (status === "online" || status === "offline") filter.status = status;
 					const mode = query.get("mode");
@@ -200,41 +235,26 @@ export function handleRest(
 					const agentId = query.get("agentId");
 					if (agentId) filter.agentId = agentId;
 					filter.under = mount;
-					return json(res, 200, opts.api.list(filter));
-				}
-				if (method === "POST") {
-					if (!need("admin")) return;
-					const body = await readObject(req);
-					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
-					const template = typeof body.template === "string" ? body.template : undefined;
-					if (!template) return fail(res, 400, "missing `template`");
-					const created = opts.api.create(template, {
-						sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
-						prompt: typeof body.prompt === "string" ? body.prompt : undefined,
-					});
-					if (!created) return fail(res, 404, `unknown template: ${template}`);
-					return json(res, 200, created);
+					return json(res, 200, opts.api.agents.list(filter));
 				}
 				return fail(res, 405, "method not allowed");
 			}
 
 			const id = decodeURIComponent(seg[1]!);
 
-			// item
 			if (seg.length === 2) {
 				if (method === "GET") {
 					if (!need("peer")) return;
-					const w = opts.api.get(id, mount);
-					return w ? json(res, 200, w) : fail(res, 404, `unknown worker: ${id}`);
+					const w = opts.api.agents.get(id, mount);
+					return w ? json(res, 200, w) : fail(res, 404, `unknown agent: ${id}`);
 				}
 				if (method === "DELETE") {
 					if (!need("admin")) return;
-					return json(res, 200, opts.api.kill(id, mount));
+					return json(res, 200, opts.api.agents.kill(id, mount));
 				}
 				return fail(res, 405, "method not allowed");
 			}
 
-			// sub-resources
 			if (seg[2] === "events" && seg.length === 3 && method === "GET") {
 				if (!need("peer")) return;
 				const events = opts.api.events(
@@ -242,7 +262,7 @@ export function handleRest(
 					Number(query.get("limit") ?? 100) || 100,
 					mount,
 				);
-				return events ? json(res, 200, events) : fail(res, 404, `unknown worker: ${id}`);
+				return events ? json(res, 200, events) : fail(res, 404, `unknown agent: ${id}`);
 			}
 			if (seg[2] === "input" && seg.length === 3 && method === "POST") {
 				if (!need("peer")) return;
@@ -251,7 +271,7 @@ export function handleRest(
 					return fail(res, 400, "input must be a single JSON object with keys — passed through as-is");
 				}
 				const r = opts.api.input(id, body, mount);
-				return r ? json(res, 200, r) : fail(res, 404, `worker not online: ${id}`);
+				return r ? json(res, 200, r) : fail(res, 404, `agent not online: ${id}`);
 			}
 			if (seg[2] === "control" && seg.length === 3 && method === "POST") {
 				if (!need("peer")) return;
@@ -261,21 +281,143 @@ export function handleRest(
 					return fail(res, 400, `action must be one of: ${CONTROL_ACTIONS.join(", ")}`);
 				}
 				const r = opts.api.control(id, action as ControlAction, mount);
-				return r ? json(res, 200, r) : fail(res, 404, `worker not online: ${id}`);
+				return r ? json(res, 200, r) : fail(res, 404, `agent not online: ${id}`);
 			}
-			if (seg[2] === "restart" && seg.length === 3 && method === "POST") {
-				if (!need("admin")) return;
+		}
+
+		// ---- processes ----------------------------------------------------
+		if (seg[0] === "processes") {
+			if (!need("admin")) return;
+			if (seg.length === 1) {
+				if (method === "GET") return json(res, 200, opts.api.processes.list());
+				if (method === "POST") {
+					const body = await readObject(req);
+					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
+					const name = str(body.name);
+					if (!name) return fail(res, 400, "missing `name`");
+					const r = await opts.api.processes.start(name, {
+						file: str(body.file),
+						from: str(body.from),
+						autorestart: typeof body.autorestart === "boolean" ? body.autorestart : undefined,
+						prompt: str(body.prompt),
+					});
+					if (!r) return fail(res, 404, `unknown template/file: ${str(body.from) ?? str(body.file) ?? "(none)"}`);
+					return json(res, 200, r);
+				}
+				return fail(res, 405, "method not allowed");
+			}
+			const name = decodeURIComponent(seg[1]!);
+			if (seg.length === 2 && method === "GET") {
+				const p = opts.api.processes.get(name);
+				return p ? json(res, 200, p) : fail(res, 404, `unknown process: ${name}`);
+			}
+			if (seg.length === 2 && method === "DELETE") {
+				return json(res, 200, opts.api.processes.remove(name));
+			}
+			if (seg.length === 3 && method === "POST") {
 				const body = await readObject(req);
-				if (!body) return fail(res, 400, "body must be a single JSON object with keys");
-				const r = opts.api.restart(
-					id,
-					{ prompt: typeof body.prompt === "string" ? body.prompt : undefined },
-					mount,
-				);
-				return r.ok
-					? json(res, 200, r)
-					: fail(res, 409, `not spawned by the daemon / already gone: ${id}`);
+				if (!body && seg[2] !== "stop" && seg[2] !== "resume") {
+					return fail(res, 400, "body must be a single JSON object with keys");
+				}
+				const b = body ?? {};
+				switch (seg[2]) {
+					case "start": {
+						const r = await opts.api.processes.start(name, {
+							file: str(b.file),
+							from: str(b.from),
+							autorestart: typeof b.autorestart === "boolean" ? b.autorestart : undefined,
+							prompt: str(b.prompt),
+						});
+						if (!r) return fail(res, 404, `unknown process / missing agent file: ${name}`);
+						return json(res, 200, r);
+					}
+					case "save": {
+						const r = opts.api.processes.save(name, {
+							file: str(b.file),
+							from: str(b.from),
+							autorestart: typeof b.autorestart === "boolean" ? b.autorestart : undefined,
+						});
+						return json(res, 200, r);
+					}
+					case "stop":
+						return json(res, 200, opts.api.processes.stop(name));
+					case "restart": {
+						const r = await opts.api.processes.restart(name, { prompt: str(b.prompt) });
+						return r.ok
+							? json(res, 200, r)
+							: fail(res, 409, `unknown process / missing agent file: ${name}`);
+					}
+					case "autorestart": {
+						if (typeof b.autorestart !== "boolean") {
+							return fail(res, 400, "`autorestart` must be a boolean");
+						}
+						return json(res, 200, opts.api.processes.setAutorestart(name, b.autorestart));
+					}
+				}
 			}
+			return fail(res, 404, "no such route");
+		}
+
+		// ---- tasks --------------------------------------------------------
+		if (seg[0] === "tasks") {
+			if (!need("admin")) return;
+			if (seg.length === 1) {
+				if (method === "GET") return json(res, 200, opts.api.tasks.list());
+				if (method === "POST") {
+					const body = await readObject(req);
+					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
+					const name = str(body.name);
+					const fire = str(body.fire);
+					if (!name) return fail(res, 400, "missing `name`");
+					if (fire !== "every" && fire !== "at" && fire !== "manual") {
+						return fail(res, 400, "`fire` must be one of: every, at, manual");
+					}
+					const r = opts.api.tasks.define({
+						name,
+						file: str(body.file),
+						from: str(body.from),
+						fire,
+						everyMs: typeof body.everyMs === "number" ? body.everyMs : undefined,
+						at: typeof body.at === "number" ? body.at : undefined,
+					});
+					if (!r) return fail(res, 400, `bad task definition: ${name}`);
+					return json(res, 200, r);
+				}
+				return fail(res, 405, "method not allowed");
+			}
+			const name = decodeURIComponent(seg[1]!);
+			if (seg.length === 2 && method === "GET") {
+				const t = opts.api.tasks.get(name);
+				return t ? json(res, 200, t) : fail(res, 404, `unknown task: ${name}`);
+			}
+			if (seg.length === 2 && method === "DELETE") {
+				return json(res, 200, opts.api.tasks.remove(name));
+			}
+			if (seg.length === 3 && method === "POST") {
+				const body = await readObject(req);
+				const b = body ?? {};
+				switch (seg[2]) {
+					case "fire": {
+						const r = await opts.api.tasks.fire(name, { prompt: str(b.prompt) });
+						if (!r) return fail(res, 404, `unknown task / missing agent file / paused (use trigger): ${name}`);
+						return json(res, 200, r);
+					}
+					case "trigger": {
+						const r = await opts.api.tasks.trigger(name, { context: str(b.context), prompt: str(b.prompt) });
+						if (!r) return fail(res, 404, `unknown task / missing agent file: ${name}`);
+						if ("busy" in r && r.busy) return fail(res, 409, `task ${name} already firing (at-most-once)`);
+						return json(res, 200, r);
+					}
+					case "pause":
+						return json(res, 200, opts.api.tasks.pause(
+							name,
+							typeof b.paused === "boolean" ? b.paused : true,
+						));
+					case "resume":
+						return json(res, 200, opts.api.tasks.resume(name));
+				}
+			}
+			return fail(res, 404, "no such route");
 		}
 
 		return fail(res, 404, "no such route");

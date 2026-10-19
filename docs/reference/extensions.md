@@ -2,7 +2,7 @@
 node_type: reference
 title: The Extensions Catalog — every @sanityloop package
 status: active
-updated: 2026-10-18
+updated: 2026-10-19
 tags: [extras, catalog, reference, extensions, packages]
 confidence: decided
 links:
@@ -100,7 +100,7 @@ agent.install(createSomething({ /* opts */ }));
 | Package | Entry point | What it gives you |
 | --- | --- | --- |
 | `@sanityloop/pi-model` | `PiAdapterModel` | Model adapter riding the pi provider library (multi-provider beyond OpenAI-compatible). |
-| `@sanityloop/swarm` | `createSwarmServer()`, `wireSwarm()` / `createSwarmJoin()` | The dumb daemon hub + the join extension. Agents from anywhere join, report state, get commanded; `FleetApi` is the fleet-ops surface. Workers never belong to the hub — they answer to their own definition. |
+| `@sanityloop/swarm` | `createSwarmServer()`, `wireSwarm()` / `createSwarmJoin()` | The dumb daemon hub + the join extension. Four nouns: PROCESS (named remembered fork, PM2-supervised), TASK (named fire-and-die definition — every/at/manual — with durable exactly-once fires + paused-immune `trigger`), AGENT (whoever joined — wild or forked), TEMPLATE (spawn menu). `FleetApi` is the fleet-ops surface over WS, REST (`/api/v1`), and the CLI. Workers never belong to the hub — they answer to their own definition. |
 | `@sanityloop/subagents` | `agentAsTool`, `createSubAgents`, `runOnce`, `fork` | Sub-agents as tools: a sub-agent is just an Agent nobody ran yet — the parent delegates, results come back as tool answers. |
 
 ## Sandbox & isolation

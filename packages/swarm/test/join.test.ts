@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createSwarmJoin } from "../src/join/index.ts";
-import type { Plugin } from "@sanityloop/core";
+import type { GodObject, Plugin } from "@sanityloop/core";
 import { startDaemon, WsClient, tmpHome, rmHome } from "./harness.ts";
 import { STREAM_EVENTS, LIFECYCLE_EVENTS } from "../src/protocol.ts";
 
@@ -62,7 +62,7 @@ class FakeAgent {
 		this.woke = true;
 	}
 	install(plugin: Plugin) {
-		plugin.install(this as any);
+		plugin.install(this as unknown as GodObject);
 	}
 }
 
@@ -70,10 +70,10 @@ function findTool(a: FakeAgent, name: string) {
 	return a.tools.find((t) => t.name === name);
 }
 
-async function waitRegistered(server: any, id: string, ms = 5000): Promise<boolean> {
+async function waitRegistered(server: { api: { agents: { get(id: string): unknown } } }, id: string, ms = 5000): Promise<boolean> {
 	const deadline = Date.now() + ms;
 	while (Date.now() < deadline) {
-		if (server.api.get(id)) return true;
+		if (server.api.agents.get(id)) return true;
 		await new Promise((r) => setTimeout(r, 40));
 	}
 	return false;
@@ -99,13 +99,13 @@ test("worker-mode join: registers, adds report filters, exposes NO tools", async
 		);
 		assert.ok(agent.caps.find((c) => c.id === "swarm"));
 	} finally {
-		plugin?.uninstall(agent as any);
+		if (plugin) plugin.uninstall(agent as unknown as GodObject);
 		rmHome(home);
 		await server.stop();
 	}
 });
 
-test("admin-mode join: tools RPC against daemon (list/get/create/kill/send/control/broadcast/listen)", async () => {
+test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_start/kill/send/control/broadcast/listen)", async () => {
 	const home = tmpHome();
 	const tdir = join(home, "templates");
 	mkdirSync(tdir, { recursive: true });
@@ -128,22 +128,22 @@ test("admin-mode join: tools RPC against daemon (list/get/create/kill/send/contr
 		agent.install(plugin);
 		assert.equal(await waitRegistered(server, "admin1"), true);
 
-		// list
-		const list = JSON.parse((await findTool(agent, "swarm_list")!.execute({})).answer);
+		// agents_list
+		const list = JSON.parse((await findTool(agent, "swarm_agents_list")!.execute({})).answer);
 		assert.ok(Array.isArray(list));
-		assert.ok(list.find((r: any) => r.sessionId === "target1"));
+		assert.ok(list.find((r: { sessionId: string }) => r.sessionId === "target1"));
 
-		// get
+		// agents_get
 		const got = JSON.parse(
-			(await findTool(agent, "swarm_get")!.execute({ sessionId: "target1" })).answer,
+			(await findTool(agent, "swarm_agents_get")!.execute({ sessionId: "target1" })).answer,
 		);
 		assert.equal(got.sessionId, "target1");
 
-		// create (spawns idle fixture)
-		const created = JSON.parse(
-			(await findTool(agent, "swarm_create")!.execute({ template: "w1" })).answer,
+		// proc_start (forks idle fixture)
+		const started = JSON.parse(
+			(await findTool(agent, "swarm_proc_start")!.execute({ name: "p1", from: "w1" })).answer,
 		);
-		assert.ok(created.sessionId && typeof created.pid === "number");
+		assert.ok(started.name === "p1" && typeof started.pid === "number");
 
 		// send → target receives input
 		const inP = target.waitFor("input");
@@ -179,13 +179,21 @@ test("admin-mode join: tools RPC against daemon (list/get/create/kill/send/contr
 		}
 		assert.ok(got2, "admin received relayed swarm/event");
 
-		// kill the spawned worker
+		// kill = terminate signal: the target gets a stop control
+		const killP = target.waitFor("control");
 		const killed = JSON.parse(
-			(await findTool(agent, "swarm_kill")!.execute({ sessionId: created.sessionId })).answer,
+			(await findTool(agent, "swarm_kill")!.execute({ sessionId: "target1" })).answer,
 		);
 		assert.equal(killed.ok, true);
+		assert.equal((await killP).action, "stop");
+
+		// stop the forked process
+		const stopped = JSON.parse(
+			(await findTool(agent, "swarm_proc_stop")!.execute({ name: "p1" })).answer,
+		);
+		assert.equal(stopped.ok, true);
 	} finally {
-		plugin?.uninstall(agent as any);
+		if (plugin) plugin.uninstall(agent! as unknown as GodObject);
 		target?.close();
 		rmHome(home);
 		await server.stop();
@@ -206,7 +214,7 @@ test("join rejects a bad admin token (never registers)", async () => {
 		assert.equal(await waitRegistered(server, "adminX", 1500), false);
 		assert.equal(agent.emitted.length, 0);
 	} finally {
-		plugin?.uninstall(agent as any);
+		if (plugin) plugin.uninstall(agent as unknown as GodObject);
 		rmHome(home);
 		await server.stop();
 	}

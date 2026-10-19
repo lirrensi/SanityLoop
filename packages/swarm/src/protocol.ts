@@ -6,9 +6,17 @@
 //
 //   worker → server:  register, report (stream + lifecycle), ping
 //   server → worker:  input, control (the same doors a human REPL would use)
-//   peer   → server:  list, get, listen, input, control
-//   admin  → server:  everything above + create, kill, restart, broadcast
+//   peer   → server:  agents_list, agents_get, listen, input, control
+//   admin  → server:  everything above + proc_*/task_* ops, kill (agent signal),
+//                     broadcast
 // server → anyone:  welcome, event (relayed streams), result, error, pong, closed
+//
+// ONE API, MANY SURFACES: the daemon's ops are exposed verbatim over WS frames
+// (here), REST routes (server/rest.ts) and the CLI (a WS client). input/listen
+// stay wire-only where they belong to streams; everything else is entity CRUD.
+//
+// patched (the god-object delta) is NEVER on the wire — it is the job of the
+// worker's own storage. The swarm carries voices, not memories.
 //
 // ONE API, MANY SURFACES: the daemon's ops are exposed verbatim over WS frames
 // (here), REST routes (server/rest.ts) and the CLI (a WS client). input/listen
@@ -70,6 +78,8 @@ export interface RegisterFrame {
 	room?: string;
 	/** Optional per-role token (when the server has tokens configured). */
 	token?: string;
+	/** Backlink: which process/task/spawn forked this agent. Echoed as AgentInfo.parent. */
+	spawnId?: string;
 }
 
 export interface ReportFrame {
@@ -83,16 +93,23 @@ export interface PingFrame {
 	t: number;
 }
 
-export interface ListFrame {
+export interface AgentsListFrame {
+	op: "agents_list";
+	id?: string;
+}
+
+/** Compat alias of agents_list — the federation mount's wire (never advertised). */
+export interface DispatchListFrame {
 	op: "list";
 	id?: string;
 }
 
-export interface GetFrame {
-	op: "get";
+export interface AgentsGetFrame {
+	op: "agents_get";
 	id?: string;
 	sessionId: string;
 }
+
 
 export interface ListenFrame {
 	op: "listen";
@@ -136,30 +153,125 @@ export interface ControlFrame {
 	action: "stop" | "abort" | "pause" | "wake";
 }
 
-export interface CreateFrame {
-	op: "create";
-	id?: string;
-	/** Template id or file name (matched against the scanned templates). */
-	template: string;
-	/** Optional explicit sessionId — omit for a fresh one. */
-	sessionId?: string;
-	/** Optional first input, delivered after the worker registers. */
-	prompt?: string;
-}
-
 export interface KillFrame {
 	op: "kill";
 	id?: string;
+	/** One loop identified — the daemon sends it a stop control signal. */
 	sessionId: string;
 }
 
-export interface RestartFrame {
-	op: "restart";
+export interface ProcStartFrame {
+	op: "proc_start";
 	id?: string;
-	sessionId: string;
-	/** Optional prompt delivered after the worker re-registers. */
+	name: string;
+	file?: string;
+	from?: string;
+	prompt?: string;
+	autorestart?: boolean;
+}
+
+export interface ProcSaveFrame {
+	op: "proc_save";
+	id?: string;
+	name: string;
+	file?: string;
+	from?: string;
+	autorestart?: boolean;
+}
+
+export interface ProcStopFrame {
+	op: "proc_stop";
+	id?: string;
+	name: string;
+}
+
+export interface ProcRemoveFrame {
+	op: "proc_remove";
+	id?: string;
+	name: string;
+}
+
+export interface ProcSetAutorestartFrame {
+	op: "proc_set_autorestart";
+	id?: string;
+	name: string;
+	autorestart: boolean;
+}
+
+export interface ProcRestartFrame {
+	op: "proc_restart";
+	id?: string;
+	name: string;
 	prompt?: string;
 }
+
+export interface ProcListFrame {
+	op: "proc_list";
+	id?: string;
+}
+
+export interface ProcGetFrame {
+	op: "proc_get";
+	id?: string;
+	name: string;
+}
+
+export interface TaskDefineFrame {
+	op: "task_define";
+	id?: string;
+	name: string;
+	file?: string;
+	from?: string;
+	fire: "every" | "at" | "manual";
+	everyMs?: number;
+	at?: number;
+}
+
+export interface TaskFireFrame {
+	op: "task_fire";
+	id?: string;
+	name: string;
+	prompt?: string;
+}
+export interface TaskTriggerFrame {
+	op: "task_trigger";
+	id?: string;
+	name: string;
+	/** Transient context — delivered as the fork's prompt, never stored on the definition. */
+	context?: string;
+	prompt?: string;
+}
+
+export interface TaskPauseFrame {
+	op: "task_pause";
+	id?: string;
+	name: string;
+	paused: boolean;
+}
+
+export interface TaskResumeFrame {
+	op: "task_resume";
+	id?: string;
+	name: string;
+}
+
+export interface TaskRemoveFrame {
+	op: "task_remove";
+	id?: string;
+	name: string;
+}
+
+export interface TaskListFrame {
+	op: "task_list";
+	id?: string;
+}
+
+export interface TaskGetFrame {
+	op: "task_get";
+	id?: string;
+	name: string;
+}
+
 
 export interface BroadcastFrame {
 	op: "broadcast";
@@ -175,20 +287,34 @@ export type ClientFrame =
 	| RegisterFrame
 	| ReportFrame
 	| PingFrame
-	| ListFrame
-	| GetFrame
+	| AgentsListFrame
+	| DispatchListFrame
+	| AgentsGetFrame
 	| ListenFrame
 	| EventsFrame
 	| HistoryFrame
 	| TemplatesFrame
 	| InputFrame
 	| ControlFrame
-	| CreateFrame
 	| KillFrame
-	| RestartFrame
+	| ProcStartFrame
+	| ProcSaveFrame
+	| ProcStopFrame
+	| ProcRemoveFrame
+	| ProcSetAutorestartFrame
+	| ProcRestartFrame
+	| ProcListFrame
+	| ProcGetFrame
+	| TaskDefineFrame
+	| TaskFireFrame
+	| TaskTriggerFrame
+	| TaskPauseFrame
+	| TaskResumeFrame
+	| TaskRemoveFrame
+	| TaskListFrame
+	| TaskGetFrame
 	| BroadcastFrame;
 
-// ---------------------------------------------------------------------------
 // server → client
 // ---------------------------------------------------------------------------
 
@@ -199,7 +325,7 @@ export interface WelcomeFrame {
 	 *  Undefined when the daemon is unnamed (hermit mode — federation refused). */
 	swarm?: string;
 	/** Registry snapshot at join time. */
-	registry: WorkerInfo[];
+	registry: AgentInfo[];
 }
 
 /** A relayed stream/lifecycle event from a worker you subscribed to. */
@@ -278,17 +404,18 @@ export interface RecentEvent {
 	payload?: unknown;
 }
 
-/** What the registry exposes about a worker. */
-export interface WorkerInfo {
+/** What the registry exposes about an agent. Agents are whoever joined —
+ *  wild (no parent) or spawned (parent = process name / task fire id). */
+export interface AgentInfo {
 	sessionId: string;
 	agentId: string;
 	description?: string;
 	mode: SwarmRole;
 	persistent: boolean;
-	/** True when the daemon spawned this worker itself (restartable). */
-	spawned: boolean;
+	/** Backlink: which process/task/spawn forked this agent (absent = wild). */
+	parent?: string;
 	status: "online" | "offline";
-	/** Where in the room tree this worker lives (always set — default "global"). */
+	/** Where in the room tree this agent lives (always set — default "global"). */
 	room?: string;
 	/** Derived full address: "<swarm>/<room>/<sessionId>" (unnamed daemon: "<room>/<sessionId>").
 	 *  Display + resolution — the registry key, never stored as payload truth. */
@@ -297,16 +424,16 @@ export interface WorkerInfo {
 	origin?: "local" | "mirrored";
 	/** Derived runtime activity — the "running status". */
 	state?: WorkerState;
-	/** The last voice the daemon heard from this worker. */
+	/** The last voice the daemon heard from this agent. */
 	lastEvent?: SwarmEvent;
 	lastEventAt?: number;
 	stats?: WorkerStats;
-	pid?: number;
 	lastSeen: number;
-	/** How this worker's spawned child last died (exit code + stderr tail) —
-	 *  present when the daemon spawned it and the child has exited since. */
-	lastExit?: { code: number | null; signal: string | null; at: number; stderrTail?: string };
 }
+
+/** Legacy alias — AgentInfo renamed from WorkerInfo. Kept for the untouched
+ *  federation door (federate.ts) until phase 2 reshapes mirrors. */
+export type WorkerInfo = AgentInfo;
 
 /** The control actions a peer/admin may send a worker. */
 export const CONTROL_ACTIONS = ["stop", "abort", "pause", "wake"] as const;

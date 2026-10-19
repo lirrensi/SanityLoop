@@ -4,10 +4,12 @@
 //
 //   ~/.sanity/swarm/              the default home — the one daemon per system
 //   ├── config.json               the daemon's declared identity (written at serve)
-//   ├── fleet.json                spawn recipes — what it launched (resurrectable)
+//   ├── processes.json            process definitions — named remembered forks
+//   ├── tasks.json                task definitions — named fire-and-die schedules
 //   ├── templates/                templates it can spawn (scanned at boot)
-//   └── sessions/                 spawned workers' session storage
-//
+//   ├── sessions/                 spawned workers' session storage
+//   ├── tasks/                    task working scratch (scaffolded; phase 2+ owns use)
+//   └── pm2/                      reserved for phase 2 (empty until then)
 // Isolation = a different directory: `swarm serve --dir /elsewhere --port 6123`
 // is a completely separate swarm (own config, own templates, own sessions).
 // Resolution order: --dir flag > $SWARM_HOME > the default.
@@ -85,10 +87,12 @@ export function writeConfig(cfg: SwarmConfig): void {
 	);
 }
 
-/** Create the home scaffold (templates/ + sessions/) if missing. */
+/** Create the home scaffold (templates/ + sessions/ + tasks/ + pm2/) if missing. */
 export function ensureScaffold(home: string): void {
 	mkdirSync(join(home, "templates"), { recursive: true });
 	mkdirSync(join(home, "sessions"), { recursive: true });
+	mkdirSync(join(home, "tasks"), { recursive: true });
+	mkdirSync(join(home, "pm2"), { recursive: true });
 }
 
 /**
@@ -132,11 +136,20 @@ export function ensureNodeModulesLink(home: string): void {
 export function homeLayout(home: string): {
 	templatesDir: string;
 	sessionsDir: string;
+	tasksDir: string;
+	pm2Dir: string;
+	processesPath: string;
+	tasksPath: string;
+	/** Legacy fleet.json path — read once at boot for migration, then deleted. */
 	manifestPath: string;
 } {
 	return {
 		templatesDir: join(home, "templates"),
 		sessionsDir: join(home, "sessions"),
+		tasksDir: join(home, "tasks"),
+		pm2Dir: join(home, "pm2"),
+		processesPath: join(home, "processes.json"),
+		tasksPath: join(home, "tasks.json"),
 		manifestPath: join(home, "fleet.json"),
 	};
 }

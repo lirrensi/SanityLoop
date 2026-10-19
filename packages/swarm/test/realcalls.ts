@@ -75,18 +75,18 @@ async function main() {
 	await admin.waitFor("welcome");
 
 	console.log("[demo] spawning REAL worker (will call llama.cpp @58080)...");
-	const created = (await admin.rpc({ op: "create", template: "real-worker" })).data;
+	const created = (await admin.rpc({ op: "proc_start", name: "real-worker", from: "real-worker" })).data;
 	const sid = created.sessionId;
-	console.log(`[demo] spawned session=${sid} pid=${created.pid}`);
+	console.log(`[demo] started process real-worker session=${sid} pid=${created.pid}`);
 
 	// wait for the worker to actually join
 	const joinDeadline = Date.now() + 20000;
 	while (Date.now() < joinDeadline) {
-		const i = server.api.get(sid);
+		const i = server.api.agents.get(sid);
 		if (i && i.status === "online") break;
 		await new Promise((r) => setTimeout(r, 50));
 	}
-	console.log(`[demo] worker status: ${server.api.get(sid)?.status}`);
+	console.log(`[demo] worker status: ${server.api.agents.get(sid)?.status}`);
 
 	// subscribe so we receive the worker's streamed voices
 	await admin.rpc({ op: "listen", sessionId: sid, on: true });
@@ -116,7 +116,7 @@ async function main() {
 	// wait until the worker settles its turn (or 40s cap)
 	const cap = Date.now() + 40000;
 	while (Date.now() < cap) {
-		const i = server.api.get(sid);
+		const i = server.api.agents.get(sid);
 		if (i && (i.lastEvent === "agentSettled" || i.lastEvent === "turnEnd")) break;
 		await new Promise((r) => setTimeout(r, 150));
 	}
@@ -124,7 +124,7 @@ async function main() {
 
 	console.log(`\n[demo] === WORKER REPLY (real llama.cpp @58080) ===`);
 	console.log(reply || "(no streamed text captured)");
-	console.log(`[demo] worker state: ${server.api.get(sid)?.state}, lastEvent: ${server.api.get(sid)?.lastEvent}`);
+	console.log(`[demo] worker state: ${server.api.agents.get(sid)?.state}, lastEvent: ${server.api.agents.get(sid)?.lastEvent}`);
 
 	try {
 		await admin.rpc({ op: "kill", sessionId: sid });
