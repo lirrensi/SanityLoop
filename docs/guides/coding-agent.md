@@ -224,21 +224,33 @@ import { createSubAgents } from "@sanityloop/subagents";
 
 const subs = createSubAgents({
     subs: [
-        { id: "tester", description: "Runs the test suite, triages failures.", build: () => new Agent({ /* ... */ }) },
+        // the builder gets { id, kind, parent, depth } — per-child session dirs,
+        // fork slices, model picks all live here (bare `() => Agent` still works)
+        { id: "tester", description: "Runs the test suite, triages failures.", build: (ctx) => new Agent({ agentId: ctx!.id /* ... */ }) },
         { id: "fixer",  description: "Applies fixes for triaged failures.",    build: () => new Agent({ /* ... */ }) },
     ],
     concurrency: 4,                    // background slots; FIFO beyond
     // onPending: "escalate",           // child asks bubble up as proxy awaits
+    // maxDepth: 2,                     // nesting bound — deeper spawns refuse
+    // onSpawn: ({ id, agent }) => {},  // birth hook — attach filters, install storage
+    // onDone: ({ id, ok, reply }) => {}, // landing hook — every run, ok or error
 });
-agent.install(subs);                   // adds sub_spawn / sub_await / sub_steer / sub_list
+agent.install(subs);                   // sub_spawn / sub_await / sub_steer / sub_list / sub_read / sub_restart
 
-subs.instances();                      // host-side peek: who's running, what state
+subs.instances();                      // host-side peek: who's running, what state, parked gates
+subs.get("tester-1");                  // the live child Agent — filters, messages, stats
 ```
 
 The parent spawns instances, steers them (`sub_steer`), collects results
-(`sub_await`), lists the family portrait (`sub_list`). A child's parked question
-never leaks raw into the parent — THE PENDING LAW wraps it
-(`subagents/pending`), answered through one door regardless of depth.
+(`sub_await`), lists the family portrait (`sub_list`), peeks at transcripts
+(`sub_read`), restarts the ended (`sub_restart` — same id, fresh brain).
+Children message each other with their own `sibling_send` tool (`"*"` =
+broadcast). Freeze is `sub_steer { stop }`, resume is `sub_steer { text }` —
+pause and stop are the same flag; the kick restarts the heart.
+A child's parked question never leaks raw into the parent — THE PENDING LAW
+wraps it (`subagents/pending`), answered through one door regardless of depth.
+A dead child reports its death (`aborted`/`errored`/`terminated` + reason) —
+waits resolve, slots free, nothing hangs.
 
 ---
 

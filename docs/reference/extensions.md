@@ -101,7 +101,7 @@ agent.install(createSomething({ /* opts */ }));
 | --- | --- | --- |
 | `@sanityloop/pi-model` | `PiAdapterModel` | Model adapter riding the pi provider library (multi-provider beyond OpenAI-compatible). |
 | `@sanityloop/swarm` | `createSwarmServer()`, `wireSwarm()` / `createSwarmJoin()` | The dumb daemon hub + the join extension. Four nouns: PROCESS (named remembered fork, PM2-supervised), TASK (named fire-and-die definition — every/at/manual — with durable exactly-once fires + paused-immune `trigger`), AGENT (whoever joined — wild or forked), TEMPLATE (spawn menu). `FleetApi` is the fleet-ops surface over WS, REST (`/api/v1`), and the CLI. Workers never belong to the hub — they answer to their own definition. |
-| `@sanityloop/subagents` | `agentAsTool`, `createSubAgents`, `runOnce`, `fork` | Sub-agents as tools: a sub-agent is just an Agent nobody ran yet — the parent delegates, results come back as tool answers. |
+| `@sanityloop/subagents` | `agentAsTool`, `createSubAgents`, `runOnce`, `fork` | Sub-agents as tools: a sub-agent is just an Agent nobody ran yet — the parent delegates, results come back as tool answers. Manager tools: spawn/await/steer/list/read/restart; children carry `sibling_send`; builders get `{id, kind, parent, depth}`; `maxDepth` bounds nesting. |
 
 ## Sandbox & isolation
 

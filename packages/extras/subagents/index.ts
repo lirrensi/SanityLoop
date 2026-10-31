@@ -9,7 +9,7 @@
 //
 // ── MODE 2: createSubAgents({...}) ─────────────────────────────────────────
 // THE AGENT-MANAGER: persistent sub-agents that stay alive across sends.
-// Four tools (the mode dial shapes which exist):
+// Six tools (the mode dial shapes which exist):
 //   spawn { sub, text, context?, background? }  create an instance — id generated,
 //                                     ALWAYS returned. background:false blocks
 //                                     till the reply; true = fire-and-forget.
@@ -18,27 +18,25 @@
 //                                     text: delivered (running → inserted, idle →
 //                                     kickstarts, queued → seed pile). stop: gentle
 //                                     freeze + inspection, resumable. terminate: 💀.
-//   list  {}                          family portrait: id · kind · state · snippet.
+//   list  {}                          family portrait: id · kind · state · parked ·
+//                                     error · snippet.
+//   read  { id, tail? }               pull-peek: status + last N transcript lines.
+//   restart { id, text, background?, context? }  rebirth: terminate the old
+//                                     brain, rebuild fresh from the same kind
+//                                     under the SAME id, run the new task.
+//   PLUS per child: sibling_send { to, text } — child↔child mail ("*" = all).
 //
-// MODE DIAL: "sync" → spawn(blocking)+list · "async" → spawn(always bg)+await+
-// steer+list · "both" (default) → everything, spawn carries background?.
+// MODE DIAL: "sync" → spawn(blocking)+list · "async" → everything always-bg ·
+// "both" (default) → everything, spawn/restart carry background?.
 //
 // CONCURRENCY: manager-level cap on BACKGROUND runs (FIFO queue, auto-start).
 // Sync spawns bypass it (they block the caller anyway).
 //
 // TIMEOUT: optional budget for BLOCKING sends — same union as agentAsTool.
 //
-// ── THE PENDING LAW ────────────────────────────────────────────────────────
-// ONE TYPE = ONE OWNER = ONE RESOLVING LOOP. A child's parked await NEVER
-// wears its native type on the parent. Escalation wraps it:
-//   parent.pendingAwaits += { type: "subagents/pending", id: "sub:<id>:<ref>" }
-// answered ONLY via  input({ type: "subagents/answer", id, … })  — the manager
-// translates to the inner plugin's vocabulary and delivers DOWN; the sub's own
-// filter splices its own await. Gates stay home; only wrappers travel.
-//   onPending: "escalate" → the above (upstream answers through ITS door)
-//              fn(subId, item) → Input  → auto: manager answers by itself
-//              undefined                → local: frozen + visible, manual steer
-// Independent from swarm: swarm = multi-process hypervisor. This = one process.
+// NESTING: each manager sits at `depth` (default 0); its children are born
+// at depth+1. `maxDepth` refuses deeper spawns BEFORE the builder runs.
+// A nested manager passes its birth depth + 1 — the bound holds across levels.
 // ============================================================================
 
 import { Agent, EVENTS, Tool, answerText, validateToolArgs } from "@sanityloop/core";
@@ -57,8 +55,24 @@ import type {
 // SHARED PIECES
 // ============================================================================
 
-/** The builder — create + decorate + return an UN-RUN agent. */
-export type AgentBuilder = () => Agent;
+/** What the manager tells the builder about the instance being born.
+ * The builder owns per-child decisions (session dir, fork slice, model pick,
+ * depth gating) — this is the identity it needs to make them. */
+export interface SubBuildContext {
+    /** The instance id (kind-n) — stable for the instance's whole life. */
+    id: string;
+    /** The kind handle from the registry. */
+    kind: string;
+    /** The parent agent — undefined when the manager is never installed. */
+    parent: GodObject | undefined;
+    /** Nesting depth: 0 for a manager's direct children. A nested manager
+     * passes depth+1 to its own spawnInstance — see maxDepth. */
+    depth: number;
+}
+
+/** The builder — create + decorate + return an UN-RUN agent.
+ * The ctx param is optional (bare `() => Agent` builders keep working). */
+export type AgentBuilder = (ctx?: SubBuildContext) => Agent;
 
 export interface AgentAsToolOptions {
     /** The tool name the PARENT model sees (e.g. "researcher"). */
@@ -690,17 +704,48 @@ export interface CreateSubAgentsOptions {
     /** ORCHESTRATE hook — called when a sub parks and onPending === "orchestrate".
      * The orchestrator decides and answers via manager.respond(ask.id, input). */
     onAsk?: (ask: SubAgentAsk) => void;
+    /** Completion hook — fires on EVERY landing (idle ok + terminal error).
+     * The manager's own notify channel; the parent loop is never poked. */
+    onDone?: (done: SubAgentDone) => void;
+    /** Birth hook — the child's Agent ref, the moment it exists. Attach
+     * filters, install storage, read state — the host's full-expression door. */
+    onSpawn?: (spawn: SubAgentSpawn) => void;
+    /** Nesting bound — a child born at depth >= maxDepth is refused BEFORE
+     * the builder runs (spawn returns an error). Absent = unbounded. */
+    maxDepth?: number;
+    /** This manager's own depth — 0 for a top-level manager. A nested
+     * manager (installed inside a child) passes its birth depth + 1 so the
+     * bound holds across levels. Default 0. */
+    depth?: number;
     /** Translators for answering foreign gate families in escalate/auto flows.
      * Built-ins exist for "ask-question/question" and "loop-control/doom". */
     answerBuilders?: Record<string, (item: PendingAwait, raw: unknown) => Input>;
     /** The kinds — entries or bare builders (id read from fn.name). */
     subs: SubEntryLike[];
-    /** Tool name overrides. Defaults: sub_spawn / sub_await / sub_steer / sub_list. */
-    names?: Partial<Record<"spawn" | "await" | "steer" | "list", string>>;
+    /** Tool name overrides. Defaults: sub_spawn / sub_await / sub_steer / sub_list / sub_read / sub_restart. */
+    names?: Partial<Record<"spawn" | "await" | "steer" | "list" | "read" | "restart", string>>;
 }
 
 const PROXY_TYPE = "subagents/pending";
 const ANSWER_TYPE = "subagents/answer";
+
+/** Birth notice — the child's Agent ref, the moment it exists. */
+export interface SubAgentSpawn {
+    id: string;
+    kind: string;
+    /** Nesting depth of the newborn (manager depth + 1). */
+    depth: number;
+    agent: Agent;
+}
+
+/** Landing notice — one per run that settles (idle or terminal). */
+export interface SubAgentDone {
+    id: string;
+    kind: string;
+    ok: boolean;
+    reply?: string;
+    error?: string;
+}
 
 /** One line of the family portrait — `list` output / host introspection. */
 export interface SubAgentInstanceInfo {
@@ -709,11 +754,18 @@ export interface SubAgentInstanceInfo {
     description: string;
     state: string;
     lastMessage?: string;
+    /** Parked-await summary — types only, e.g. ["permission/ask"]. Absent when none parked. */
+    pending?: string[];
+    /** The last death's facts (reason/message). Set on terminal, cleared on a fresh run. */
+    lastError?: string;
 }
 
 /** The manager object: a Plugin (installable) plus the small host API. */
 export interface SubAgentsManager extends Plugin {
     instances(): SubAgentInstanceInfo[];
+    /** The live child Agent — attach filters, read messages/state/stats,
+     * install storage. Undefined for unknown ids. */
+    get(id: string): Agent | undefined;
     close(id: string): Promise<boolean>;
     closeAll(): Promise<number>;
     /** ORCHESTRATE answering door — deliver an answer input down to the sub
@@ -746,10 +798,13 @@ interface SubInstance {
     kind: string;
     description: string;
     agent: Agent;
+    depth: number;
     started: boolean;
     queued: boolean;
     usedSlot: boolean;
     send?: Deferred;
+    /** The last death's facts — set on terminal reconcile, cleared on a fresh run. */
+    lastError?: string;
     /** Await items already surfaced (proxied or auto-handled) — identity-keyed. */
     handled: Set<PendingAwait>;
 }
@@ -782,7 +837,13 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
     const concurrency = opts.concurrency ?? 4;
     const limit = opts.timeout !== undefined ? resolveTimeout("manager", opts.timeout) : undefined;
     const onPending = opts.onPending;
-    const names = { spawn: "sub_spawn", await: "sub_await", steer: "sub_steer", list: "sub_list", ...(opts.names ?? {}) };
+    const selfDepth = opts.depth ?? 0;
+    const maxDepth = opts.maxDepth;
+    if (maxDepth !== undefined && (!Number.isInteger(maxDepth) || maxDepth < 1)) {
+        throw new Error(`[subagents] maxDepth must be a positive integer (got ${maxDepth}).`);
+    }
+    const childDepth = selfDepth + 1;
+    const names = { spawn: "sub_spawn", await: "sub_await", steer: "sub_steer", list: "sub_list", read: "sub_read", restart: "sub_restart", ...(opts.names ?? {}) };
 
     if (!Array.isArray(opts.subs) || opts.subs.length === 0) {
         throw new Error("[subagents] `subs` must be a non-empty array of builders/entries.");
@@ -846,10 +907,17 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         inst.agent.input({ ...input, async: true } as Input);
     };
 
+    const dequeue = (inst: SubInstance): void => {
+        const idx = queue.findIndex((q) => q.inst === inst);
+        if (idx !== -1) queue.splice(idx, 1);
+        inst.queued = false;
+    };
+
     const pump = (): void => {
         while (queue.length > 0 && activeBackground < concurrency) {
             const next = queue.shift()!;
             next.inst.queued = false;
+            if (TERMINAL_STATES.has(next.inst.agent.loopState)) continue; // corpse — skip, never start
             startRun(next.inst, next.prompt, true, next.context);
         }
     };
@@ -862,19 +930,28 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         pump();
     };
 
-    /** Reconcile an instance after ANY lifecycle beat (its own stop-event). */
+    /** Reconcile an instance after ANY lifecycle beat (stop + death events). */
     const reconcile = (inst: SubInstance): void => {
         const a = inst.agent;
         if (TERMINAL_STATES.has(a.loopState)) {
-            inst.send?.resolve({ ok: false, error: `sub ended in "${a.loopState}"` });
-            inst.send = undefined;
+            if (inst.lastError === undefined) inst.lastError = `sub ended in "${a.loopState}"`;
+            if (inst.send !== undefined) {
+                inst.send.resolve({ ok: false, error: inst.lastError });
+                inst.send = undefined;
+                opts.onDone?.({ id: inst.id, kind: inst.kind, ok: false, error: inst.lastError });
+            }
             releaseAllProxies(inst);
             freeSlot(inst);
+            dequeue(inst);
             return;
         }
         if (landed(a)) {
-            inst.send?.resolve({ ok: true, reply: collectFinalAnswer(a.messages) ?? "" });
-            inst.send = undefined;
+            if (inst.send !== undefined) {
+                const reply = collectFinalAnswer(a.messages) ?? "";
+                inst.send.resolve({ ok: true, reply });
+                inst.send = undefined;
+                opts.onDone?.({ id: inst.id, kind: inst.kind, ok: true, reply });
+            }
             freeSlot(inst);
             return;
         }
@@ -950,19 +1027,59 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
     const watchFilterId = (inst: SubInstance) => `subagents/watch/${inst.id}`;
 
     const attachWatcher = (inst: SubInstance): void => {
-        inst.agent.addFilter({
-            event: EVENTS.stop,
-            id: watchFilterId(inst),
-            priority: 0,
-            fn: async () => {
-                reconcile(inst);
-            },
-        });
+        // The landing beat (stop) PLUS every death channel: abort() fires
+        // beforeAbort/abort, fail() fires error→beforeAbort→abort, terminate()
+        // aborts then fires beforeTerminate. stop fires on NONE of them — a
+        // watcher on stop alone leaves blocking waits hanging on a dead child.
+        // Filter ids are unique per event chain, hence the suffix.
+        // TIMING: death channels fire BEFORE loopState stamps terminal
+        // (abort/error/beforeTerminate all precede the assignment), so the
+        // reconcile rides a MICROTASK — by the time it runs, the stamp landed.
+        // The abort chain is awaited through the bus, so no extra delay: the
+        // microtask runs right after the stamping statement, never before.
+        const beats: Array<{ event: string; suffix: string }> = [
+            { event: EVENTS.stop, suffix: "stop" },
+            { event: EVENTS.abort, suffix: "abort" },
+            { event: EVENTS.error, suffix: "error" },
+            { event: EVENTS.beforeTerminate, suffix: "term" },
+        ];
+        for (const b of beats) {
+            inst.agent.addFilter({
+                event: b.event,
+                id: `${watchFilterId(inst)}/${b.suffix}`,
+                priority: 0,
+                fn: async (_ag, payload) => {
+                    captureDeath(inst, b.suffix, payload);
+                    if (b.suffix === "stop") {
+                        reconcile(inst);
+                    } else {
+                        void Promise.resolve().then(() => reconcile(inst));
+                    }
+                },
+            });
+        }
+    };
+
+    /** Death channels fire BEFORE loopState stamps terminal — capture the
+     * facts now (reason/message) so the microtask reconcile reports them. */
+    const captureDeath = (inst: SubInstance, suffix: string, payload?: { type: string; reason?: unknown; message?: unknown }): void => {
+        if (suffix === "stop") return;
+        if (inst.lastError !== undefined) return; // first death wins
+        const message = typeof payload?.message === "string" && payload.message.length > 0 ? payload.message : undefined;
+        const reason = typeof payload?.reason === "string" && payload.reason.length > 0 ? payload.reason : undefined;
+        if (suffix === "error" && message !== undefined) {
+            inst.lastError = message;
+        } else if (reason !== undefined) {
+            inst.lastError = reason;
+        } else {
+            inst.lastError = `sub ended in "${suffix === "term" ? "terminated" : "aborted"}"`;
+        }
     };
 
     const startRun = (inst: SubInstance, prompt: string, useSlot: boolean, contextN?: number): void => {
         inst.started = true;
         inst.queued = false;
+        inst.lastError = undefined; // a fresh run owns a fresh verdict
         if (useSlot) {
             inst.usedSlot = true;
             activeBackground++;
@@ -1038,10 +1155,16 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                 `[subagents] unknown kind "${kind}". Known: ${[...kinds.keys()].join(", ")}`,
             );
         }
+        if (maxDepth !== undefined && childDepth > maxDepth) {
+            throw new Error(
+                `[subagents] nesting bound reached — this manager's children would sit at depth ${childDepth}, max is ${maxDepth}.`,
+            );
+        }
         const n = (counters.get(kind) ?? 0) + 1;
         counters.set(kind, n);
         const id = `${kind}-${n}`;
-        const agent = entry.build();
+        const ctx: SubBuildContext = { id, kind, parent, depth: childDepth };
+        const agent = entry.build(ctx);
         if (!(agent instanceof Agent)) {
             throw new Error(`[subagents] kind "${kind}": builder must return an Agent instance.`);
         }
@@ -1050,17 +1173,90 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
             kind,
             description: entry.description,
             agent,
+            depth: childDepth,
             started: false,
             queued: false,
             usedSlot: false,
             handled: new Set(),
         };
+        installSiblingSend(inst);
         attachWatcher(inst);
         instances.set(id, inst);
+        opts.onSpawn?.({ id, kind, depth: childDepth, agent });
         return inst;
     };
 
-    // ---- the four tools ----
+    /** REBIRTH — rebuild the child's Agent in place (same id, same kind).
+     * The old corpse is terminated, its watchers die with it; the new Agent
+     * gets a fresh watcher + sibling door. Fresh history, fresh stats —
+     * same handle the parent already knows. */
+    const rebirth = (inst: SubInstance): Agent => {
+        const entry = kinds.get(inst.kind)!;
+        const agent = entry.build({ id: inst.id, kind: inst.kind, parent, depth: inst.depth });
+        if (!(agent instanceof Agent)) {
+            throw new Error(`[subagents] kind "${inst.kind}": builder must return an Agent instance.`);
+        }
+        inst.agent = agent;
+        inst.started = false;
+        inst.usedSlot = false;
+        inst.send = undefined;
+        inst.lastError = undefined;
+        inst.handled = new Set();
+        installSiblingSend(inst);
+        attachWatcher(inst);
+        return agent;
+    };
+
+    /** THE SIBLING DOOR — one tool per child, in its OWN tool list, so a
+     * child model can message its siblings. Same delivery as steer text
+     * (user message push, never blocks); the sender id rides as a label
+     * prefix so the sibling sees who wrote. Refuses the dead, refuses self.
+     * Not a manager/parent tool — children only. */
+    const installSiblingSend = (inst: SubInstance): void => {
+        if (inst.agent.tools.some((t) => t.name === "sibling_send")) return;
+        inst.agent.addTool(Tool.define({
+            name: "sibling_send",
+            description:
+                "Send a text message to a SIBLING sub-agent (another instance of this family). " +
+                "Never blocks — the sibling reads it on its next step. " +
+                "Use `to: \"*\"` to broadcast to every live sibling.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    to: { type: "string", description: "Sibling instance id, or \"*\" for all live siblings." },
+                    text: { type: "string", description: "The message." },
+                },
+                required: ["to", "text"],
+            },
+            execute: async (rawParams): Promise<ToolResult> => {
+                const p = (rawParams ?? {}) as { to?: unknown; text?: unknown };
+                if (typeof p.to !== "string" || p.to.length === 0) {
+                    return { answer: "sibling_send: missing \"to\".", error: true };
+                }
+                if (typeof p.text !== "string" || p.text.length === 0) {
+                    return { answer: "sibling_send: missing \"text\".", error: true };
+                }
+                const label = `[from ${inst.id}] ${p.text}`;
+                if (p.to === "*") {
+                    const targets = [...instances.values()].filter(
+                        (s) => s !== inst && !TERMINAL_STATES.has(s.agent.loopState),
+                    );
+                    for (const s of targets) s.agent.messages.push(userMessage(label));
+                    return { answer: `delivered to ${targets.length} sibling(s).`, stored: { count: targets.length } };
+                }
+                const target = instances.get(p.to);
+                if (!target) return { answer: `sibling_send: unknown sibling "${p.to}".`, error: true };
+                if (target === inst) return { answer: "sibling_send: that's you — talk to yourself with tools, not mail.", error: true };
+                if (TERMINAL_STATES.has(target.agent.loopState)) {
+                    return { answer: `sibling_send: ${p.to} ended ("${target.agent.loopState}") — cannot accept messages.`, error: true };
+                }
+                target.agent.messages.push(userMessage(label));
+                return { answer: `delivered to ${p.to}.`, stored: { to: p.to } };
+            },
+        }));
+    };
+
+    // ---- the six tools ----
     const tools: Record<string, ToolType> = {};
     const kindListText = [...kinds.entries()]
         .map(([id, k]) => `  - ${id}${k.description ? `: ${k.description}` : ""}`)
@@ -1115,8 +1311,14 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                 }
                 const wantBackground = mode === "async" ? true : mode === "sync" ? false : p.background === true;
                 const contextN = typeof p.context === "number" && p.context > 0 ? Math.floor(p.context) : undefined;
-                const inst = spawnInstance(p.sub);
-
+                let inst: SubInstance;
+                try {
+                    inst = spawnInstance(p.sub);
+                } catch (err) {
+                    // builder threw / depth bound — a tool answer, not a tool crash
+                    const msg = err instanceof Error ? err.message : String(err);
+                    return { answer: `${names.spawn}: ${msg}`, error: true };
+                }
                 if (!wantBackground) {
                     startRun(inst, p.text, false, contextN);
                     const outcome = await awaitSettled(inst);
@@ -1225,6 +1427,7 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                 const a = inst.agent;
 
                 if (p.terminate === true) {
+                    dequeue(inst);
                     await a.terminate();
                     releaseAllProxies(inst);
                     freeSlot(inst);
@@ -1265,15 +1468,131 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         tools["list"] = Tool.define({
             name: names.list,
             description:
-                "Overview of every sub-agent instance: id · kind · state · last-message snippet. Use after context loss to find who exists and who is doing what.",
+                "Overview of every sub-agent instance: id · kind · state · pending gates · last-message snippet. Use after context loss to find who exists and who is doing what.",
             executionMode: "sequential",
             inputSchema: { type: "object", properties: {} },
             execute: async (): Promise<ToolResult> => {
                 if (instances.size === 0) return { answer: "No sub-agent instances exist." };
-                const lines = [...instances.values()].map((i) =>
-                    `[${stateOf(i)}] ${i.id} · ${i.kind} — ${i.description || "(no description)"} · last: "${snippet(i.agent)}"`,
-                );
+                const lines = [...instances.values()].map((i) => {
+                    const bits = [`[${stateOf(i)}] ${i.id} · ${i.kind} — ${i.description || "(no description)"}`];
+                    if (i.agent.pendingAwaits.length > 0) {
+                        bits.push(`parked: ${i.agent.pendingAwaits.map((w) => w.type).join(", ")}`);
+                    }
+                    if (i.lastError !== undefined) bits.push(`error: ${i.lastError}`);
+                    bits.push(`last: "${snippet(i.agent)}"`);
+                    return bits.join(" · ");
+                });
                 return { answer: lines.join("\n"), stored: { count: instances.size } };
+            },
+        });
+    }
+
+    // -- read --  (sync mode spawns settle inline, so no peek surface there)
+    if (mode !== "sync") {
+        tools["read"] = Tool.define({
+            name: names.read,
+            description:
+                "Read a sub-agent's recent transcript + status: last N messages as readable lines, loop state, parked gates, death facts. Pull-peek into a live or finished instance.",
+            executionMode: "sequential",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    id: { type: "string", description: "Which instance." },
+                    tail: { type: "integer", minimum: 1, description: "Last N messages. Default 10." },
+                },
+                required: ["id"],
+            },
+            execute: async (rawParams): Promise<ToolResult> => {
+                const p = (rawParams ?? {}) as { id?: unknown; tail?: unknown };
+                if (typeof p.id !== "string") return { answer: `${names.read}: missing "id".`, error: true };
+                const inst = instances.get(p.id);
+                if (!inst) return { answer: `${names.read}: unknown instance "${p.id}".`, error: true };
+                const n = typeof p.tail === "number" && p.tail > 0 ? Math.floor(p.tail) : 10;
+                const a = inst.agent;
+                const head = [`${inst.id} · ${inst.kind} · state: ${stateOf(inst)}`];
+                if (a.pendingAwaits.length > 0) {
+                    head.push(`parked: ${a.pendingAwaits.map((w) => w.type).join(", ")}`);
+                }
+                if (inst.lastError !== undefined) head.push(`error: ${inst.lastError}`);
+                const lines = a.messages.slice(-n).map(transcriptLine);
+                const body = lines.length > 0 ? lines.join("\n") : "(no messages)";
+                return {
+                    answer: `${head.join(" · ")}\n${body}`,
+                    stored: { id: inst.id, loopState: a.loopState, messages: a.messages.length },
+                };
+            },
+        });
+    }
+
+    // -- restart --  (sync mode spawns settle inline; nothing to restart there)
+    if (mode !== "sync") {
+        tools["restart"] = Tool.define({
+            name: names.restart,
+            description:
+                "Restart a sub-agent that ENDED (idle, aborted, errored, terminated) or is stuck: terminate the old brain, rebuild it fresh from the same kind under the SAME id, and run the new task. Refuses a live running/awaiting instance — stop it first.",
+            executionMode: "sequential",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    id: { type: "string", description: "Which instance." },
+                    text: { type: "string", description: "The new task for the fresh brain." },
+                    background: { type: "boolean", description: "true: fire-and-forget — returns immediately; collect later via await. Default: block until the reply." },
+                    context: {
+                        type: "integer",
+                        minimum: 0,
+                        description: "Include the last N messages of the current conversation as ONE labeled transcript message. Omit for none.",
+                    },
+                },
+                required: ["id", "text"],
+            },
+            execute: async (rawParams): Promise<ToolResult> => {
+                const p = (rawParams ?? {}) as { id?: unknown; text?: unknown; background?: unknown; context?: unknown };
+                if (typeof p.id !== "string") return { answer: `${names.restart}: missing "id".`, error: true };
+                const inst = instances.get(p.id);
+                if (!inst) return { answer: `${names.restart}: unknown instance "${p.id}".`, error: true };
+                if (typeof p.text !== "string" || p.text.length === 0) {
+                    return { answer: `${names.restart}: missing required string parameter "text".`, error: true };
+                }
+                const live = inst.queued || inst.started
+                    ? !TERMINAL_STATES.has(inst.agent.loopState) && (inst.queued || !landed(inst.agent))
+                    : false;
+                if (live) {
+                    return {
+                        answer: `${inst.id} is still live ("${stateOf(inst)}") — stop it first; restart is for the ended or the stuck.`,
+                        error: true,
+                        stored: { id: inst.id },
+                    };
+                }
+                const contextN = typeof p.context === "number" && p.context > 0 ? Math.floor(p.context) : undefined;
+                const wantBackground = mode === "async" ? true : p.background === true;
+                // the old brain dies a clean death: terminate, release, free — then rebirth
+                dequeue(inst);
+                await inst.agent.terminate();
+                releaseAllProxies(inst);
+                freeSlot(inst);
+                let fresh: Agent;
+                try {
+                    fresh = rebirth(inst);
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    return { answer: `${names.restart}: rebirth failed — ${msg}`, error: true, stored: { id: inst.id } };
+                }
+                opts.onSpawn?.({ id: inst.id, kind: inst.kind, depth: inst.depth, agent: fresh });
+                if (!wantBackground) {
+                    startRun(inst, p.text, false, contextN);
+                    const outcome = await awaitSettled(inst);
+                    if (outcome.ok) {
+                        return { answer: outcome.reply || "(empty reply)", stored: { id: inst.id } };
+                    }
+                    return { answer: `${inst.id}: ${outcome.error}`, error: true, stored: { id: inst.id } };
+                }
+                if (activeBackground >= concurrency) {
+                    inst.queued = true;
+                    queue.push({ inst, prompt: p.text, context: contextN });
+                    return { answer: `Restarted ${inst.id} — queued (concurrency limit reached). It starts automatically as slots free.`, stored: { id: inst.id, queued: true } };
+                }
+                startRun(inst, p.text, true, contextN);
+                return { answer: `Restarted ${inst.id} in the background. Collect with ${names.await}.`, stored: { id: inst.id, queued: false } };
             },
         });
     }
@@ -1282,6 +1601,7 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
     const closeOne = async (id: string): Promise<boolean> => {
         const inst = instances.get(id);
         if (!inst) return false;
+        dequeue(inst);
         await inst.agent.terminate();
         releaseAllProxies(inst);
         freeSlot(inst);
@@ -1291,7 +1611,10 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         let n = 0;
         for (const inst of instances.values()) {
             if (TERMINAL_STATES.has(inst.agent.loopState)) continue;
+            dequeue(inst);
             await inst.agent.terminate();
+            releaseAllProxies(inst);
+            freeSlot(inst);
             n++;
         }
         for (const proxyId of [...proxyById.keys()]) releaseProxy(proxyId);
@@ -1344,7 +1667,7 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
             }
             agent.addDeclaredCapability({
                 id: "subagents",
-                description: "persistent sub-agent manager (spawn/await/steer/list)",
+                description: "persistent sub-agent manager (spawn/await/steer/list/read/restart)",
             });
         },
         uninstall(agent) {
@@ -1363,7 +1686,14 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                 description: i.description,
                 state: stateOf(i),
                 lastMessage: snippet(i.agent),
+                pending: i.agent.pendingAwaits.length > 0
+                    ? i.agent.pendingAwaits.map((w) => w.type)
+                    : undefined,
+                lastError: i.lastError,
             }));
+        },
+        get(id: string) {
+            return instances.get(id)?.agent;
         },
         async close(id: string) {
             return closeOne(id);

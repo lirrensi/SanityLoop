@@ -721,3 +721,321 @@ test("collectFinalAnswer: last assistant text wins; none → undefined", () => {
     assert.equal(collectFinalAnswer([textMessage("user", "q")]), undefined);
     assert.equal(collectFinalAnswer([]), undefined);
 });
+
+// ---------------------------------------------------------------------------
+// DEATH — a dead child reports, never hangs (reconcile watches abort/error/term)
+// ---------------------------------------------------------------------------
+
+test("manager: abort mid-flight resolves the blocking wait with the reason + frees the slot", async () => {
+    const mgr = createSubAgents({
+        concurrency: 1,
+        subs: [
+            {
+                id: "w",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("w1")]) }),
+            },
+        ],
+    });
+    const r1 = await mgr.tools["spawn"].execute({ sub: "w", text: "a", background: true }, {} as never);
+    assert.match(r1.answer!, /Started w-1/);
+    mgr.get("w-1")!.abort("test kill");
+    const out = await mgr.tools["await"].execute({ id: "w-1" }, {} as never);
+    assert.equal(out.error, true);
+    assert.match(out.answer!, /test kill/);
+    assert.equal(mgr.get("w-1")!.loopState, "aborted");
+    // the slot is free — the next background spawn starts, not queues
+    const r2 = await mgr.tools["spawn"].execute({ sub: "w", text: "b", background: true }, {} as never);
+    assert.match(r2.answer!, /Started w-2/);
+});
+
+test("manager: terminate while queued never starts a corpse — pump skips it", async () => {
+    const slowTool = {
+        name: "slow",
+        description: "takes time",
+        inputSchema: { type: "object" },
+        executionMode: "sequential",
+        execute: async () => {
+            await sleep(120);
+            return { answer: "slow done" };
+        },
+    };
+    const mgr = createSubAgents({
+        concurrency: 1,
+        subs: [
+            {
+                id: "slug",
+                build: () =>
+                    new Agent({
+                        model: new StubModel([() => toolCallTurn([callTo("slow", {})]), () => assistantTurn("A finished")]),
+                        tools: [slowTool as never],
+                    }),
+            },
+            {
+                id: "fast",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("B finished")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "slug", text: "a", background: true }, {} as never);
+    const q = await mgr.tools["spawn"].execute({ sub: "fast", text: "b", background: true }, {} as never);
+    assert.match(q.answer!, /Queued fast-1/);
+    const kill = await mgr.tools["steer"].execute({ id: "fast-1", terminate: true }, {} as never);
+    assert.match(kill.answer!, /terminated/);
+    const all = await mgr.tools["await"].execute({}, {} as never);
+    assert.match(all.answer!, /A finished/);
+    assert.doesNotMatch(all.answer!, /B finished/, "the queued corpse never ran");
+});
+
+// ---------------------------------------------------------------------------
+// BUILDER CONTEXT + HOST API — per-child expression
+// ---------------------------------------------------------------------------
+
+test("manager: builder receives {id, kind, depth}; get() exposes the live child", async () => {
+    const seen: Array<{ id: string; kind: string; depth: number }> = [];
+    const mgr = createSubAgents({
+        subs: [
+            {
+                id: "ctx",
+                build: (ctx) => {
+                    seen.push({ id: ctx!.id, kind: ctx!.kind, depth: ctx!.depth });
+                    return new Agent({ model: new StubModel([() => assistantTurn("hi")]) });
+                },
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "ctx", text: "go" }, {} as never);
+    assert.deepEqual(seen, [{ id: "ctx-1", kind: "ctx", depth: 1 }]);
+    const child = mgr.get("ctx-1");
+    assert.ok(child instanceof Agent, "host holds the live ref");
+    assert.equal(mgr.get("nope"), undefined);
+});
+
+test("manager: onSpawn/onDone fire once per birth/landing", async () => {
+    const events: string[] = [];
+    const mgr = createSubAgents({
+        onSpawn: (s) => events.push(`spawn:${s.id}:${s.depth}`),
+        onDone: (d) => events.push(`done:${d.id}:${d.ok}`),
+        subs: [
+            {
+                id: "ev",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("done")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "ev", text: "go" }, {} as never);
+    assert.deepEqual(events, ["spawn:ev-1:1", "done:ev-1:true"]);
+});
+
+test("manager: maxDepth refuses deeper spawns before the builder runs", async () => {
+    let builds = 0;
+    const mk = (depth?: number) =>
+        createSubAgents({
+            maxDepth: 1,
+            depth,
+            subs: [
+                {
+                    id: "d",
+                    build: () => {
+                        builds++;
+                        return new Agent({ model: new StubModel([() => assistantTurn("x")]) });
+                    },
+                },
+            ],
+        });
+    const top = mk();
+    const okRes = await top.tools["spawn"].execute({ sub: "d", text: "go" }, {} as never);
+    assert.equal(okRes.error, undefined, "depth 1 within maxDepth 1");
+    assert.equal(builds, 1);
+    const nested = mk(1);
+    const noRes = await nested.tools["spawn"].execute({ sub: "d", text: "go" }, {} as never);
+    assert.equal(noRes.error, true);
+    assert.match(noRes.answer!, /nesting bound/);
+    assert.equal(builds, 1, "builder never ran for the refused spawn");
+});
+
+// ---------------------------------------------------------------------------
+// READ — pull-peek into a live or finished instance
+// ---------------------------------------------------------------------------
+
+test("manager: read returns transcript tail + status; list shows parked gates", async () => {
+    const parent = new Agent({ model: new StubModel([]) });
+    const mgr = createSubAgents({
+        onPending: "escalate",
+        answerBuilders: { "test/gate": (item) => ({ type: "gate-answer", ref: item.id! }) as never },
+        subs: [
+            {
+                id: "chatter",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("the secret")]) }),
+            },
+            {
+                id: "gated",
+                build: () => {
+                    const a = new Agent({ model: new StubModel([() => assistantTurn("post-gate gold")]) });
+                    a.addFilter({
+                        event: EVENTS.beforeProviderRequest,
+                        id: "test/gate-park",
+                        priority: 0,
+                        fn: async (ag) => {
+                            if (!ag.pendingAwaits.some((w) => w.id === "gate-9")) {
+                                ag.pendingAwaits.push({ type: "test/gate", id: "gate-9", schema: null } as never);
+                            }
+                        },
+                    });
+                    a.addFilter({
+                        event: EVENTS.inputReceived,
+                        id: "test/gate-resolve",
+                        priority: 100,
+                        fn: async (ag) => {
+                            const input = ag.currentInput as { type?: string; ref?: string };
+                            if (input?.type !== "gate-answer" || input.ref !== "gate-9") return;
+                            const idx = ag.pendingAwaits.findIndex((w) => w.id === "gate-9");
+                            if (idx !== -1) ag.pendingAwaits.splice(idx, 1);
+                        },
+                    });
+                    return a;
+                },
+            },
+        ],
+    });
+    parent.install(mgr);
+    void parent.run({ startState: "idle" });
+    await mgr.tools["spawn"].execute({ sub: "chatter", text: "tell me" }, {} as never);
+    const read = await mgr.tools["read"].execute({ id: "chatter-1", tail: 5 }, {} as never);
+    assert.match(read.answer!, /the secret/);
+    assert.match(read.answer!, /state: idle/);
+    const bad = await mgr.tools["read"].execute({ id: "nope" }, {} as never);
+    assert.equal(bad.error, true);
+    // parked gate surfaces in read + list
+    await mgr.tools["spawn"].execute({ sub: "gated", text: "dangerous", background: true }, {} as never);
+    await waitUntil(() => parent.pendingAwaits.some((w) => w.type === "subagents/pending"), {
+        what: "proxy escalated onto the parent",
+    });
+    const parked = await mgr.tools["read"].execute({ id: "gated-1" }, {} as never);
+    assert.match(parked.answer!, /parked: test\/gate/);
+    const list = await mgr.tools["list"].execute({}, {} as never);
+    assert.match(list.answer!, /parked: test\/gate/);
+});
+
+// ---------------------------------------------------------------------------
+// SIBLING_SEND — child↔child mail
+// ---------------------------------------------------------------------------
+
+test("manager: sibling_send delivers labeled mail; broadcast skips the dead", async () => {
+    const mgr = createSubAgents({
+        subs: [
+            {
+                id: "a",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("a-ok")]) }),
+            },
+            {
+                id: "b",
+                build: () =>
+                    new Agent({
+                        // two turns: the spawn reply + the sibling-mail reply (mail kickstarts the idle loop)
+                        model: new StubModel([() => assistantTurn("b-ok"), () => assistantTurn("b-got-mail")]),
+                    }),
+            },
+            {
+                id: "c",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("c-ok")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "a", text: "go" }, {} as never);
+    await mgr.tools["spawn"].execute({ sub: "b", text: "go" }, {} as never);
+    await mgr.tools["spawn"].execute({ sub: "c", text: "go" }, {} as never);
+    const sender = mgr.get("a-1")!;
+    const mail = sender.tools.find((t) => t.name === "sibling_send")!;
+    assert.ok(mail, "every child carries the sibling door");
+    const one = await mail.execute({ to: "b-1", text: "hello sib" }, sender as never);
+    assert.equal(one.error, undefined);
+    assert.match(JSON.stringify(mgr.get("b-1")!.messages.at(-1)!.content), /from a-1/);
+    // mail kickstarted b's loop — let its reply land before counting it live again
+    await mgr.tools["await"].execute({ id: "b-1" }, {} as never);
+    const self = await mail.execute({ to: "a-1", text: "me" }, sender as never);
+    assert.equal(self.error, true, "self-send refuses");
+    const ghost = await mail.execute({ to: "ghost-9", text: "boo" }, sender as never);
+    assert.equal(ghost.error, true, "unknown sibling refuses");
+    await mgr.tools["steer"].execute({ id: "c-1", terminate: true }, {} as never);
+    const cast = await mail.execute({ to: "*", text: "all hands" }, sender as never);
+    assert.equal((cast.stored as { count: number }).count, 1, "broadcast skips self + the dead");
+    assert.match(JSON.stringify(mgr.get("b-1")!.messages.at(-1)!.content), /all hands/);
+});
+
+// ---------------------------------------------------------------------------
+// RESTART — rebirth under the same id
+// ---------------------------------------------------------------------------
+
+test("manager: restart rebirths an ended instance — same id, fresh brain", async () => {
+    let builds = 0;
+    const mgr = createSubAgents({
+        subs: [
+            {
+                id: "phoenix",
+                build: () => {
+                    builds++;
+                    const n = builds;
+                    return new Agent({ model: new StubModel([() => assistantTurn(`life ${n}`)]) });
+                },
+            },
+        ],
+    });
+    const first = await mgr.tools["spawn"].execute({ sub: "phoenix", text: "live" }, {} as never);
+    assert.equal(first.answer, "life 1");
+    const old = mgr.get("phoenix-1")!;
+    const re = await mgr.tools["restart"].execute({ id: "phoenix-1", text: "live again" }, {} as never);
+    assert.equal(re.error, undefined);
+    assert.equal(re.answer, "life 2");
+    assert.equal((re.stored as { id: string }).id, "phoenix-1", "same handle");
+    assert.equal(old.loopState, "terminated", "old brain terminated");
+    assert.notEqual(mgr.get("phoenix-1"), old, "new brain under the same id");
+    assert.equal(mgr.get("phoenix-1")!.messages.length, 2, "fresh history: user + assistant");
+});
+
+test("manager: restart refuses a live instance; revives an errored one", async () => {
+    const slowTool = {
+        name: "slow",
+        description: "takes time",
+        inputSchema: { type: "object" },
+        executionMode: "sequential",
+        execute: async () => {
+            await sleep(150);
+            return { answer: "slow done" };
+        },
+    };
+    const mgr = createSubAgents({
+        subs: [
+            {
+                id: "busy",
+                build: () =>
+                    new Agent({
+                        model: new StubModel([
+                            () => toolCallTurn([callTo("slow", {})]),
+                            () => assistantTurn("busy done"),
+                            () => assistantTurn("reborn done"),
+                        ]),
+                        tools: [slowTool as never],
+                    }),
+            },
+            {
+                id: "doomed",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("doomed done")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "busy", text: "work", background: true }, {} as never);
+    await waitUntil(() => mgr.get("busy-1")!.loopState === "running", { what: "child reaches running" });
+    const live = await mgr.tools["restart"].execute({ id: "busy-1", text: "nope" }, {} as never);
+    assert.equal(live.error, true);
+    assert.match(live.answer!, /still live/);
+    await mgr.tools["await"].execute({ id: "busy-1" }, {} as never);
+    // errored instance: abort it, then restart revives it under the same id
+    await mgr.tools["spawn"].execute({ sub: "doomed", text: "go", background: true }, {} as never);
+    mgr.get("doomed-1")!.abort("doom");
+    const dead = await mgr.tools["await"].execute({ id: "doomed-1" }, {} as never);
+    assert.equal(dead.error, true);
+    assert.match((await mgr.tools["list"].execute({}, {} as never)).answer!, /error: doom/);
+    const revive = await mgr.tools["restart"].execute({ id: "doomed-1", text: "again" }, {} as never);
+    assert.equal(revive.error, undefined);
+    assert.equal(revive.answer, "doomed done");
+});
