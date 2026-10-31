@@ -158,20 +158,19 @@ agent.addFilter({
     event: EVENTS.toolListChanged,
     id: "log-tool-list",
     priority: 0,
-    fn: async (agent) => {
+    fn: async (agent, payload) => {
         console.log(
-            `[filter:toolListChanged] tools now: ${agent.tools.map((t) => t.name).join(", ")}`,
+            `[filter:toolListChanged] cacheBreak=${(payload as { cacheBreak?: unknown }).cacheBreak} tools now: ${agent.tools.map((t) => t.name).join(", ")}`,
         );
     },
 });
 agent.addFilter({
-    event: EVENTS.toolUpdate,
-    id: "log-tool-update",
+    event: EVENTS.toolChanged,
+    id: "log-tool-changed",
     priority: 0,
-    fn: async (agent) => {
-        console.log(
-            `[filter:toolUpdate] a tool definition changed: ${agent.tools.map((t) => `${t.name}${t.disabled ? " (disabled)" : ""}`).join(", ")}`,
-        );
+    fn: async (_agent, payload) => {
+        const p = payload as { toolName?: string; change?: string };
+        console.log(`[filter:toolChanged] ${p.toolName}: ${p.change}`);
     },
 });
 
@@ -246,7 +245,7 @@ agent.addFilter({
             if (block)
                 block.content =
                     "You are a precise coding agent. (fragment updated after the tool!)";
-            // tool definition change — fires toolUpdate (per-tool, not list-level)
+            // tool definition change — fires big+small (toolListChanged + toolChanged)
             agent.updateTool("echo", {
                 description: "Echoes back the given text. (definition updated)",
             });

@@ -1,0 +1,28 @@
+{
+  "name": "@sanityloop/cache-trace",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.2.0",
+    "@sanityloop/util": "^0.1.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "Cache-break diagnostics — traces wire-head diff ops per provider call, each tagged with its triggering mutation."
+}

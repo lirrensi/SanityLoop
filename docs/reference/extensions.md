@@ -32,7 +32,7 @@ agent.install(createSomething({ /* opts */ }));
 | --- | --- | --- |
 | `@sanityloop/permission` | `createPermissions(config)` | Per-tool allow/ask/deny gates over the core park. Sparse tool map (`"*"` → specific, last match wins), shipped gates (`allowAll`/`askAll`/`denyAll`/`fsPathGate` workspace+blacklist policy), classic choices (`once`/`session`/`no`/`no_explain`). Approvals + a capped denial audit live in `state.permission`. Answers arrive as input `{ type: "permission/answer", ref, answer }`. |
 | `@sanityloop/inputs` | `createDefaultInputs()` | The default input vocabulary: `input_abort`, `input_stop`, `input_steer` (inserts after current tool batch), `input_followup` (inserts at landing), `request_clear` (hide history), `request_reset` (back to system-only). Install this or nothing turns inputs into messages. |
-| `@sanityloop/loop-control` | `loopControl(opts)` | Watchdogs: doom-loop detection (repeated tool failures), max-turns budget. The doctrine says a strong model needs none of it. |
+| `@sanityloop/loop-control` | `loopControl(opts)` | The resilience dial: budgets (maxTurns/maxSteps/maxTokens/maxTime/maxCost — breach refuses the money call), harden (provider retry + fallback chain + stall watchdogs via a model wrapper), tool retry, circuit breaker (disableTool + cooldown), malformed veto, doom-loop + spin guards. All default-off. |
 | `@sanityloop/keep-open` | `createKeepOpenPlugin()` | Keeps the loop breathing when it would otherwise settle (long-lived processes). |
 | `@sanityloop/quit-on-end` | `createQuitOnEndPlugin(opts)` | Exits the process when the agent lands idle (batch scripts). `mode: "terminate"` stops only this agent's heart (multi-agent hosts). `canQuit(agent)` vetoes the quit while out-of-band work (background bash jobs) is alive — fail-closed, non-terminal path only. |
 | `@sanityloop/checks` | `createChecks(...)`, `collectInto(evidence, message)` | Deterministic binary checks over the transcript — runtime guardrails and test verdicts with zero LLM (`ChecksVerdict`: passed \| failed). |
@@ -62,7 +62,7 @@ agent.install(createSomething({ /* opts */ }));
 
 | Package | Entry point | What it gives you |
 | --- | --- | --- |
-| `@sanityloop/basic-fs-tools` | `createBasicTools(opts)` | Read/write/edit file tools with truncation guards. |
+| `@sanityloop/basic-fs-tools` | `createBasicTools({ edit })` | Read/write/edit file tools with truncation guards. `edit: "simple"` (default) → exact-string `edit`; `edit: "patch"` → unified-diff `patch` in the same slot — one edit tool per agent. |
 | `@sanityloop/hash-fs-tools` | `createEditTools(opts)` | Hash-addressed edit tools — precise, conflict-safe edits. |
 | `@sanityloop/shell-tool` | `bashTool` / `createBashPlugin(opts)`, plus `globTool`, `echo` | Shell execution (Windows-first: resolves login shell/coreutils, kills process trees, accumulates output, truncates tail so errors survive). `background: {...}` adds explicit `background: true` (bg_N) + auto-background with followup delivery; companions `jobs`/`job_read`/`job_kill`/`job_wait`; plugin returns `{ jobs }` view for quit-on-end's `canQuit`. |
 | `@sanityloop/simple-todo` | `createTodoTool()` | Task-list tool writing `state.todos` — observed, restorable. |
@@ -79,9 +79,9 @@ agent.install(createSomething({ /* opts */ }));
 | `@sanityloop/snapshot` | `agentSnapshot(agent)` | The light status card builder (used by storage cards and dashboards). |
 | `@sanityloop/sentry` | `createSentryPlugin({ dsn })` | Sentry error monitoring — fatal lanes become issues with a breadcrumb trail; tool/log lanes opt in (`tools`/`logs` gates, `transport`/`beforeSend`/`flush()`). |
 | `@sanityloop/runlog` | `createRunLogPlugin(opts)` | The between-runs ledger: one install-and-forget extension that records every operation, answerable a week later. |
+| `@sanityloop/cache-trace` | `createCacheTrace(opts)` | Cache-break diagnostics — wire-head diff ops per provider call on custom `cache/break`, each tagged with its triggering mutation. |
 
 ## Persistence
-
 | Package | Entry point | What it gives you |
 | --- | --- | --- |
 | `@sanityloop/base-storage` | `jsonlSession(path)` | Folder-backed sessions: append-only JSONL tape (`{t, change}` KeyChanges) + atomic `state.json` card. `restoreInto(agent)` replays baseline+deltas; parked awaits come back. Swap the tape backend by implementing the Storage contract. |

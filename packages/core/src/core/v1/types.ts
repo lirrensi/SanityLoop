@@ -548,6 +548,16 @@ export interface GodObject extends Session {
   addTool(tool: Tool): this;
   removeTool(name: string): boolean;
   updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode" | "hidden">>): boolean;
+  /** Disable a tool — NON-DESTRUCTIVE (stays in prompt, execute is a no-op
+   * with a "currently disabled" error result). Big + small (cacheBreak: false). */
+  disableTool(name: string): boolean;
+  /** Enable a previously disabled tool. Big + small (cacheBreak: false). */
+  enableTool(name: string): boolean;
+  /** Hide a tool — out of the provider wire prompt, still callable by name.
+   * Big + small (cacheBreak: true), like add/remove. */
+  hideTool(name: string): boolean;
+  /** Show a hidden tool — back into the wire prompt. Big + small (cacheBreak: true). */
+  showTool(name: string): boolean;
   /** The tools the PROVIDER sees — everything except `hidden`. Hidden tools stay
    * callable (execute runs) but never reach context. Model adapters MUST build
    * their wire list from this, never from `tools` directly. */
@@ -557,7 +567,16 @@ export interface GodObject extends Session {
   streamSink?: StreamSink;
   /** The abort signal — live from construction; tools/models/subscribers hang here. Fires on abort(), fail(), and terminate(). */
   abortSignal: AbortSignal;
-
+  /** The model roster — every preset, driver first. Plain field (code, never
+   * serialized). Extras read presets here; hosts fill it at construction. */
+  models: ModelContract[];
+  /** Resolve a roster preset by id, index, or direct reference. Throws on miss. */
+  resolvePreset(ref: string | number | ModelContract): ModelContract;
+  /** SIDE CALL — run any preset without touching the loop (no swap, no commit,
+   * no stats). Returns the handle; `done` settles with the TurnResult. */
+  call(ref: string | number | ModelContract, messages?: Message[]): ModelCall;
+  /** Drive the given preset for EXACTLY one turn, then revert to the driver. */
+  driveOnce(ref: string | number | ModelContract): void;
   // ---- plugins (named batches of registrations, observable) ----
   install(plugin: Plugin): Promise<this>;
   /** Web-pattern alias for install() — same call, same semantics, shorter word. */
@@ -846,6 +865,10 @@ export interface ModelContract {
   stream: boolean;
   /** The context window — the compaction trigger reads this. */
   maxContext?: number;
+  /** Price card ($/1M tokens per bucket) — the adapter computes cost from the
+   * token buckets into stats.cost, so spend flows even when the provider
+   * reports none. Same seat as maxContext: model config, not loop config. */
+  prices?: ModelPrices;
   /** Runtime params — plain mutable fields, swap anytime, by any hook. */
   temperature?: number;
   maxOutputTokens?: number;
@@ -853,6 +876,41 @@ export interface ModelContract {
 
   /** THE function the runtime calls. Receives the WHOLE context. */
   callNextTurn(ctx: GodObject): Promise<TurnResult>;
+  /** Preset id — how the roster addresses this model. Auto-assigned from
+   * modelId at construction (deduped) when omitted. */
+  presetId?: string;
+  /** Abort ONE in-flight call — the call throws a stamped `attemptAborted`
+   * error, the loop continues. No id = the most recent call. False = nothing
+   * matched. Adapters mint ids synchronously at callNextTurn entry (before
+   * the first await) so callers can resolve the fresh id without racing.
+   * Adapters that don't track calls omit this. */
+  abortCall?(id?: string, reason?: unknown): boolean;
+  /** In-flight call ids, oldest first. Empty = idle. */
+  readonly inFlightCalls?: readonly string[];
+}
+
+/** A provider call's control handle — one per in-flight callNextTurn.
+ * Aborting kills THAT request (fetch cancelled, stream torn down); the loop
+ * is untouched. The loop-abort signal is the parent of every handle: killing
+ * the loop kills all calls, never the reverse. Ownership is local: whoever
+ * spawned the call owns its handle (loop / side-chain / race). */
+export interface ModelCall {
+  /** Unique per adapter instance. */
+  id: string;
+  /** Settles with the call's TurnResult (or its error). */
+  done: Promise<TurnResult>;
+  /** Abort this call with a reason (stamped onto the thrown error). */
+  abort(reason?: unknown): boolean;
+  /** ms epoch when the call started. */
+  startedAt: number;
+}
+
+/** Price card in USD per 1M tokens — input/output/cacheRead/cacheWrite. */
+export interface ModelPrices {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
 }
 
 /** A stream event emitted by the model — forwarded to the bus by the loop. */
@@ -1053,15 +1111,16 @@ export const EVENTS = {
   // compound-fragment level update — our own stuff, its own event
   fragmentUpdate: "fragmentUpdate",
 
-  // ---- tool (6) ----
+  // ---- tool (7) ----
   beforeTool: "beforeTool",
   afterTool: "afterTool",
   toolStart: "toolStart",
-  // a TOOL'S DEFINITION changed — schema/description updated, enabled/disabled.
-  // (progress during a long tool = the tool's own custom events, not this)
-  toolUpdate: "toolUpdate",
+  // one tool changed — per-tool detail: name + what flipped + before/after.
+  // Fires once per affected tool. Pair with toolListChanged (the summary).
+  toolChanged: "toolChanged",
   toolEnd: "toolEnd",
-  // the tool LIST mutated at runtime (add/remove)
+  // the tool LIST changed — big summary: added/removed/updated/visibility/
+  // availability + cacheBreak (did the wire prompt bytes change?).
   toolListChanged: "toolListChanged",
 
   // ---- output stream (6) ----

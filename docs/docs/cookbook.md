@@ -382,7 +382,7 @@ cycleEnd turnEnd beforeStop stop beforeAbort abort beforeRunEnd error handlerErr
 
 Input: `inputReceived inputProcessed` · Messages: `beforeMessageAdd messageUpdate
 messageAdded messageRemoved fragmentUpdate` · Tools: `beforeTool afterTool toolStart
-toolUpdate toolEnd toolListChanged` · Stream: `streamStarted textDelta textEnd
+toolChanged toolEnd toolListChanged` · Stream: `streamStarted textDelta textEnd
 thinkingDelta thinkingEnd toolcallDelta` · Provider: `beforeProviderRequest
 afterProviderResponse` · Generic: `patched merged usage`
 

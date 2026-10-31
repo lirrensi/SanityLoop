@@ -18,7 +18,7 @@
 // error results — the model sees them and self-corrects (item 21.6).
 // ============================================================================
 
-import type { GodObject, Message, StreamSink, ToolResultContent, ToolResultMessage, TurnResult } from "./types.ts";
+import type { GodObject, Message, ModelPrices, StreamSink, ToolResultContent, ToolResultMessage, TurnResult, UsageCost } from "./types.ts";
 import type { ToolCallRecord } from "./agent.ts";
 import { estimateInputTokens, estimateOutputTokens } from "./token-estimate.ts";
 // ============================================================================
@@ -260,9 +260,59 @@ export function normalizeForAlternation(list: Message[]): Message[] {
 }
 /** The error shape the adapter throws for non-OK provider responses. Stamped
  * with structured facts errorFacts() forwards verbatim onto the `error` event. */
-export type ProviderError = Error & { code?: string; status?: number; retryable?: boolean; attempts?: number; elapsedMs?: number };
+export type ProviderError = Error & { code?: string; status?: number; retryable?: boolean; attempts?: number; elapsedMs?: number; retryAfterMs?: number };
 
-/** One failed attempt, handed to `onRetry` before the backoff sleep. */
+/** Parse a `retry-after` header value to ms. Seconds (integer or float) or an
+ * HTTP date; garbage and past dates → undefined (fall back to backoff). */
+export function parseRetryAfter(value: string | null | undefined): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const v = value.trim();
+  if (v === "") return undefined;
+  const secs = Number(v);
+  if (Number.isFinite(secs) && secs >= 0) return Math.floor(secs * 1000);
+  const at = Date.parse(v);
+  if (!Number.isNaN(at)) {
+    const ms = at - Date.now();
+    return ms > 0 ? ms : undefined;
+  }
+  return undefined;
+}
+
+/** Cost from the price card: provider-reported `total` wins when present
+ * (buckets still computed for the breakdown); without prices everything is
+ * zero as before. Pure — loop-control and pi-adapter reuse it. */
+export function costFromPrices(
+  reportedTotal: number | undefined,
+  prices: ModelPrices | undefined,
+  input: number,
+  output: number,
+  cacheRead: number,
+  cacheWrite: number,
+): UsageCost {
+  if (!prices) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: reportedTotal ?? 0 };
+  const per1M = (tokens: number, rate: number | undefined): number => (tokens * (rate ?? 0)) / 1_000_000;
+  const buckets = {
+    input: per1M(input, prices.input),
+    output: per1M(output, prices.output),
+    cacheRead: per1M(cacheRead, prices.cacheRead),
+    cacheWrite: per1M(cacheWrite, prices.cacheWrite),
+  };
+  return { ...buckets, total: reportedTotal ?? buckets.input + buckets.output + buckets.cacheRead + buckets.cacheWrite };
+}
+
+/** Stamped call-abort error — a DECISION about one call, never retried by the
+ * adapter. errorFacts forwards `attemptAborted` + `reason` onto the event. */
+export function attemptAborted(reason: unknown): Error & { attemptAborted: boolean; reason?: unknown } {
+  const err = new Error(`[sanity] provider call aborted: ${typeof reason === "string" ? reason : "see reason"}`) as Error & {
+    attemptAborted: boolean;
+    reason?: unknown;
+  };
+  err.name = "AttemptAbortedError";
+  err.attemptAborted = true;
+  if (reason !== undefined) err.reason = reason;
+  return err;
+}
+
 export interface RetryAttempt {
   /** 1-based: the attempt that just failed. */
   attempt: number;
@@ -284,6 +334,11 @@ export interface SimpleModelOptions {
   maxOutputTokens?: number;
   /** The context window — the compaction trigger reads this. */
   maxContext?: number;
+  /** Price card ($/1M tokens per bucket) — cost is computed from the token
+   * buckets into stats.cost on EVERY response, so spend flows through stats
+   * with or without loop-control. A provider-reported `usage.cost` total
+   * still wins when present; prices fill the buckets the provider omits. */
+  prices?: ModelPrices;
   /**
    * Normalization strategy applied to the message list RIGHT BEFORE the provider
    * call. Default: normalizeForAlternation (strict role alternation; the LEADING
@@ -318,8 +373,18 @@ export interface SimpleModelOptions {
    * budget is spent, the last error throws immediately (no trailing sleep).
    * Omit = unbounded. Pair `retries: Infinity` with a budget for "retry
    * forever until the provider comes back, but give up after an hour".
+   * `retries: Infinity` with NO budget = retry literally forever — a
+   * conscious choice for vicious mode; the abort signal still interrupts.
    */
   retryBudgetMs?: number;
+  /**
+   * Honor the provider's `retry-after` header (exact sleep, no jitter) instead
+   * of exponential backoff. Default true. Set false for providers that send
+   * insane values — backoff + jitter + ceiling apply instead. The parsed
+   * value is ALWAYS stamped on the error (`retryAfterMs`) either way, so
+   * `onRetry` and the `error` event still see the provider's intent.
+   */
+  honorRetryAfter?: boolean;
   /**
    * Base delay between retries in ms (exponential: base * 2^(attempt-1),
    * capped by retryMaxDelayMs, plus ±50% jitter). Default 500.
@@ -377,12 +442,21 @@ export class SimpleModel {
   retryDelayMs: number;
   /** Single-backoff ceiling in ms. Default 10_000. */
   retryMaxDelayMs: number;
+  /** Honor `retry-after` (exact sleep) vs backoff. Default true. */
+  honorRetryAfter: boolean;
   /** Per-attempt hook, awaited before the backoff sleep. False/throw = stop. */
   onRetry?: (attempt: RetryAttempt) => void | false | Promise<void | false>;
   /** Finish reasons that land clean (see options). Default ["stop"]. */
   stopReasons: string[];
   /** Transport override (see options). Default: globalThis.fetch, resolved per call. */
   fetchImpl?: typeof fetch;
+  /** Price card ($/1M tokens) — cost computed from token buckets in parseResponse. */
+  prices?: ModelPrices;
+  /** In-flight calls by handle id — the adapter-instance registry. Minted
+   * synchronously at callNextTurn entry, deleted on settle. Never serialized. */
+  protected readonly pendingCalls = new Map<string, { controller: AbortController; startedAt: number }>();
+  /** Handle sequence — ids are `c<n>-<rand>` (monotonic + unique). */
+  protected callSeq = 0;
   /** The runtime's open bag — satisfies ModelContract's index signature. */
   [key: string]: unknown;
 
@@ -401,26 +475,65 @@ export class SimpleModel {
     this.retryBudgetMs = opts.retryBudgetMs;
     this.retryDelayMs = opts.retryDelayMs ?? 500;
     this.retryMaxDelayMs = opts.retryMaxDelayMs ?? 10_000;
+    this.honorRetryAfter = opts.honorRetryAfter ?? true;
     this.onRetry = opts.onRetry;
     this.stopReasons = opts.stopReasons ?? ["stop"];
     this.fetchImpl = opts.fetchImpl;
+    this.prices = opts.prices;
   }
 
   // ==========================================================================
   // THE function the runtime calls — receives the WHOLE context
   // ==========================================================================
   async callNextTurn(agent: GodObject): Promise<TurnResult> {
-    // 0. normalize BEFORE the call — the strategy is this model's own concern
-    const normalized = this.normalizeMessages(agent.messages);
-    // 1. prepare messages — the seam (override this for adjustments)
-    const apiMessages = this.prepareMessages(normalized) as unknown[];
+    // MINT synchronously (before the first await) — callers resolve the fresh
+    // id via inFlightCalls without racing. Contract requirement, not courtesy.
+    const { id: callId, signal: callSignal } = this.mintCall();
+    try {
+      // 0. normalize BEFORE the call — the strategy is this model's own concern
+      const normalized = this.normalizeMessages(agent.messages);
+      // 1. prepare messages — the seam (override this for adjustments)
+      const apiMessages = this.prepareMessages(normalized) as unknown[];
 
-    // 2. THE CALL — the guts (library / Pi SDK / raw fetch)
-    //    tools travel with the request; the abort signal cooperates with the loop
-    const response = await this.callApi(apiMessages, agent.streamSink, agent);
+      // 2. THE CALL — the guts (library / Pi SDK / raw fetch)
+      //    tools travel with the request; loop + call signals combine inside
+      const response = await this.callApi(apiMessages, agent.streamSink, agent, callSignal);
 
-    // 3. return the normal message — what the runtime expects
-    return this.parseResponse(response, normalized);
+      // 3. return the normal message — what the runtime expects
+      return this.parseResponse(response, normalized);
+    } finally {
+      this.settleCall(callId);
+    }
+  }
+
+  /** Mint a call handle — sync, before the first await. Subclass adapters
+   * (PiAdapterModel) that override callNextTurn use this too. */
+  protected mintCall(): { id: string; signal: AbortSignal } {
+    const id = `c${++this.callSeq}-${crypto.randomUUID().slice(0, 8)}`;
+    const controller = new AbortController();
+    this.pendingCalls.set(id, { controller, startedAt: Date.now() });
+    return { id, signal: controller.signal };
+  }
+
+  /** Settle a call handle — delete on completion, throw, or abort. */
+  protected settleCall(id: string): void {
+    this.pendingCalls.delete(id);
+  }
+  /** Abort ONE in-flight call by id (most recent when omitted). The call
+   * throws a stamped `attemptAborted` error — no adapter retry (a decision,
+   * not a failure). Loop-abort always wins outright (checked first). */
+  abortCall(id?: string, reason?: unknown): boolean {
+    const target = id ?? [...this.pendingCalls.keys()].at(-1);
+    if (target === undefined) return false;
+    const call = this.pendingCalls.get(target);
+    if (!call || call.controller.signal.aborted) return false;
+    call.controller.abort(reason ?? `call ${target} aborted`);
+    return true;
+  }
+
+  /** In-flight call ids, oldest first. Empty = idle. */
+  get inFlightCalls(): readonly string[] {
+    return [...this.pendingCalls.keys()];
   }
 
   // ==========================================================================
@@ -434,8 +547,12 @@ export class SimpleModel {
   // ==========================================================================
   // The guts — swap this one function to swap the whole world
   // ==========================================================================
-  protected async callApi(apiMessages: unknown[], sink: StreamSink | undefined, agent: GodObject): Promise<unknown> {
+  protected async callApi(apiMessages: unknown[], sink: StreamSink | undefined, agent: GodObject, callSignal?: AbortSignal): Promise<unknown> {
     const url = `${this.baseUrl ?? "https://api.openai.com/v1"}/chat/completions`;
+    // loop signal is the parent of every call: AbortSignal.any fires on either,
+    // and the loop-abort check below always wins outright over call-abort.
+    const loopSignal = agent.abortSignal;
+    const combined = callSignal ? AbortSignal.any([loopSignal, callSignal]) : loopSignal;
     const body: Record<string, unknown> = {
       model: this.modelId,
       messages: apiMessages,
@@ -478,14 +595,14 @@ export class SimpleModel {
             Authorization: `Bearer ${this.apiKey}`,
           },
           body: JSON.stringify(body),
-          // the abort controller — abort() reaches into the in-flight call
-          signal: agent.abortSignal,
+          // loop + call signals combined — either kills the fetch
+          signal: combined,
         });
         if (!res.ok) {
           throw await this.providerError(res);
         }
         const completion = this.stream && sink
-          ? await this.streamAndAssemble(res, sink, agent)
+          ? await this.streamAndAssemble(res, sink, agent, combined)
           : await res.json();
         // finish validation runs INSIDE the loop: an unclean stop reason is a
         // RETRY CANDIDATE, not a terminal error (process agents must survive
@@ -494,8 +611,10 @@ export class SimpleModel {
         return completion;
       } catch (err) {
         lastErr = err;
-        // abort = the loop's own kill signal — NEVER retried, thrown as-is.
-        if (agent.abortSignal?.aborted) throw err;
+        // loop-abort = the loop's own kill signal — NEVER retried, thrown as-is, wins outright.
+        if (loopSignal?.aborted) throw err;
+        // call-abort = a decision about THIS call — stamped, never retried.
+        if (callSignal?.aborted) throw attemptAborted(callSignal.reason);
         if (err instanceof Error && err.name === "AbortError") throw err;
         const stop = (error: unknown): never => {
           if (error instanceof Error) {
@@ -520,8 +639,16 @@ export class SimpleModel {
         // wall-clock budget: attempts + backoffs. Spent = throw NOW, no trailing sleep.
         const elapsedMs = Date.now() - startedAt;
         if (budgetMs !== undefined && (budgetMs <= 0 || elapsedMs >= budgetMs)) stop(err);
-        // exponential backoff + jitter, capped by retryMaxDelayMs
-        const waitMs = Math.min(this.retryMaxDelayMs, this.retryDelayMs * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2);
+        // exponential backoff + jitter, capped by retryMaxDelayMs — unless the
+        // provider told us exactly how long to wait AND we honor it (retry-after
+        // wins, no jitter: the provider's clock beats our guess, but the
+        // ceiling still holds). honorRetryAfter: false = insane-provider mode:
+        // backoff always, the stamp still lands on the error for onRetry.
+        const retryAfterMs = (tagged as { retryAfterMs?: unknown } | null)?.retryAfterMs;
+        const honor = this.honorRetryAfter && typeof retryAfterMs === "number" && retryAfterMs >= 0;
+        const waitMs = honor
+          ? Math.min(this.retryMaxDelayMs, retryAfterMs)
+          : Math.min(this.retryMaxDelayMs, this.retryDelayMs * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2);
         // the hook runs BEFORE the sleep: observe, or veto (false/throw = stop).
         if (this.onRetry !== undefined) {
           let verdict: void | false;
@@ -533,26 +660,24 @@ export class SimpleModel {
           }
           if (verdict === false) stop(err);
         }
-        // abort-aware sleep: abort() mid-backoff throws the ORIGINAL error
+        // abort-aware sleep: loop-abort mid-backoff throws the ORIGINAL error
         // immediately (no waiting out the timer, no AbortError swap — the
         // provider failure is the truth, the abort just ends the waiting).
-        const signal = agent.abortSignal;
-        if (signal?.aborted) throw err;
+        // call-abort mid-backoff throws the stamped decision instead.
+        if (loopSignal?.aborted) throw err;
+        if (callSignal?.aborted) throw attemptAborted(callSignal.reason);
         // executor form, not Promise.withResolvers — target is ES2022 (see
         // shell-tool/bash.ts for the same call). Stored resolver: the abort
         // listener AND the timer release the same sleep.
         let release!: () => void;
         const backoff = new Promise<void>((res) => { release = res; });
         const timer = setTimeout(release, waitMs);
-        if (signal !== undefined) {
-          signal.addEventListener("abort", release, { once: true });
-          await backoff;
-          signal.removeEventListener("abort", release);
-        } else {
-          await backoff;
-        }
+        combined.addEventListener("abort", release, { once: true });
+        await backoff;
+        combined.removeEventListener("abort", release);
         clearTimeout(timer);
-        if (signal?.aborted) throw err;
+        if (loopSignal?.aborted) throw err;
+        if (callSignal?.aborted) throw attemptAborted(callSignal.reason);
       }
     }
     throw lastErr;
@@ -579,6 +704,8 @@ export class SimpleModel {
     perr.code = "provider_error";
     perr.status = res.status;
     perr.retryable = res.status >= 500 || res.status === 429;
+    const retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));
+    if (retryAfterMs !== undefined) perr.retryAfterMs = retryAfterMs;
     return perr;
   }
 
@@ -587,7 +714,7 @@ export class SimpleModel {
    * assemble; the batch runs only when the response is completely ready.
    * Cooperative abort: checks agent.abortSignal between chunks.
    */
-  protected async streamAndAssemble(res: Response, sink: StreamSink, agent: GodObject): Promise<unknown> {
+  protected async streamAndAssemble(res: Response, sink: StreamSink, agent: GodObject, signal?: AbortSignal): Promise<unknown> {
     sink.emit({ type: "streamStarted" });
     const reader = res.body?.getReader();
     if (!reader) return { choices: [] };
@@ -602,7 +729,7 @@ export class SimpleModel {
     const toolCalls: Record<number, { id: string; name: string; args: string }> = {};
 
     while (true) {
-      if (agent.abortSignal?.aborted) break; // cooperative stop — "kill it now"
+      if ((signal ?? agent.abortSignal)?.aborted) break; // cooperative stop — "kill it now"
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -667,6 +794,9 @@ export class SimpleModel {
         }
       }
     }
+    // call-abort mid-stream throws the stamped decision (loop-abort just breaks —
+    // the providerStep terminal check discards the partial on that path).
+    if (signal?.aborted && !agent.abortSignal?.aborted) throw attemptAborted(signal.reason);
     sink.emit({ type: "textEnd" });
 
     // assemble into a completion-shaped object parseResponse can consume
@@ -775,7 +905,7 @@ export class SimpleModel {
         cacheRead: cachedTokens,
         cacheWrite: 0,
         totalTokens,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage?.cost ?? 0 },
+        cost: costFromPrices(usage?.cost, this.prices, promptTokens, completionTokens, cachedTokens, 0),
         // Identity — chat_completions is what we are. Provider/model can be set by subclasses.
         api: this.api,
         provider: undefined,

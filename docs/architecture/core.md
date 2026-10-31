@@ -177,7 +177,7 @@ Gates all pass (`gateCursor` reaches the end) → `batchStep()`: phase
 ## Sealed-phase deferral (THE LANE)
 
 While the tool batch executes, the transcript is SEALED for mutation. Events
-in the deferral whitelist (`toolUpdate`, `toolListChanged`) fired mid-batch
+in the deferral whitelist (`toolChanged`, `toolListChanged`) fired mid-batch
 are held in THE LANE and drain at the seams (`closeCycle`/`land`) — after
 tool results commit, when the transcript is whole again. Control events are
 never deferred.

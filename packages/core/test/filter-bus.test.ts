@@ -5,7 +5,7 @@
 // end-to-end, duplicate-id rejection across ALL events, throw = skip +
 // handlerError {error, filterId, event} + queue survives, child dispatch
 // semantics, disable/enable/remove lifecycles, and SEALED-PHASE DEFERRAL
-// (toolUpdate / toolListChanged held mid-batch → drained at the seam).
+// (toolChanged / toolListChanged held mid-batch → drained at the seam).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -194,7 +194,7 @@ test("CURRENT SEMANTICS: an ASYNC child does NOT block the next sibling (doc say
 // Sealed-phase deferral — THE LANE (behavioral; the whitelist is private)
 // ---------------------------------------------------------------------------
 
-test("SEALED LANE: toolUpdate fired DURING the tool batch defers to the seam", async () => {
+test("SEALED LANE: toolChanged fired DURING the tool batch defers to the seam", async () => {
     const marks: string[] = [];
     const tool: Tool = {
         name: "mutator",
@@ -213,7 +213,7 @@ test("SEALED LANE: toolUpdate fired DURING the tool batch defers to the seam", a
 
     let batchDone = false;
     agent.addFilter({
-        event: EVENTS.toolUpdate, id: "watch-update", priority: 0,
+        event: EVENTS.toolChanged, id: "watch-update", priority: 0,
         fn: async () => marks.push(batchDone ? "delivered-after-seam" : "delivered-mid-batch"),
     });
     agent.addFilter({
@@ -226,7 +226,7 @@ test("SEALED LANE: toolUpdate fired DURING the tool batch defers to the seam", a
     await awaitIdle(agent);
 
     assert.deepEqual(marks, ["delivered-after-seam"],
-        "toolUpdate fired while sealed must be HELD, then delivered after toolResults commit");
+        "toolChanged fired while sealed must be HELD, then delivered after toolResults commit");
     assert.equal(tool.description, "updated MID-BATCH", "the definition change itself applied immediately");
 });
 
@@ -275,17 +275,17 @@ test("outside the batch the SAME events deliver immediately (no lane when unseal
     const model = new StubModel([]);
     const agent = new Agent({ model, agentId: "unsealed" });
     agent.addFilter({
-        event: EVENTS.toolUpdate, id: "watch-update", priority: 0,
+        event: EVENTS.toolChanged, id: "watch-update", priority: 0,
         fn: async () => void marks.push("update"),
     });
     agent.addFilter({
         event: EVENTS.toolListChanged, id: "watch-list", priority: 0,
         fn: async () => void marks.push("list"),
     });
-    // addTool fires toolListChanged immediately; updateTool fires toolUpdate immediately
+    // addTool fires list+small immediately; updateTool fires list+small immediately
     agent.addTool({ name: "plain", description: "d", inputSchema: { type: "object" }, execute: async () => ({ answer: "x" }) });
     agent.updateTool("plain", { description: "d2" });
-    assert.deepEqual(marks, ["list", "update"]);
+    assert.deepEqual(marks, ["list", "update", "list", "update"]);
 });
 
 // ---------------------------------------------------------------------------

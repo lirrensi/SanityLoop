@@ -36,8 +36,8 @@ test("spot-check: every documented event name exists", () => {
         "inputReceived", "inputProcessed",
         // messages (5)
         "beforeMessageAdd", "messageAdded", "messageUpdate", "messageRemoved", "fragmentUpdate",
-        // tools (6)
-        "beforeTool", "afterTool", "toolStart", "toolUpdate", "toolEnd", "toolListChanged",
+        // tools (7)
+        "beforeTool", "afterTool", "toolStart", "toolChanged", "toolEnd", "toolListChanged",
         // output stream (6)
         "streamStarted", "textDelta", "textEnd", "thinkingDelta", "thinkingEnd", "toolcallDelta",
         // provider boundary (2)
@@ -51,7 +51,6 @@ test("spot-check: every documented event name exists", () => {
     }
     assert.equal(expected.length, 41, "doc list itself must be complete");
 });
-
 test("the blocking walls exist: beforeTool / inputReceived / beforeAgentStart are declared events", () => {
     // The walls are where the worker/supervisor AWAIT the full filter chain —
     // beforeTool (per call), inputReceived (per sync input), beforeAgentStart

@@ -35,7 +35,7 @@ which command, and the honest gaps.
 | --- | --- | --- |
 | Core loops (two clocks) | loop 1 drains inputs under the literal `blocked` flag; loop 2 steps one unit per beat; derived `loopState` (incl. `stopped`); no breaks except terminate() (run() resolves, heart stops); terminal paths incl. `terminated` | `packages/core/test/*` + template runs |
 | The block flag | literal `blocked` observable: raised by pending awaits, dropped by the answer, worker frozen while true | `packages/core/test/agent-state.test.ts` (V-BLOCK) |
-| Event contract | the 38 events exist; dispatch lanes (cycle vs registry); sealed-phase deferral of `toolUpdate`/`toolListChanged` | `packages/core/test/events.test.ts`, `filter-bus.test.ts` |
+| Event contract | the 41 events exist; dispatch lanes (cycle vs registry); sealed-phase deferral of `toolChanged`/`toolListChanged` | `packages/core/test/events.test.ts`, `filter-bus.test.ts` |
 | State / observer | any write → `KeyChange` → `patched` → tape; semantic message events; merge silence | `packages/core/test/agent-state.test.ts` |
 | Persistence / restore | baseline + deltas, flush-before-restore, atomic card, version scream, torn-tail | `packages/extras/base-storage/test/storage.test.ts` |
 | Crash-heal | mid-batch crash restore NEVER re-runs tools; parked restore is NOT healed (ask re-presented) | `packages/extras/base-storage/test/storage.test.ts` (V-CRASH-HEAL) |

@@ -189,13 +189,16 @@ const kit: Plugin = {
 `install` may also be a **record of named steps** — a subclass can spread and
 null individual steps instead of copying the body.
 
-## ModelContract — one function
+## ModelContract — one function, plus call control
 
 ```ts
 interface ModelContract {
   api: string; modelId: string; stream: boolean;
   maxContext?: number; temperature?: number; /* open runtime params */
+  presetId?: string; // roster address, auto-assigned from modelId
   callNextTurn(ctx: GodObject): Promise<TurnResult>;
+  abortCall?(id?: string, reason?: unknown): boolean; // kill ONE call, loop continues
+  readonly inFlightCalls?: readonly string[];
 }
 ```
 
@@ -206,6 +209,22 @@ loop 1 flushes every beat. `stats` is a flat `MessageStats`:
 cost: { input, output, cacheRead, cacheWrite, total }, ...provider extras }`.
 `SimpleModel` covers OpenAI-compatible APIs; extend and override
 `callNextTurn` or `prepareMessages` for anything else.
+
+Every `callNextTurn` mints a handle synchronously at entry (before the first
+await): abort it via `abortCall(id, reason)` — the call throws a stamped
+`attemptAborted` error, never retried (a decision, not a failure). Loop-abort
+always wins outright. Adapters that omit the members can't truly cancel.
+
+## Roster — one driver, many presets
+
+`new Agent({ model })` takes one preset or an array. First drives;
+`agent.models` holds all; `resolvePreset(id | index | ref)` addresses them.
+Presets are meaning-free values — no framework roles; the host maps meaning.
+
+- `agent.call(ref, messages?) → ModelCall` — side call: no swap, no commit,
+  no stats. Survives `abort()`/`stop()`, dies on `terminate()`.
+- `agent.driveOnce(ref)` — the loop drives that preset for exactly one turn,
+  then reverts. Bypass any installed model wrapper.
 
 ## Input — the universal envelope
 

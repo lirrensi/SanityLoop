@@ -370,12 +370,13 @@ test("hideTool/showTool flip visibility and fire toolListChanged", () => {
     assert.equal(agent.hideTool("a"), true);
     assert.deepEqual(agent.visibleTools().map((t) => t.name), [], "hidden after hideTool");
     assert.equal(events.length, 1);
-    assert.equal((events[0] as { hidden?: string }).hidden, "a");
+    assert.deepEqual((events[0] as { visibility?: unknown }).visibility, [{ name: "a", hidden: true }]);
+    assert.equal((events[0] as { cacheBreak?: unknown }).cacheBreak, true);
     assert.equal(agent.hideTool("a"), true, "idempotent — no event for already-hidden");
     assert.equal(events.length, 1);
     assert.equal(agent.showTool("a"), true);
     assert.deepEqual(agent.visibleTools().map((t) => t.name), ["a"], "back on the wire after showTool");
-    assert.equal((events[1] as { shown?: string }).shown, "a");
+    assert.deepEqual((events[1] as { visibility?: unknown }).visibility, [{ name: "a", hidden: false }]);
 });
 
 test("a HIDDEN tool still executes when the model calls it by name", async () => {
@@ -419,6 +420,29 @@ test("updateTool can set hidden on the fly", () => {
     assert.deepEqual(agent.visibleTools().map((t) => t.name), []);
     assert.equal(agent.updateTool("a", { hidden: false }), true);
     assert.deepEqual(agent.visibleTools().map((t) => t.name), ["a"]);
+});
+
+test("tool events: big summary + small detail per mutation", () => {
+    const { tool: a } = visTool("a");
+    const agent = new Agent({ model: new StubModel([]), tools: [a], agentId: "event-split" });
+    const big: unknown[] = [];
+    const small: unknown[] = [];
+    agent.addFilter({ event: "toolListChanged", id: "test/big", priority: 0, fn: async (_a, e) => void big.push(e) });
+    agent.addFilter({ event: "toolChanged", id: "test/small", priority: 0, fn: async (_a, e) => void small.push(e) });
+    agent.disableTool("a");
+    assert.deepEqual(big, [{ type: "toolListChanged", availability: [{ name: "a", disabled: true }], cacheBreak: false }]);
+    assert.deepEqual(small, [{ type: "toolChanged", toolName: "a", change: "availability", before: false, after: true }]);
+    agent.updateTool("a", { description: "new bytes" });
+    assert.equal((big[1] as { cacheBreak?: unknown }).cacheBreak, true);
+    assert.deepEqual((big[1] as { updated?: unknown }).updated, ["a"]);
+    const def = small[1] as { change?: unknown; fields?: unknown; before?: unknown; after?: unknown };
+    assert.equal(def.change, "definition");
+    assert.deepEqual(def.fields, ["description"]);
+    assert.deepEqual(def.before, { description: "d" });
+    assert.deepEqual(def.after, { description: "new bytes" });
+    agent.updateTool("a", { hidden: true, description: "both" });
+    assert.equal(big.length, 4, "def+hidden = two big fires (one per aspect)");
+    assert.equal(small.length, 4, "def+hidden = two small fires (one per aspect)");
 });
 
 // ---------------------------------------------------------------------------

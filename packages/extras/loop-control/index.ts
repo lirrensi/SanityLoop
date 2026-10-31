@@ -46,11 +46,14 @@ import { EVENTS, answerText } from "@sanityloop/core";
 import type {
 	ContentBlock,
 	GodObject,
+	ModelContract,
 	Message,
 	Plugin,
 	ToolResultContent,
 } from "@sanityloop/core";
 import { removeFiltersByPrefix } from "@sanityloop/util";
+import { HardenedModel } from "./hardened-model.ts";
+import type { HardenOptions } from "./hardened-model.ts";
 
 // ----------------------------------------------------------------------------
 // Options
@@ -175,6 +178,72 @@ export interface RetryOptions {
 	fallback?: (info: { name: string; parameters: Record<string, unknown>; answer: string | ContentBlock[]; errorMessage?: string; attempts: number }) => { answer: string; error?: boolean; errorMessage?: string };
 }
 
+export interface MaxTimeOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Wall-clock budget in ms, measured from install. Checked before every
+	 * provider call. Default 0 = unlimited (only meaningful once `enabled`). */
+	capMs?: number;
+	/** Optional text pushed on the budget-exhausted stop. */
+	finalMessage?: string;
+	/** TRUE = HARD stop (`agent.abort()`, terminal). Default false = gentle
+	 * stop() + message. */
+	abort?: boolean;
+}
+
+export interface MaxCostOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Spend cap in USD, read from `stats.cost.total` (computed from the
+	 * model's price card when the provider reports none). Checked before every
+	 * provider call — the call that would breach never fires. */
+	capUsd?: number;
+	/** Optional text pushed on the budget-exhausted stop. */
+	finalMessage?: string;
+	/** TRUE = HARD stop (`agent.abort()`, terminal). Default false = gentle
+	 * stop() + message. */
+	abort?: boolean;
+}
+
+export interface MaxTokensOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Session token cap, read from `stats.totalTokens`. Checked before every
+	 * provider call. */
+	cap?: number;
+	/** Optional text pushed on the budget-exhausted stop. */
+	finalMessage?: string;
+	/** TRUE = HARD stop (`agent.abort()`, terminal). Default false = gentle
+	 * stop() + message. */
+	abort?: boolean;
+}
+
+export interface CircuitBreakerOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Consecutive erroring results per tool before the breaker opens.
+	 * Default 5. A success resets the count. */
+	errors?: number;
+	/** How long the tool stays disabled before auto re-enable. Default 60_000.
+	 * 0 = stays open until uninstall (manual recovery). */
+	cooldownMs?: number;
+	/** Optional: only guard these tool names. Omit = guard all tools. */
+	toolNames?: string[];
+	/** The pushed message when the breaker opens. */
+	message?: string;
+}
+
+export interface MalformedOptions {
+	/** Master switch — OFF by default. */
+	enabled?: boolean;
+	/** Empty/degenerate responses vetoed silently before the nudge. Default 3.
+	 * A healthy response resets the count. Bounds come from maxTurns/maxSteps
+	 * (this guard only fixes SHAPE, never stops the loop). */
+	strikes?: number;
+	/** The pushed nudge when strikes hit the cap (strikes reset after). */
+	message?: string;
+}
+
 export interface LoopControlOptions {
 	doomLoop?: DoomLoopOptions;
 	maxTurns?: MaxTurnsOptions;
@@ -189,6 +258,21 @@ export interface LoopControlOptions {
 	/** Tool-call retry — re-invoke erroring tools at the afterTool patch point
 	 * (before commit) with backoff. Transient-only by default. */
 	retry?: RetryOptions;
+	/** Wall-clock budget — checked before every provider call. */
+	maxTime?: MaxTimeOptions;
+	/** Spend budget (USD) — checked before every provider call. */
+	maxCost?: MaxCostOptions;
+	/** Session token budget — checked before every provider call. */
+	maxTokens?: MaxTokensOptions;
+	/** Bulletproof wrapper — swaps agent.model for a retry/fallback/stall
+	 * decorator at install, restores at uninstall. OFF by default. */
+	harden?: HardenOptions;
+	/** Circuit breaker — disable a tool that keeps erroring, re-enable on
+	 * cooldown. Stronger than doom-nudge; per-tool, not per-call-shape. */
+	circuitBreaker?: CircuitBreakerOptions;
+	/** Malformed recovery — veto empty/degenerate provider responses (fresh
+	 * attempt), nudge at the strike cap. Shape only; budgets bound it. */
+	malformed?: MalformedOptions;
 	/** Where loop-control activity lives in session state. Default "loopControl". */
 	stateKey?: string;
 }
@@ -243,9 +327,44 @@ const DEFAULT_SPIN_GUARD: Required<SpinGuardOptions> = {
 		"**[loop-control]** The loop discarded several cycles without committing anything — a filter may be stuck in a veto loop. Investigate before continuing.",
 };
 
-const TRANSIENT_RE = /timeout|429|5\d\d|ECONN|ENOTFOUND|EAI_AGAIN|temporar|rate.limit|overloaded|unavailable/i;
+const DEFAULT_MAX_TIME: Required<MaxTimeOptions> = {
+	enabled: false,
+	capMs: 0,
+	finalMessage: "**Time budget exhausted.** Stopping here.",
+	abort: false,
+};
 
-/** Default retry predicate: transient-only, never invalid_arguments. */
+const DEFAULT_MAX_COST: Required<MaxCostOptions> = {
+	enabled: false,
+	capUsd: 0,
+	finalMessage: "**Cost budget exhausted.** Stopping here.",
+	abort: false,
+};
+
+const DEFAULT_MAX_TOKENS: Required<MaxTokensOptions> = {
+	enabled: false,
+	cap: 0,
+	finalMessage: "**Token budget exhausted.** Stopping here.",
+	abort: false,
+};
+
+const DEFAULT_BREAKER: Required<Omit<CircuitBreakerOptions, "toolNames">> & {
+	toolNames?: string[];
+} = {
+	enabled: false,
+	errors: 5,
+	cooldownMs: 60_000,
+	toolNames: undefined,
+	message: "**[loop-control]** `{tool}` keeps failing and is now disabled — stop calling it. Work around it or ask for help.",
+};
+
+const DEFAULT_MALFORMED: Required<MalformedOptions> = {
+	enabled: false,
+	strikes: 3,
+	message: "**[loop-control]** Your last response was empty — say something or call a tool. Empty replies are discarded.",
+};
+
+const TRANSIENT_RE = /timeout|429|5\d\d|ECONN|ENOTFOUND|EAI_AGAIN|temporar|rate.limit|overloaded|unavailable/i;
 export function defaultRetryOn(info: { errorMessage?: string; answer: string | ContentBlock[] }): boolean {
 	if (info.errorMessage === "invalid_arguments") return false;
 	return TRANSIENT_RE.test(`${info.errorMessage ?? ""} ${answerText(info.answer)}`);
@@ -339,6 +458,13 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	const maxSteps = { ...DEFAULT_MAX_STEPS, ...(opts.maxSteps ?? {}) };
 	const maxConsTools = { ...DEFAULT_MAX_CONSECUTIVE_TOOLS, ...(opts.maxConsecutiveTools ?? {}) };
 	const spinGuard = { ...DEFAULT_SPIN_GUARD, ...(opts.spinGuard ?? {}) };
+	const maxTime = { ...DEFAULT_MAX_TIME, ...(opts.maxTime ?? {}) };
+	const maxCost = { ...DEFAULT_MAX_COST, ...(opts.maxCost ?? {}) };
+	const maxTokens = { ...DEFAULT_MAX_TOKENS, ...(opts.maxTokens ?? {}) };
+	const hardenCfg = opts.harden ?? {};
+	const hardenEnabled = hardenCfg.enabled === true;
+	const breaker = { ...DEFAULT_BREAKER, ...(opts.circuitBreaker ?? {}) };
+	const malformed = { ...DEFAULT_MALFORMED, ...(opts.malformed ?? {}) };
 	const retryCfg = opts.retry ?? {};
 	const retryEnabled = retryCfg.enabled === true;
 	const retryTools = retryCfg.tools ?? ["*"];
@@ -366,6 +492,20 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 	let consecutiveTools = 0;
 	// spin-guard counter — consecutive discarded cycles
 	let spinCount = 0;
+	// governor bookkeeping — install timestamp + one-shot stop flags
+	const installedAt = Date.now();
+	let stoppedTime = false;
+	let stoppedCost = false;
+	let stoppedTokens = false;
+	// harden bookkeeping — the wrapper + the original it displaced
+	let hardened: HardenedModel | undefined;
+	let wrappedOriginal: ModelContract | undefined;
+	// breaker bookkeeping — per-tool error counts + open breakers + cooldown timers
+	const breakerCounts = new Map<string, number>();
+	const breakerOpen = new Set<string>();
+	const breakerTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	// malformed bookkeeping — consecutive degenerate responses
+	let malformedStrikes = 0;
 
 	/** Decide what to do for a key that crossed the doom threshold this cycle. */
 	function handleDoom(
@@ -436,9 +576,104 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 		});
 	}
 
+	/** Trip a governor: committed wrap-up + gentle stop (or hard abort).
+	 * The gentle path PARKS to refuse the money call: providerStep checks ONLY
+	 * pendingAwaits between the wall and the call (stopRequested is honored at
+	 * step boundaries, not mid-step), so stop() alone would let this call
+	 * fire. The park is released on the next macrotask — NOT synchronously
+	 * (a microtask would clear before the wall's own check) and NOT via a
+	 * stop filter (the CANCEL rule blocks every filter once stopRequested is
+	 * set). The release ALSO abandons the resume cursor: land() treats a set
+	 * currentAction + stopRequested as "parked, will resume" and re-stamps
+	 * awaiting forever — but we are stopping, there IS no resume. Clearing
+	 * it lets the next beat land idle. Timer-vs-beat ordering is safe: the
+	 * timer fires ~1ms after the park completes, beats are 10ms apart. */
+	function tripGovernor(
+		agent: GodObject,
+		kind: "max-time" | "max-cost" | "max-tokens",
+		spent: number,
+		cap: number,
+		finalMessage: string,
+		abort: boolean,
+	): boolean {
+		pushUser(agent, finalMessage);
+		// The wrap-up must NOT re-owe work: an answered-through marker keeps
+		// the machine landed after the stop (otherwise the pushed message
+		// starts a new turn past the breach). Public setter, taped on restore.
+		agent.lastResponse = agent.messages.length - 1;
+		record(agent, stateKey, { lastAction: kind, spent, cap, at: Date.now() });
+		if (abort) {
+			agent.abort(finalMessage);
+			return true;
+		}
+		const awaitId = `loop-control-governor-${kind}`;
+		agent.pendingAwaits.push({ type: "loop-control/governor", id: awaitId, schema: { kind, spent, cap } });
+		agent.stop();
+		setTimeout(() => {
+			const idx = agent.pendingAwaits.findIndex((a) => a.id === awaitId);
+			if (idx >= 0) agent.pendingAwaits.splice(idx, 1);
+			agent.currentAction = undefined; // no resume — we are stopping
+		}, 0);
+		return true;
+	}
+
+	/** Open the breaker: disable the tool, tell the model, arm cooldown. */
+	function openBreaker(agent: GodObject, tool: string, count: number): void {
+		if (breakerOpen.has(tool)) return;
+		breakerOpen.add(tool);
+		agent.disableTool(tool);
+		pushUser(agent, breaker.message.replaceAll("{tool}", tool));
+		record(agent, stateKey, { lastAction: "breaker-open", tool, count, at: Date.now() });
+		if (breaker.cooldownMs > 0) {
+			const timer = setTimeout(() => {
+				breakerTimers.delete(tool);
+				closeBreaker(agent, tool);
+			}, breaker.cooldownMs);
+			breakerTimers.set(tool, timer);
+		}
+	}
+
+	/** Close the breaker: re-enable, reset count, fresh chances. */
+	function closeBreaker(agent: GodObject, tool: string): void {
+		if (!breakerOpen.has(tool)) return;
+		breakerOpen.delete(tool);
+		breakerCounts.set(tool, 0);
+		const timer = breakerTimers.get(tool);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			breakerTimers.delete(tool);
+		}
+		agent.enableTool(tool);
+		record(agent, stateKey, { lastAction: "breaker-close", tool, at: Date.now() });
+	}
+
+	/** Degenerate response? Empty/whitespace assistant with no tool calls, or
+	 * a toolCall carrying zero calls. Healthy = anything else. */
+	function isMalformed(message: unknown): boolean {
+		if (typeof message !== "object" || message === null) return true;
+		const m = message as { type?: unknown; content?: unknown };
+		if (m.type === "toolCall") {
+			const stored = (m.content as { stored?: unknown } | null)?.stored;
+			return !Array.isArray(stored) || stored.length === 0;
+		}
+		if (m.type !== "assistant") return false; // only assistant/toolCall judged
+		return answerText((m.content ?? "") as never).trim() === "";
+	}
+
 	return {
 		id: "loop-control",
 		install(agent) {
+			// ---- HARDEN: swap agent.model for the bulletproof decorator.
+			// providerStep reads this.model fresh every step — the wrapper sees
+			// every call with zero core involvement. Restored on uninstall.
+			if (hardenEnabled) {
+				if (agent.model instanceof HardenedModel) {
+					throw new Error("[loop-control] harden already installed — agent.model is wrapped (uninstall first)");
+				}
+				wrappedOriginal = agent.model;
+				hardened = new HardenedModel(agent.model, hardenCfg);
+				agent.model = hardened;
+			}
 			// ---- RETRY: re-invoke erroring tools at the afterTool patch point
 			// (BEFORE commit — the push waits for this filter). Same tool, same
 			// params, exponential backoff; the rewritten result commits as if the
@@ -525,6 +760,67 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 				},
 			});
 
+			// ---- GOVERNORS: time/cost/tokens checked BEFORE every provider call.
+			// The money wall: the call that would breach never fires. Committed
+			// wrap-up + gentle stop (or hard abort) — never a silent crash.
+			agent.addFilter({
+				event: EVENTS.beforeProviderRequest,
+				id: "loop-control/governors",
+				priority: 0,
+				fn: async (agent) => {
+					if (maxTime.enabled && !stoppedTime && maxTime.capMs > 0) {
+						const spent = Date.now() - installedAt;
+						if (spent >= maxTime.capMs) {
+							stoppedTime = true;
+							tripGovernor(agent, "max-time", spent, maxTime.capMs, maxTime.finalMessage, maxTime.abort);
+							return;
+						}
+					}
+					if (maxCost.enabled && !stoppedCost && maxCost.capUsd > 0) {
+						const spent = agent.stats.cost.total;
+						if (typeof spent === "number" && spent >= maxCost.capUsd) {
+							stoppedCost = true;
+							tripGovernor(agent, "max-cost", spent, maxCost.capUsd, maxCost.finalMessage, maxCost.abort);
+							return;
+						}
+					}
+					if (maxTokens.enabled && !stoppedTokens && maxTokens.cap > 0) {
+						const spent = agent.stats.totalTokens;
+						if (typeof spent === "number" && spent >= maxTokens.cap) {
+							stoppedTokens = true;
+							tripGovernor(agent, "max-tokens", spent, maxTokens.cap, maxTokens.finalMessage, maxTokens.abort);
+							return;
+						}
+					}
+				},
+			});
+
+			// ---- MALFORMED: veto empty/degenerate responses (fresh attempt),
+			// nudge at the strike cap (strikes reset). Shape only — maxTurns /
+			// maxSteps bound the loop; this never stops anything itself.
+			agent.addFilter({
+				event: EVENTS.afterProviderResponse,
+				id: "loop-control/malformed",
+				priority: 50,
+				fn: async (agent, payload) => {
+					if (!malformed.enabled) return;
+					const message = (payload as { result?: { message?: unknown } } | undefined)?.result?.message;
+					if (!isMalformed(message)) {
+						malformedStrikes = 0; // healthy resets
+						return;
+					}
+					malformedStrikes++;
+					if (malformedStrikes >= malformed.strikes) {
+						malformedStrikes = 0;
+						pushUser(agent, malformed.message);
+						record(agent, stateKey, { lastAction: "malformed-nudge", at: Date.now() });
+					} else {
+						record(agent, stateKey, { lastAction: "malformed-veto", strikes: malformedStrikes, at: Date.now() });
+					}
+					agent.endCycle(); // discard — the worker runs the turn again
+				},
+			});
+
 			agent.addFilter({
 				event: EVENTS.toolEnd,
 				id: "loop-control/doom/count",
@@ -546,6 +842,32 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 					} else {
 						counts.set(key, 0); // a success resets the failure counter
 						nudges.set(key, 0);
+					}
+				},
+			});
+
+			// ---- CIRCUIT BREAKER: per-tool consecutive errors → disableTool.
+			// Stronger than doom-nudge: the tool STOPS being callable (stays in
+			// prompt, execute short-circuits). Success resets; cooldown re-enables.
+			agent.addFilter({
+				event: EVENTS.toolEnd,
+				id: "loop-control/breaker/count",
+				priority: 210,
+				fn: async (agent) => {
+					if (!breaker.enabled) return;
+					const turn = agent.currentTurn as
+						| (Record<string, unknown> & { content?: ToolResultContent | null })
+						| undefined;
+					const tool = turn?.toolName as string | undefined;
+					if (!tool || !turn?.content) return;
+					if (breaker.toolNames && !breaker.toolNames.includes(tool)) return;
+					if (turn.content.error === true) {
+						const c = (breakerCounts.get(tool) ?? 0) + 1;
+						breakerCounts.set(tool, c);
+						if (c >= breaker.errors) openBreaker(agent, tool, c);
+					} else {
+						breakerCounts.set(tool, 0); // success resets
+						if (breakerOpen.has(tool)) closeBreaker(agent, tool); // healed early
 					}
 				},
 			});
@@ -794,14 +1116,14 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 				},
 			});
 
-			// ---- CLEANUP: on hard abort, drop parked doom awaits — no hang ----
+			// ---- CLEANUP: on hard abort, drop parked doom/governor awaits — no hang ----
 			agent.addFilter({
 				event: EVENTS.beforeAbort,
 				id: "loop-control/doom/cleanup",
 				priority: 100,
 				fn: async (agent) => {
 					const kept = agent.pendingAwaits.filter(
-						(a) => a.type !== "loop-control/doom",
+						(a) => a.type !== "loop-control/doom" && a.type !== "loop-control/governor",
 					);
 					agent.pendingAwaits.splice(0, agent.pendingAwaits.length, ...kept);
 				},
@@ -825,12 +1147,31 @@ export function loopControl(opts: LoopControlOptions = {}): Plugin {
 			stepCount = 0;
 			consecutiveTools = 0;
 			spinCount = 0;
+			stoppedTime = false;
+			stoppedCost = false;
+			stoppedTokens = false;
+			malformedStrikes = 0;
+			breakerCounts.clear();
+			for (const timer of breakerTimers.values()) clearTimeout(timer);
+			breakerTimers.clear();
+			for (const tool of breakerOpen) agent.enableTool(tool);
+			breakerOpen.clear();
+			if (hardened !== undefined && agent.model === hardened && wrappedOriginal !== undefined) {
+				agent.model = wrappedOriginal;
+			}
+			hardened = undefined;
+			wrappedOriginal = undefined;
+			const kept = agent.pendingAwaits.filter((a) => a.type !== "loop-control/governor");
+			agent.pendingAwaits.splice(0, agent.pendingAwaits.length, ...kept);
 			removeFiltersByPrefix(agent, "loop-control/");
 			agent.removeDeclaredCapability("loop-control");
 			delete agent.state[stateKey];
 		},
 	};
 }
-
 // a convenience default — OFF, ready to `.install(loopControl())` and tune
 export const loopControlGuard: Plugin = loopControl();
+
+// the bulletproof decorator — standalone use without the plugin
+export { HardenedModel, StallError, defaultClassify } from "./hardened-model.ts";
+export type { HardenOptions, HardenStallOptions, HardenVerdict } from "./hardened-model.ts";

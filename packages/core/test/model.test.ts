@@ -12,6 +12,7 @@ import {
     SimpleModel,
     answerText,
     normalizeForAlternation,
+    parseRetryAfter,
 } from "@sanityloop/core";
 import type { GodObject, Message, MessageStats, TurnResult } from "@sanityloop/core";
 import { makeAgent, seedUserMessage, kick } from "@sanityloop/test-kit/core";
@@ -222,4 +223,122 @@ test("UNION wire: block toolResults emit multipart; strings stay strings", () =>
         { id: "r3", enabled: true, type: "toolResult", toolCallId: "c3", content: null },
     ] as Message[]) as Array<{ content: string }>;
     assert.match(dead[0].content, /catastrophically/);
+});
+
+test("parseRetryAfter: seconds, float, HTTP date, garbage", () => {
+    assert.equal(parseRetryAfter(null), undefined);
+    assert.equal(parseRetryAfter(""), undefined);
+    assert.equal(parseRetryAfter("2"), 2000);
+    assert.equal(parseRetryAfter("0.5"), 500);
+    assert.equal(parseRetryAfter("  3  "), 3000);
+    assert.equal(parseRetryAfter("-1"), undefined);
+    assert.equal(parseRetryAfter("garbage"), undefined);
+    const future = parseRetryAfter(new Date(Date.now() + 5000).toUTCString());
+    assert.ok(typeof future === "number" && future > 4000 && future <= 5000, `HTTP date → ~5000, got ${future}`);
+    assert.equal(parseRetryAfter(new Date(Date.now() - 5000).toUTCString()), undefined, "past date → backoff");
+});
+
+test("callApi honors retry-after over backoff (fetchImpl seam, onRetry observes waitMs)", async () => {
+    let calls = 0;
+    const seen: number[] = [];
+    const fail429 = () =>
+        new Response("rate limited", { status: 429, headers: { "retry-after": "2" } });
+    const okBody = JSON.stringify({
+        id: "c1", choices: [{ index: 0, message: { role: "assistant", content: "recovered" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    const model = new SimpleModel({
+        modelId: "m",
+        stream: false,
+        retries: 3,
+        retryMaxDelayMs: 60_000, // high ceiling: retry-after must survive unclamped
+        fetchImpl: (async () => (++calls === 1 ? fail429() : new Response(okBody, { status: 200 }))) as typeof fetch,
+        onRetry: ({ waitMs }) => { seen.push(waitMs); },
+    });
+    const { agent } = makeAgent({ script: [() => assistantTurn("unused")] });
+    seedUserMessage(agent, "go");
+    const result = await model.callNextTurn(agent);
+    assert.equal(calls, 2, "one 429 then success");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], 2000, `retry-after wins exactly, got ${seen[0]}`);
+    assert.deepEqual(result.message.content, [{ type: "text", content: "recovered" }]);
+});
+
+test("retry-after respects the ceiling and stamps the error for errorFacts", async () => {
+    const fail429 = () =>
+        new Response("slow down", { status: 429, headers: { "retry-after": "120" } });
+    const model = new SimpleModel({
+        modelId: "m",
+        stream: false,
+        retries: 1, // no retry — the throw carries the stamp
+        fetchImpl: (async () => fail429()) as typeof fetch,
+    });
+    const { agent } = makeAgent({ script: [() => assistantTurn("unused")] });
+    seedUserMessage(agent, "go");
+    const err = await model.callNextTurn(agent).then(
+        () => { throw new Error("must throw"); },
+        (e: unknown) => e as { retryAfterMs?: unknown; status?: unknown },
+    );
+    assert.equal(err.status, 429);
+    assert.equal(err.retryAfterMs, 120_000, "stamp is raw provider intent; the ceiling applies at sleep time");
+});
+
+test("prices: cost flows from token buckets without loop-control", () => {
+    const model = new SimpleModel({
+        modelId: "m",
+        stream: false,
+        prices: { input: 3, output: 15, cacheRead: 0.3 },
+    });
+    const result = model.parseResponse({
+        choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1_000_000, completion_tokens: 100_000, total_tokens: 1_100_000, cached_tokens: 500_000 },
+    });
+    assert.deepEqual(result.stats.cost, {
+        input: 3,
+        output: 1.5,
+        cacheRead: 0.15,
+        cacheWrite: 0,
+        total: 4.65,
+    });
+});
+
+test("prices: provider-reported total wins, buckets still computed", () => {
+    const model = new SimpleModel({ modelId: "m", stream: false, prices: { input: 3, output: 15 } });
+    const result = model.parseResponse({
+        choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100, cost: 0.99 },
+    });
+    assert.equal(result.stats.cost.total, 0.99);
+    assert.ok((result.stats.cost.input as number) > 0, "breakdown still computed");
+});
+
+test("prices: absent → zeros as before", () => {
+    const model = new SimpleModel({ modelId: "m", stream: false });
+    const result = model.parseResponse({
+        choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 },
+    });
+    assert.deepEqual(result.stats.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+});
+
+test("honorRetryAfter: false ignores insane values, stamp still lands", async () => {
+    const seen: number[] = [];
+    const model = new SimpleModel({
+        modelId: "m",
+        stream: false,
+        retries: 3,
+        retryDelayMs: 10,
+        honorRetryAfter: false,
+        fetchImpl: (async () => new Response("slow", { status: 429, headers: { "retry-after": "3600" } })) as typeof fetch,
+        onRetry: ({ waitMs, error }) => {
+            seen.push(waitMs);
+            assert.equal((error as { retryAfterMs?: unknown }).retryAfterMs, 3_600_000, "stamp lands regardless");
+            return false; // stop after observing — no trailing sleep
+        },
+    });
+    const { agent } = makeAgent({ script: [() => assistantTurn("unused")] });
+    seedUserMessage(agent, "go");
+    await assert.rejects(() => model.callNextTurn(agent));
+    assert.equal(seen.length, 1);
+    assert.ok((seen[0] as number) < 1000, `backoff applied, not 3600s — got ${seen[0]}`);
 });

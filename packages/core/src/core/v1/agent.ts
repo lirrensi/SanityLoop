@@ -50,6 +50,7 @@ import type {
     Input,
     LoopState,
     Message,
+    ModelCall,
     ModelContract,
     KeyChange,
     EventPayload,
@@ -83,14 +84,15 @@ import { validateToolArgs } from "./tool.ts";
  * extend freely; control events (fromRegistry) are NEVER deferred.
  */
 const SEALED_DEFER_EVENTS = new Set<EventName>([
-    EVENTS.toolUpdate,
+    EVENTS.toolChanged,
     EVENTS.toolListChanged,
 ]);
 
 export interface AgentOptions {
-    model: ModelContract;
+    /** The turn driver — or the full roster (first drives, rest addressable
+     * by preset id via models/call/driveOnce). Single = today's behavior. */
+    model: ModelContract | ModelContract[];
     messages?: Message[];
-    /** Restored session state — resume passes what `restoreSession` rebuilt. */
     state?: Record<string, unknown>;
     tools?: Tool[];
     /** The profile's agentId — pointer to this definition for resume. */
@@ -271,6 +273,14 @@ export class Agent implements GodObject {
     }
     // ---- profile (code, never serialized) ----
     filters: Filter[] = [];
+    /** The model roster — every preset, driver first. Plain field (code, never
+     * serialized); `model` (the driver) stays in data as today. */
+    models: ModelContract[] = [];
+    /** One-shot driver override — consumed by the next money call, then gone. */
+    private driveOnceModel: ModelContract | undefined;
+    /** Side-call controllers — terminate() fires them all; abort()/stop() don't
+     * (side chains are not the loop's job). Deleted on settle. */
+    private sideControllers = new Set<AbortController>();
     /** Installed plugins by id — the extension storage. */
     private pluginMap = new Map<string, Plugin>();
     /** ---- declared registries (private Maps — the agent's contract surface) ---- */
@@ -382,7 +392,20 @@ export class Agent implements GodObject {
         this.description = opts.description ?? "";
         this.activity = "";
         this.cwd = opts.cwd ?? (globalThis as { process?: { cwd?: () => string } }).process?.cwd?.() ?? ".";
-        this.model = opts.model;
+        // ROSTER — one or many. First drives; preset ids auto-assigned from
+        // modelId (deduped) so every preset is addressable out of the box.
+        const roster = Array.isArray(opts.model) ? [...opts.model] : [opts.model];
+        if (roster.length === 0) throw new Error("[sanity] model roster must not be empty — supply at least the driver.");
+        const seenPresetIds = new Set<string>();
+        for (const m of roster) {
+            const base = m.presetId ?? m.modelId;
+            let id = base;
+            for (let n = 2; seenPresetIds.has(id); n++) id = `${base}#${n}`;
+            seenPresetIds.add(id);
+            m.presetId = id;
+        }
+        this.models = roster;
+        this.model = roster[0]!;
         this.messages = opts.messages ?? [];
         this.state = opts.state ?? {};
         // THE LAW — run() CALCULATES NOTHING. It starts with whatever messages
@@ -672,7 +695,7 @@ export class Agent implements GodObject {
 
     // ---- tools: the mutable array ----
 
-    /** Register a tool. Fires toolListChanged (the LIST changed). */
+    /** Register a tool. Big + small: list summary + per-tool detail. */
     addTool(tool: Tool): this {
         // Tool names MUST be unique — they are the sole handle for
         // removeTool / updateTool. A duplicate would be ambiguous to address
@@ -684,7 +707,8 @@ export class Agent implements GodObject {
             );
         }
         this.tools.push(tool);
-        this.fire(EVENTS.toolListChanged, { added: tool.name }, true);
+        this.fire(EVENTS.toolListChanged, { added: [tool.name], cacheBreak: true }, true);
+        this.fire(EVENTS.toolChanged, { toolName: tool.name, change: "added", tool }, true);
         return this;
     }
 
@@ -693,38 +717,59 @@ export class Agent implements GodObject {
         const i = this.tools.findIndex((t) => t.name === name);
         if (i === -1) return false;
         this.tools.splice(i, 1);
-        this.fire(EVENTS.toolListChanged, { removed: name }, true);
+        this.fire(EVENTS.toolListChanged, { removed: [name], cacheBreak: true }, true);
+        this.fire(EVENTS.toolChanged, { toolName: name, change: "removed" }, true);
         return true;
     }
 
     /**
      * Update a tool's DEFINITION in place (schema / description / executionMode).
-     * Fires toolUpdate — the per-tool definition-changed event.
-     * Cache-friendly: same name, same presence, changed guts.
+     * Big + small per aspect: definition keys → updated/cacheBreak, `hidden` →
+     * visibility/cacheBreak. Small carries fields + before/after (O1: one per aspect).
      */
     updateTool(name: string, updates: Partial<Pick<Tool, "description" | "inputSchema" | "outputSchema" | "executionMode" | "hidden">>): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
-        Object.assign(t, updates);
-        this.fire(EVENTS.toolUpdate, { toolName: name, updates }, true);
+        const { hidden: nextHidden, ...rest } = updates;
+        const restKeys = Object.keys(rest);
+        if (restKeys.length > 0) {
+            const before: Record<string, unknown> = {};
+            for (const k of restKeys) before[k] = (t as unknown as Record<string, unknown>)[k];
+            Object.assign(t, rest);
+            const after: Record<string, unknown> = {};
+            for (const k of restKeys) after[k] = (t as unknown as Record<string, unknown>)[k];
+            this.fire(EVENTS.toolListChanged, { updated: [name], cacheBreak: true }, true);
+            this.fire(EVENTS.toolChanged, { toolName: name, change: "definition", fields: restKeys, before, after }, true);
+        }
+        if (nextHidden !== undefined) {
+            const before = t.hidden ?? false;
+            t.hidden = nextHidden;
+            this.fire(EVENTS.toolListChanged, { visibility: [{ name, hidden: nextHidden }], cacheBreak: true }, true);
+            this.fire(EVENTS.toolChanged, { toolName: name, change: "visibility", before, after: nextHidden }, true);
+        }
         return true;
     }
 
-    /** Disable a tool — NON-DESTRUCTIVE (stays in prompt, execute is a no-op). */
+    /** Disable a tool — NON-DESTRUCTIVE (stays in prompt, execute is a no-op).
+     * Big (cacheBreak: false) + small availability delta. */
     disableTool(name: string): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
+        const before = t.disabled ?? false;
         t.disabled = true;
-        this.fire(EVENTS.toolUpdate, { toolName: name, disabled: true }, true);
+        this.fire(EVENTS.toolListChanged, { availability: [{ name, disabled: true }], cacheBreak: false }, true);
+        this.fire(EVENTS.toolChanged, { toolName: name, change: "availability", before, after: true }, true);
         return true;
     }
 
-    /** Enable a previously disabled tool. */
+    /** Enable a previously disabled tool. Big (cacheBreak: false) + small. */
     enableTool(name: string): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
+        const before = t.disabled ?? false;
         t.disabled = false;
-        this.fire(EVENTS.toolUpdate, { toolName: name, disabled: false }, true);
+        this.fire(EVENTS.toolListChanged, { availability: [{ name, disabled: false }], cacheBreak: false }, true);
+        this.fire(EVENTS.toolChanged, { toolName: name, change: "availability", before, after: false }, true);
         return true;
     }
 
@@ -737,25 +782,87 @@ export class Agent implements GodObject {
     }
 
     /** HIDE — out of context (the wire prompt), but still callable by name.
-     * DESTRUCTIVE from the provider's view: the visible tool set changed, so
-     * this cache-busts (toolListChanged), like add/remove. */
+     * Big (cacheBreak: true) + small visibility delta. */
     hideTool(name: string): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
         if (t.hidden) return true; // already hidden — no change, no event
         t.hidden = true;
-        this.fire(EVENTS.toolListChanged, { hidden: name }, true);
+        this.fire(EVENTS.toolListChanged, { visibility: [{ name, hidden: true }], cacheBreak: true }, true);
+        this.fire(EVENTS.toolChanged, { toolName: name, change: "visibility", before: false, after: true }, true);
         return true;
     }
 
-    /** SHOW — back into context. Cache-busts (toolListChanged) when it changes. */
+    /** SHOW — back into context. Big (cacheBreak: true) + small when it changes. */
     showTool(name: string): boolean {
         const t = this.tools.find((t) => t.name === name);
         if (!t) return false;
         if (!t.hidden) return true; // already visible — no change, no event
         t.hidden = false;
-        this.fire(EVENTS.toolListChanged, { shown: name }, true);
+        this.fire(EVENTS.toolListChanged, { visibility: [{ name, hidden: false }], cacheBreak: true }, true);
+        this.fire(EVENTS.toolChanged, { toolName: name, change: "visibility", before: true, after: false }, true);
         return true;
+    }
+
+    // ---- roster: presets, side calls, one-turn swaps ----
+    /** Resolve a roster preset by id, index, or direct reference. */
+    resolvePreset(ref: string | number | ModelContract): ModelContract {
+        if (typeof ref !== "string" && typeof ref !== "number") return ref;
+        const found = typeof ref === "number"
+            ? this.models[ref]
+            : this.models.find((m) => m.presetId === ref);
+        if (!found) throw new Error(`[sanity] unknown preset ${JSON.stringify(ref)} (roster: ${this.models.map((m) => m.presetId).join(", ") || "empty"})`);
+        return found;
+    }
+
+    /** SIDE CALL — run any preset without touching the loop: no pointer swap,
+     * no commit, no stats. `messages` defaults to the live transcript.
+     * Returns the handle (abort/stamp via the adapter); `done` settles with
+     * the TurnResult. Side chains survive abort()/stop() (not the loop's job)
+     * and die on terminate(). */
+    call(ref: string | number | ModelContract, messages?: Message[]): ModelCall {
+        const preset = this.resolvePreset(ref);
+        const controller = new AbortController();
+        this.sideControllers.add(controller);
+        const startedAt = Date.now();
+        // stub ctx: the preset's own messages + NO tools (side calls judge,
+        // they don't act) + an isolated signal (loop-abort must not leak in).
+        const ctx = {
+            messages: messages ?? this.messages,
+            tools: [],
+            visibleTools: () => [],
+            streamSink: undefined,
+            abortSignal: controller.signal,
+            model: preset,
+        } as unknown as GodObject;
+        const done = preset.callNextTurn(ctx).finally(() => {
+            this.sideControllers.delete(controller);
+        });
+        // the adapter minted synchronously at entry — resolve without racing.
+        // Adapters that override callNextTurn without minting (stubs) resolve
+        // nothing: abort falls back to the side controller below.
+        const minted = preset.inFlightCalls?.at(-1);
+        const id = minted ?? `side-${startedAt}`;
+        return {
+            id,
+            done,
+            abort: (reason?: unknown) => {
+                if (minted && preset.abortCall?.(id, reason)) return true;
+                if (!controller.signal.aborted) {
+                    controller.abort(reason ?? `side call ${id} aborted`);
+                    return true;
+                }
+                return false;
+            },
+            startedAt,
+        };
+    }
+
+    /** Drive preset X for EXACTLY one turn, then revert to the driver.
+     * Consumed by the next money call (survives wall parks); bypasses any
+     * installed model wrapper (you asked for X, not wrapper(X)). */
+    driveOnce(ref: string | number | ModelContract): void {
+        this.driveOnceModel = this.resolvePreset(ref);
     }
 
     // ---- control signals ----
@@ -806,6 +913,11 @@ export class Agent implements GodObject {
         // abort() is idempotent + terminal-guarded; an idle agent's abort is a
         // no-op for the loop but still fires the cleanup channel for listeners.
         this.abort(reason);
+        // side chains die here (and ONLY here — abort()/stop() spare them).
+        for (const c of this.sideControllers) {
+            if (!c.signal.aborted) c.abort(reason);
+        }
+        this.sideControllers.clear();
         // THE DEATH RATTLE, ONCE, SYNC — after the abort channel, before the
         // loops break. Storage flush, servers close, join extension, last rites.
         // No veto: terminate proceeds regardless of what listeners do. Sync
@@ -1398,10 +1510,13 @@ export class Agent implements GodObject {
         }
         // THE MONEY CALL — awaited directly. Cancellation stays cooperative
         // through ctx.abortSignal (checked by the model between chunks).
+        // driveOnce override consumed HERE (not at the wall — parks must not eat it).
         this.runState = "generating";
+        const driver = this.driveOnceModel ?? this.model;
+        this.driveOnceModel = undefined;
         let result: TurnResult;
         try {
-            result = await this.model.callNextTurn(this);
+            result = await driver.callNextTurn(this);
         } catch (err) {
             await this.fail(err, "provider");
             return "landed";
@@ -1779,7 +1894,7 @@ export class Agent implements GodObject {
         if (this.stopRequested) facts.stopRequested = true;
         if (this.abortController.signal.aborted) facts.aborted = true;
         // adapter/tool-authored structured facts — forwarded verbatim
-        for (const k of ["reason", "code", "status", "retryable", "truncated", "attempts", "elapsedMs"] as const) {
+        for (const k of ["reason", "code", "status", "retryable", "retryAfterMs", "truncated", "attempts", "elapsedMs", "attemptAborted"] as const) {
             const v = (err as Record<string, unknown> | null)?.[k];
             if (v !== undefined) facts[k] = v;
         }

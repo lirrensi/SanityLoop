@@ -1,6 +1,6 @@
 ---
 node_type: reference
-title: The Event Contract — 38 core events
+title: The Event Contract — 41 core events
 status: active
 updated: 2026-08-22
 tags: [events, contract, reference]
@@ -16,7 +16,7 @@ last_synced: 2026-08-23
 
 # The Event Contract
 
-38 events, loop-emitted, guaranteed, versioned. The loop fires them in a
+41 events, loop-emitted, guaranteed, versioned. The loop fires them in a
 fixed order — that is what makes restore and "state is truth" work. Listen
 with `addFilter({ event: EVENTS.x, ... })`. Announce your own with
 `agent.emit("your/event", payload)`.
@@ -60,16 +60,16 @@ Verified against `EVENTS` in `packages/core/src/core/v1/types.ts`
 | `messageRemoved` | a message removed via splice/pop/shift (observer) |
 | `fragmentUpdate` | a compound fragment's block changed (observer) |
 
-## Tools (6)
+## Tools (7)
 
 | Event | When |
 | --- | --- |
 | `beforeTool` | per-call gate — blocking wall; carries `{ batch, call, tool }` |
 | `afterTool` | the patch point — rewrite the result before commit |
 | `toolStart` | execution began |
-| `toolUpdate` | a tool's DEFINITION changed (schema/description/disabled) |
+| `toolChanged` | one tool changed — per-tool detail `{ toolName, change, before, after }` |
 | `toolEnd` | execution done |
-| `toolListChanged` | the tool LIST mutated at runtime |
+| `toolListChanged` | the tool LIST changed — summary `{ added, removed, updated, visibility, availability, cacheBreak }` |
 
 ## Output stream (6)
 
@@ -104,8 +104,8 @@ at depth 32). A filter throw never breaks the queue — it fires
 ## Sealed-phase deferral
 
 While the tool batch executes the transcript is SEALED. Events in the
-deferral whitelist — `toolUpdate`, `toolListChanged` — fired mid-batch are
-HELD in the lane and drain at the seams (`closeCycle` / `land`), after tool
+deferral whitelist — `toolChanged`, `toolListChanged` — fired mid-batch are
+held in the lane and drain at the seams (`closeCycle` / `land`), after tool
 results commit. Control/abort events are never deferred.
 
 ## Custom events

@@ -69,6 +69,17 @@ const model = new SimpleModel({
 //     baseUrl: "http://localhost:58080/v1",     // your llama.cpp server
 // });
 
+// --- OPTION D: roster — many presets, one driver ---------------------------
+// WANT: side models (judge, cheap summarizer, vision...) alongside the driver?
+// HOW:  pass an ARRAY. First drives; rest addressable by preset id.
+//       Presets are meaning-free values — YOU map meaning in your own code.
+//
+// const judge = new SimpleModel({ modelId: "gpt-4o-mini", presetId: "judge" });
+// const agent = new Agent({ model: [model, judge], ... });
+// agent.call("judge", messages);   // side call: no swap, no commit, no stats
+// agent.driveOnce("judge");        // loop drives judge for exactly one turn
+// model.abortCall();               // kill the in-flight call, loop continues
+
 // ============================================================================
 // §2 — STORAGE: where state lives between runs (and whether it lives at all)
 // ============================================================================
@@ -119,6 +130,12 @@ const myTools = [echoTool];   // ← collect tools here, feed them to the agent 
 //
 // import { createBasicTools } from "@sanityloop/basic-fs-tools";
 // myTools.push(...Object.values(createBasicTools()));   // read + edit + write
+//
+// WANT: unified-diff `patch` instead of exact-string `edit`? Same kit, one slot:
+//
+// myTools.push(...Object.values(createBasicTools({ edit: "patch" })));
+//
+// Pick ONE edit kit per agent: basic/simple, basic/patch, or hashline below.
 
 // --- OPTION: file tools, drift-proof edition -------------------------------
 // WANT: precise, conflict-safe edits that survive the file changing under the
@@ -375,13 +392,23 @@ agent.install(createQuitOnEndPlugin());
 // import { createSentryPlugin } from "@sanityloop/sentry";
 // agent.install(createSentryPlugin({ dsn: process.env.SENTRY_DSN }));
 
-// ---- LOOP CONTROL — watchdogs for unattended runs ─────────────────────────
-// WHAT: doom-loop detection (same tool failing repeatedly) + max-turns budget.
-// WANT: cron/unattended runs where nobody watches. The doctrine says a strong
-//       model needs none of this — production paranoia disagrees.
+// ---- LOOP CONTROL — the resilience dial for unattended runs ───────────────
+// WHAT: two dials, one plugin. HOW MUCH it runs: maxTurns/maxSteps/maxTokens/
+//       maxTime/maxCost budgets (breach = committed wrap-up + stop, the money
+//       call that would breach never fires). HOW BULLETPROOF: harden (provider
+//       retry + fallback chain + stall watchdogs — failures synthesize an
+//       honest message instead of dying), tool retry, circuit breaker (disable
+//       a tool that keeps erroring), malformed (veto empty responses), doom,
+//       spin guard. All default-off; cost needs model prices (SimpleModel
+//       { prices }) to be real. WANT: cron/unattended/worker runs.
 //
 // import { loopControl } from "@sanityloop/loop-control";
-// agent.install(loopControl({ maxTurns: { enabled: true, cap: 50 } }));
+// agent.install(loopControl({
+//   maxTurns: { enabled: true, cap: 50 },
+//   maxCost: { enabled: true, capUsd: 1.0 },
+//   harden: { enabled: true, attempts: 2, stall: { idleMs: 60_000 } },
+//   circuitBreaker: { enabled: true },
+// }));
 
 // ============================================================================
 // §6 — YOUR FILTERS: hook ANY moment of the loop. One shape, everywhere.

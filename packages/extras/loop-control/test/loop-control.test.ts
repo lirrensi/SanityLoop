@@ -273,3 +273,203 @@ test("spinGuard: consecutive DISCARDED cycles trip the guard (stuck veto filter)
     const st = agent.state.loopControl as { lastAction?: string } | undefined;
     assert.equal(st?.lastAction, "spin-guard", "spin guard recorded");
 });
+
+test("maxTime: wall-clock breach stops before the next provider call", async () => {
+    const model = new StubModel([
+        () => toolCallTurn([callTo("dummy", { tag: "a" }, "t-1")]),
+        () => toolCallTurn([callTo("dummy", { tag: "b" }, "t-2")]),
+        () => assistantTurn("never"),
+    ]);
+    const tool = Tool.define({
+        name: "dummy", description: "d", inputSchema: { type: "object" },
+        async execute() {
+            // GENUINE wall-clock: the governor reads Date.now() and the loop
+            // beats on real 10ms ticks — fake timers cannot drive this.
+            const { promise, resolve } = Promise.withResolvers<void>();
+            setTimeout(resolve, 60); // burn the budget mid-turn
+            await promise;
+            return { answer: "ran" };
+        },
+    });
+    const agent = new Agent({ model, tools: [tool], agentId: "max-time-test" });
+    agent.install(loopControl({ maxTime: { enabled: true, capMs: 30 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(model.calls.length, 1, "second provider call never fired — the wall held");
+    const texts = userTexts(agent);
+    assert.ok(texts.some((t) => t.includes("Time budget exhausted")), "wrap-up message pushed");
+    const st = agent.state.loopControl as { lastAction?: string } | undefined;
+    assert.equal(st?.lastAction, "max-time");
+});
+
+test("maxCost: spend breach refuses the next provider call", async () => {
+    const priceyCall = (id: string) => toolCallTurn([callTo("dummy", { tag: id }, id)], { cost: { total: 0.06 } });
+    const model = new StubModel([
+        () => priceyCall("c-1"),
+        () => priceyCall("c-2"),
+        () => assistantTurn("never"),
+    ]);
+    const tool = Tool.define({
+        name: "dummy", description: "d", inputSchema: { type: "object" },
+        async execute() { return { answer: "ran" }; },
+    });
+    const agent = new Agent({ model, tools: [tool], agentId: "max-cost-test" });
+    agent.install(loopControl({ maxCost: { enabled: true, capUsd: 0.1 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    // 0 → call 1 (0.06) → call 2 (0.12) → wall: 0.12 >= 0.1, third call refused
+    assert.equal(model.calls.length, 2, "third provider call never fired");
+    assert.ok(agent.stats.cost.total >= 0.1, `spend recorded: ${agent.stats.cost.total}`);
+    const st = agent.state.loopControl as { lastAction?: string } | undefined;
+    assert.equal(st?.lastAction, "max-cost");
+});
+
+test("maxTokens: token breach stops before the next provider call", async () => {
+    const heavyCall = (id: string) => toolCallTurn([callTo("dummy", { tag: id }, id)], { totalTokens: 600, input: 500, output: 100 });
+    const model = new StubModel([
+        () => heavyCall("k-1"),
+        () => heavyCall("k-2"),
+        () => assistantTurn("never"),
+    ]);
+    const tool = Tool.define({
+        name: "dummy", description: "d", inputSchema: { type: "object" },
+        async execute() { return { answer: "ran" }; },
+    });
+    const agent = new Agent({ model, tools: [tool], agentId: "max-tokens-test" });
+    agent.install(loopControl({ maxTokens: { enabled: true, cap: 1000 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    // 0 → call 1 (600) → call 2 (1200) → wall: 1200 >= 1000, third call refused
+    assert.equal(model.calls.length, 2, "third provider call never fired");
+    assert.ok(agent.stats.totalTokens >= 1000, `tokens recorded: ${agent.stats.totalTokens}`);
+    const st = agent.state.loopControl as { lastAction?: string } | undefined;
+    assert.equal(st?.lastAction, "max-tokens");
+});
+
+test("governors: disabled by default, cap 0 = unlimited", async () => {
+    const { agent, seedAndKick } = makeAgent(
+        [() => assistantTurn("done")],
+        { maxTime: { enabled: true, capMs: 0 }, maxCost: { enabled: true, capUsd: 0 }, maxTokens: { enabled: true, cap: 0 } },
+    );
+    let landedLoopState: string | undefined;
+    await withDriver(agent, async () => {
+        seedAndKick();
+        await awaitLanded(agent);
+        landedLoopState = agent.loopState;
+    });
+    assert.equal(landedLoopState, "idle", "zero caps never trip");
+    assert.equal(agent.state.loopControl, undefined, "no governor action recorded");
+});
+
+test("circuitBreaker: opens after N consecutive errors, tool stops executing", async () => {
+    let n = 0;
+    const bad = Tool.define({
+        name: "bad",
+        description: "always fails",
+        inputSchema: { type: "object" },
+        async execute() {
+            n++;
+            return { answer: "boom", error: true, errorMessage: "500 down" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("bad", {}, "b-1")]),
+        () => toolCallTurn([callTo("bad", {}, "b-2")]),
+        () => toolCallTurn([callTo("bad", {}, "b-3")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [bad], agentId: "breaker-test" });
+    agent.install(loopControl({ circuitBreaker: { enabled: true, errors: 2, cooldownMs: 0 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(n, 2, "third call short-circuited — execute never ran");
+    const results = agent.messages.filter((m) => m.type === "toolResult");
+    assert.equal(results.length, 3);
+    const third = (results[2].content as { answer: string }).answer;
+    assert.match(third, /currently disabled/, "disabled answer committed, model informed");
+    const st = agent.state.loopControl as { lastAction?: string; tool?: string } | undefined;
+    assert.equal(st?.lastAction, "breaker-open");
+    assert.equal(st?.tool, "bad");
+});
+
+test("circuitBreaker: success resets, tool left enabled", async () => {
+    let n = 0;
+    const flaky = Tool.define({
+        name: "flaky",
+        description: "fails twice, then works",
+        inputSchema: { type: "object" },
+        async execute() {
+            n++;
+            if (n <= 2) return { answer: "boom", error: true, errorMessage: "500 down" };
+            return { answer: "recovered" };
+        },
+    });
+    const model = new StubModel([
+        () => toolCallTurn([callTo("flaky", {}, "f-1")]),
+        () => toolCallTurn([callTo("flaky", {}, "f-2")]),
+        () => toolCallTurn([callTo("flaky", {}, "f-3")]),
+        () => assistantTurn("done"),
+    ]);
+    const agent = new Agent({ model, tools: [flaky], agentId: "breaker-heal" });
+    // errors: 3 — never opens (third call succeeds, resetting at 2)
+    agent.install(loopControl({ circuitBreaker: { enabled: true, errors: 3, cooldownMs: 30 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(n, 3, "all three executed — breaker never opened");
+    const tool = agent.tools.find((t) => t.name === "flaky");
+    assert.equal(tool?.disabled, undefined, "tool left enabled");
+});
+
+test("malformed: empty responses vetoed silently, nudge at the cap", async () => {
+    const empty = (): TurnResult => ({
+        message: { id: `e-${Math.random()}`, enabled: true, type: "assistant", content: [{ type: "text", content: "   " }] },
+        stats: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop",
+    });
+    const model = new StubModel([empty, empty, empty, () => assistantTurn("finally")]);
+    const agent = new Agent({ model, agentId: "malformed-test" });
+    agent.install(loopControl({ malformed: { enabled: true, strikes: 2 } }));
+    await withDriver(agent, async () => {
+        agent.messages.push({
+            id: "u-1", enabled: true, type: "user", committedAt: Date.now(),
+            content: [{ type: "text", content: "go" }],
+        });
+        agent.input({ type: "__test_kick__" });
+        await awaitLanded(agent);
+    });
+    assert.equal(model.calls.length, 4, "three empties vetoed, fourth committed");
+    const assistants = agent.messages.filter((m) => m.type === "assistant");
+    assert.equal(assistants.length, 1, "no empty commit pollutes the transcript");
+    const texts = userTexts(agent);
+    assert.ok(texts.some((t) => t.includes("empty")), "nudge pushed at the strike cap");
+});

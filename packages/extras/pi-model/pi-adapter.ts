@@ -30,13 +30,14 @@ import type {
   GodObject,
   Message,
   MediaBlock,
+  ModelPrices,
   StreamSink,
   ToolResultContent,
   ToolResultMessage,
   TurnResult,
 } from "@sanityloop/core";
 import type { ToolCallRecord } from "@sanityloop/core";
-import { SimpleModel } from "@sanityloop/core";
+import { SimpleModel, attemptAborted } from "@sanityloop/core";
 
 /** Our ContentBlock → pi-ai user/toolResult part. Text stays text; image passes through; audio/video/document ride as text descriptors (pi-ai has no slots for them). Custom wire-ready parts ({type with underscore, e.g. video_url/image_url}) pass verbatim. */
 export function toPiParts(content: unknown): { type: string; text?: string; data?: string; mimeType?: string }[] {
@@ -81,6 +82,8 @@ export interface PiAdapterModelOptions {
 	maxTokens?: number;
 	/** The context window — the compaction trigger reads this. */
 	maxContext?: number;
+	/** Price card ($/1M tokens) — forwarded to SimpleModel; cost computed from token buckets. */
+	prices?: ModelPrices;
 }
 
 /** The cross-provider model — pi-ai guts, SimpleModel contract. */
@@ -97,6 +100,7 @@ export class PiAdapterModel extends SimpleModel {
 			temperature: opts.temperature,
 			maxOutputTokens: opts.maxTokens,
 			maxContext: opts.maxContext,
+			prices: opts.prices,
 		});
 		this.provider = opts.provider;
 		// informational only — the loop never interprets `api`
@@ -108,14 +112,19 @@ export class PiAdapterModel extends SimpleModel {
 	// so this override assembles the full Context (seam + tools) and calls down.
 	// ==========================================================================
 	override async callNextTurn(agent: GodObject): Promise<TurnResult> {
-		const base = this.prepareMessages(agent.messages) as PiContext;
-		const context: PiContext = {
-			...base,
-			// visibleTools() = the wire list — hidden tools stay callable but never reach context
-			tools: this.toolsToPi(agent.visibleTools()),
-		};
-		const response = await this.callApi(context, agent.streamSink, agent);
-		return this.parseResponse(response);
+		const { id: callId, signal: callSignal } = this.mintCall();
+		try {
+			const base = this.prepareMessages(agent.messages) as PiContext;
+			const context: PiContext = {
+				...base,
+				// visibleTools() = the wire list — hidden tools stay callable but never reach context
+				tools: this.toolsToPi(agent.visibleTools()),
+			};
+			const response = await this.callApi(context, agent.streamSink, agent, callSignal);
+			return this.parseResponse(response);
+		} finally {
+			this.settleCall(callId);
+		}
 	}
 
 	// ==========================================================================
@@ -247,9 +256,11 @@ export class PiAdapterModel extends SimpleModel {
 		apiMessages: unknown,
 		sink: StreamSink | undefined,
 		agent: GodObject,
+		callSignal?: AbortSignal,
 	): Promise<unknown> {
 		const context = apiMessages as PiContext;
-
+		const loopSignal = agent.abortSignal;
+		const combined = callSignal ? AbortSignal.any([loopSignal, callSignal]) : loopSignal;
 		// lazy-optional: pi-ai loads ONLY when this model is actually used.
 		// @sanityloop/extras ships zero deps; this subpath declares its need.
 		let piSdk: typeof import("@earendil-works/pi-ai");
@@ -292,7 +303,7 @@ export class PiAdapterModel extends SimpleModel {
 				) => AssistantMessageEventStream
 			)(requestModel, context, {
 				apiKey: this.apiKey ?? resolveEnvKey(this.provider),
-				signal: agent.abortSignal,
+				signal: combined,
 				temperature: this.temperature,
 				maxTokens: this.maxOutputTokens,
 			}),
@@ -304,6 +315,7 @@ export class PiAdapterModel extends SimpleModel {
 			agent,
 			this.provider,
 			this.modelId,
+			combined,
 		);
 		return final; // AssistantMessage → parseResponse
 	}
@@ -426,12 +438,13 @@ async function consumePiStream(
 	agent: GodObject,
 	provider: string,
 	modelId: string,
+	signal?: AbortSignal,
 ): Promise<AssistantMessage> {
 	sink?.emit({ type: "streamStarted" });
 	let final: AssistantMessage | undefined;
 
 	for await (const ev of stream) {
-		if (agent.abortSignal?.aborted) break; // cooperative stop — "kill it now"
+		if ((signal ?? agent.abortSignal)?.aborted) break; // cooperative stop — "kill it now"
 		switch (ev.type) {
 			case "text_delta":
 				sink?.emit({ type: "textDelta", delta: ev.delta });
@@ -454,6 +467,9 @@ async function consumePiStream(
 		}
 	}
 
+	// call-abort mid-stream throws the stamped decision (loop-abort just breaks —
+	// the providerStep terminal check discards the partial on that path).
+	if (signal?.aborted && !agent.abortSignal?.aborted) throw attemptAborted(signal.reason);
 	sink?.emit({ type: "textEnd" });
 	if (!final)
 		throw new Error(
