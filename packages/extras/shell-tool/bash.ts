@@ -231,7 +231,7 @@ interface RunFacts {
 function collectFacts(
   output: OutputAccumulator,
   verdict: { timedOut: boolean; aborted: boolean; exitCode: number | undefined; execError: unknown },
-  timeoutSec: number | undefined,
+  hardTimeoutSec: number | undefined,
 ): RunFacts {
   output.finish();
   const snapshot = output.snapshot({ persistIfTruncated: true });
@@ -245,7 +245,7 @@ function collectFacts(
   } else if (verdict.timedOut) {
     answer = appendStatus(
       answer,
-      `Command timed out after ${String(timeoutSec)} seconds. Retry with a larger timeout if the command is expected to take longer.`,
+      `Command timed out after ${String(hardTimeoutSec)} seconds. Retry with a larger hardTimeout if the command is expected to take longer.`,
     );
   } else if (verdict.exitCode !== 0) {
     answer = appendStatus(answer, `Command exited with code ${verdict.exitCode}.`);
@@ -283,31 +283,49 @@ function resultFromFacts(facts: RunFacts, final: BashSpawnContext, description: 
 
 const DEFAULT_AUTO_THRESHOLD_MS = 60_000;
 
+/** Soft timeout default: none — `timeout` only takes effect when the caller sets it. */
+const DEFAULT_HARD_TIMEOUT_MS: number | undefined = undefined;
+
 /**
- * Foreground-wait budget: bounded by the call's own timeout minus a buffer so
- * a deadline expiry resolves inline instead of backgrounding moments before
- * it fires. `0` = background immediately. (OMP's resolveAutoBackgroundWaitMs.)
+ * Foreground-wait budget: the auto-background threshold. The soft timeout runs
+ * as its own racer (not a cap on this budget): whichever fires first decides
+ * what the call returns — "still running" on soft expiry, background notice on
+ * threshold. `0` = background immediately. (OMP's resolveAutoBackgroundWaitMs,
+ * minus the old timeout-minus-buffer cap that made no sense once timeouts stop killing.)
  */
-function resolveAutoBackgroundWaitMs(thresholdMs: number, timeoutMs: number | undefined): number {
+function resolveAutoBackgroundWaitMs(thresholdMs: number): number {
   if (thresholdMs <= 0) return 0;
-  if (timeoutMs === undefined) return thresholdMs;
-  return Math.max(0, Math.min(thresholdMs, timeoutMs - 1000));
+  return thresholdMs;
 }
 
-type RaceOutcome = { kind: "settled" } | { kind: "threshold" } | { kind: "aborted" };
+type RaceOutcome =
+  | { kind: "settled" }
+  | { kind: "threshold" }
+  | { kind: "aborted" }
+  | { kind: "softTimeout" };
 
 /**
- * Race a job's settlement against the auto-background threshold + the abort
- * signal. (OMP's raceJobSettlement minus the steering leg — v1 has no peer
- * messaging to yield to.) Timer is cleared on every path — never a leak.
+ * Race a job's settlement against the auto-background threshold, the SOFT
+ * timeout, and the abort signal. The soft timeout NEVER kills — the winner
+ * just tells the caller to return "still running" while the job keeps going
+ * in the manager. (OMP's raceJobSettlement minus the steering leg — v1 has no
+ * peer messaging to yield to.) Timer is cleared on every path — never a leak.
  */
-function raceJobSettlement(completion: Promise<unknown>, waitMs: number, signal?: AbortSignal): Promise<RaceOutcome> {
+function raceJobSettlement(
+  completion: Promise<unknown>,
+  waitMs: number,
+  softTimeoutMs: number | undefined,
+  signal?: AbortSignal,
+): Promise<RaceOutcome> {
   if (signal?.aborted) return Promise.resolve({ kind: "aborted" });
+  if (softTimeoutMs !== undefined && softTimeoutMs <= 0) return Promise.resolve({ kind: "threshold" });
   if (waitMs <= 0) return Promise.resolve({ kind: "threshold" });
   // no Promise.withResolvers — target is ES2022; executor form is the fit here
   let resolve!: (v: RaceOutcome) => void;
   const promise = new Promise<RaceOutcome>((res) => { resolve = res; });
   const timer = setTimeout(() => resolve({ kind: "threshold" }), waitMs);
+  const softTimer =
+    softTimeoutMs === undefined ? undefined : setTimeout(() => resolve({ kind: "softTimeout" }), softTimeoutMs);
   const onAbort = (): void => resolve({ kind: "aborted" });
   signal?.addEventListener("abort", onAbort, { once: true });
   void completion.then(
@@ -316,18 +334,28 @@ function raceJobSettlement(completion: Promise<unknown>, waitMs: number, signal?
   );
   void promise.finally(() => {
     clearTimeout(timer);
+    clearTimeout(softTimer);
     signal?.removeEventListener("abort", onAbort);
   });
   return promise;
 }
 
-function formatBackgroundNotice(jobId: string, timeoutSec: number | undefined): string {
-  const deadline =
-    timeoutSec === undefined
-      ? "(no deadline)"
-      : `(killed once it has run ${timeoutSec}s in total; \`timeout: 0\` disables the deadline)`;
+function formatStillRunningNotice(jobId: string, elapsedSec: number, timeoutSec: number, outputTail: string): string {
+  const tail = outputTail && outputTail !== "(no output)" ? `\n\nOutput so far:\n${outputTail}` : "";
   return (
-    `Backgrounded as job ${jobId} ${deadline}; its output arrives as a new message the moment it finishes. ` +
+    `Still running as job ${jobId} after ${elapsedSec}s (soft timeout: ${timeoutSec}s) — the command was NOT killed and keeps running. ` +
+    `Use \`job_read\` to poll, \`job_send\`/\`job_key\` to write to its stdin, \`job_wait\` to block, or \`job_kill\` to stop it.${tail}`
+  );
+}
+
+function formatBackgroundNotice(jobId: string, timeoutSec: number | undefined, hardTimeoutSec: number | undefined): string {
+  const soft = timeoutSec === undefined ? "(no soft deadline)" : `(soft timeout: still running after ${timeoutSec}s; \`timeout: 0\` disables it)`;
+  const hard =
+    hardTimeoutSec === undefined
+      ? "(no hard deadline — runs until it exits or is killed)"
+      : `(hard kill after ${hardTimeoutSec}s in total)`;
+  return (
+    `Backgrounded as job ${jobId} ${soft} ${hard}; its output arrives as a new message the moment it finishes. ` +
     `Do NOT poll for it (no \`sleep\`, \`ps\`, \`jobs\` loops): every poll is a wasted turn. ` +
     `Do other work, \`job_wait\` if blocked, or end your reply and wait to be woken.`
   );
@@ -381,7 +409,7 @@ function createJobTools(getManager: ManagerOf) {
 
   const jobRead = Tool.define({
     name: "job_read",
-    description: "Inspect one background job: status + output tail. Never consumes delivery.",
+    description: "Inspect one background job: status + live output tail. Never consumes delivery.",
     promptSnippet: "Inspect a background job",
     inputSchema: {
       type: "object",
@@ -396,9 +424,94 @@ function createJobTools(getManager: ManagerOf) {
       const job = m.get(id);
       if (!job) return { answer: `job_read: no such job: ${id}`, error: true, errorMessage: "no such job" };
       const lines = [jobLine(m, job)];
-      if (job.resultText) lines.push("", job.resultText);
+      if (job.status === "running" && job.input) {
+        const tail = job.input.tail();
+        lines.push("", tail && tail !== "(no output)" ? tail : "(still running — no output yet)");
+      } else if (job.resultText) lines.push("", job.resultText);
       else if (job.status === "running") lines.push("", "(still running — no output yet)");
       return { answer: lines.join("\n") };
+    },
+  });
+
+  const jobSend = Tool.define({
+    name: "job_send",
+    description:
+      "Send text to a running background job's stdin (answer an interactive prompt). " +
+      "No trailing newline is added — include `\\n` (or use job_key ENTER) to submit a line.",
+    promptSnippet: "Send input to a background job",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Job id (bg_N)" },
+        text: { type: "string", description: "Text to write to the job's stdin" },
+      },
+      required: ["id", "text"],
+    },
+    async execute(params) {
+      const m = need();
+      if (!m) return missing;
+      const { id, text } = params as { id?: unknown; text?: unknown };
+      if (typeof id !== "string") return { answer: "job_send: `id` is required", error: true, errorMessage: "id required" };
+      if (typeof text !== "string") return { answer: "job_send: `text` is required", error: true, errorMessage: "text required" };
+      const job = m.get(id);
+      if (!job) return { answer: `job_send: no such job: ${id}`, error: true, errorMessage: "no such job" };
+      if (job.status !== "running" || !job.input) return { answer: `job_send: ${id} already ${job.status} — input goes nowhere`, error: true, errorMessage: "job settled" };
+      const ok = job.input.write(text);
+      if (!ok) return { answer: `job_send: ${id} stdin is closed — the process is not reading input`, error: true, errorMessage: "stdin closed" };
+      return { answer: `Sent ${text.length} chars to ${id}.` };
+    },
+  });
+
+  const jobKey = Tool.define({
+    name: "job_key",
+    description:
+      "Send a special key to a running background job's stdin: ENTER, TAB, ESC, UP, DOWN, LEFT, RIGHT, CTRL_C (interrupts the job), CTRL_D (EOF), or raw text via job_send.",
+    promptSnippet: "Send a key to a background job",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Job id (bg_N)" },
+        key: {
+          type: "string",
+          description: "Key name: ENTER, TAB, ESC, UP, DOWN, LEFT, RIGHT, CTRL_C, CTRL_D",
+        },
+      },
+      required: ["id", "key"],
+    },
+    async execute(params) {
+      const m = need();
+      if (!m) return missing;
+      const { id, key } = params as { id?: unknown; key?: unknown };
+      if (typeof id !== "string") return { answer: "job_key: `id` is required", error: true, errorMessage: "id required" };
+      if (typeof key !== "string") return { answer: "job_key: `key` is required (ENTER, TAB, ESC, UP, DOWN, LEFT, RIGHT, CTRL_C, CTRL_D)", error: true, errorMessage: "key required" };
+      const job = m.get(id);
+      if (!job) return { answer: `job_key: no such job: ${id}`, error: true, errorMessage: "no such job" };
+      if (job.status !== "running" || !job.input) return { answer: `job_key: ${id} already ${job.status} — input goes nowhere`, error: true, errorMessage: "job settled" };
+      const name = key.trim().toUpperCase();
+      if (name === "CTRL_C" || name === "C-C" || name === "SIGINT") {
+        job.input.interrupt();
+        return { answer: `Sent Ctrl-C to ${id}.` };
+      }
+      const seq: Record<string, string> = {
+        ENTER: "\n",
+        TAB: "\t",
+        ESC: "\x1b",
+        UP: "\x1b[A",
+        DOWN: "\x1b[B",
+        RIGHT: "\x1b[C",
+        LEFT: "\x1b[D",
+        CTRL_D: "\x04",
+      };
+      const bytes = seq[name];
+      if (bytes === undefined) {
+        return { answer: `job_key: unknown key '${key}' — want ENTER, TAB, ESC, UP, DOWN, LEFT, RIGHT, CTRL_C, CTRL_D`, error: true, errorMessage: "unknown key" };
+      }
+      if (name === "CTRL_D") job.input.end();
+      else {
+        const ok = job.input.write(bytes);
+        if (!ok) return { answer: `job_key: ${id} stdin is closed — the process is not reading input`, error: true, errorMessage: "stdin closed" };
+      }
+      return { answer: `Sent ${name} to ${id}.` };
     },
   });
 
@@ -469,7 +582,7 @@ function createJobTools(getManager: ManagerOf) {
     },
   });
 
-  return [jobs, jobRead, jobKill, jobWait];
+  return [jobs, jobRead, jobKill, jobWait, jobSend, jobKey];
 }
 
 // ---------------------------------------------------------------------------
@@ -501,8 +614,8 @@ export function createBashTool(options: BashToolOptions = {}) {
             "`workdir` sets the working directory for this command only (absolute, `~` for home, git-bash style `/c/...`, or relative to the agent cwd; defaults to the agent cwd). " +
             "Returns combined stdout+stderr. Large output is truncated to the last lines, with the full output saved to a temp file. " +
             (background
-                ? "`timeout` is optional (seconds, whole-run deadline); `0` disables the deadline. `background: true` returns a job id immediately; slow calls auto-background and deliver on completion. "
-                : "`timeout` is optional (seconds) — no default, commands run to completion unless one is given. ") +
+                ? "`timeout` is the SOFT deadline (seconds): at expiry the call returns “still running” with a job id and the job keeps going — poll with `job_read`, write with `job_send`/`job_key`, block with `job_wait`, kill with `job_kill`. `0` disables it. `hardTimeout` is the HARD kill deadline (seconds, off unless set) — the process tree dies when it fires. `background: true` returns a job id immediately; slow calls auto-background and deliver on completion. "
+                : "`timeout` is the soft deadline (seconds) — at expiry the call returns “still running” text instead of killing the run; `hardTimeout` kills. No defaults — commands run to completion unless set. ") +
             "`description` should say WHY the command is being run (it is logged and shown for approval).",
         promptSnippet: `Execute a ${shell.label} command`,
         promptGuidelines: [
@@ -528,12 +641,12 @@ export function createBashTool(options: BashToolOptions = {}) {
                 timeout: {
                     type: "number",
                     description: background
-                        ? "Timeout in seconds (whole-run deadline). Optional; `0` disables the deadline."
-                        : "Timeout in seconds. Optional — no default timeout.",
+                        ? "Soft deadline in seconds: at expiry return “still running” + job id, keep the job alive. Optional; `0` disables it."
+                        : "Soft deadline in seconds: at expiry return “still running” instead of killing. Optional — no default.",
                 },
-                description: {
-                    type: "string",
-                    description: "Why you are running this command (for logging and approval). Optional.",
+                hardTimeout: {
+                    type: "number",
+                    description: "Hard kill deadline in seconds: the process tree dies when it fires. Optional — off unless set.",
                 },
                 ...(background
                     ? {
@@ -547,10 +660,11 @@ export function createBashTool(options: BashToolOptions = {}) {
             required: ["command"],
         },
         async execute(params, agent) {
-            const { command, workdir, timeout, description, background: bgParam } = params as {
+            const { command, workdir, timeout, hardTimeout, description, background: bgParam } = params as {
                 command?: unknown;
                 workdir?: unknown;
                 timeout?: unknown;
+                hardTimeout?: unknown;
                 description?: unknown;
                 background?: unknown;
             };
@@ -559,12 +673,21 @@ export function createBashTool(options: BashToolOptions = {}) {
                 return { answer: "bash: `command` is required and must be a string", error: true, errorMessage: "command required" };
             }
             const timeoutSec = timeout === undefined ? undefined : timeout;
+            const hardTimeoutSec = hardTimeout === undefined ? undefined : hardTimeout;
             if (background) {
                 if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec < 0)) {
                     return { answer: `bash: invalid timeout '${String(timeout)}' — must be 0 (no deadline) or a positive number of seconds`, error: true, errorMessage: "invalid timeout" };
                 }
-            } else if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0)) {
-                return { answer: `bash: invalid timeout '${String(timeout)}' — must be a positive number of seconds`, error: true, errorMessage: "invalid timeout" };
+                if (hardTimeoutSec !== undefined && (typeof hardTimeoutSec !== "number" || !Number.isFinite(hardTimeoutSec) || hardTimeoutSec <= 0)) {
+                    return { answer: `bash: invalid hardTimeout '${String(hardTimeout)}' — must be a positive number of seconds`, error: true, errorMessage: "invalid hardTimeout" };
+                }
+            } else {
+                if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0)) {
+                    return { answer: `bash: invalid timeout '${String(timeout)}' — must be a positive number of seconds`, error: true, errorMessage: "invalid timeout" };
+                }
+                if (hardTimeoutSec !== undefined && (typeof hardTimeoutSec !== "number" || !Number.isFinite(hardTimeoutSec) || hardTimeoutSec <= 0)) {
+                    return { answer: `bash: invalid hardTimeout '${String(hardTimeout)}' — must be a positive number of seconds`, error: true, errorMessage: "invalid hardTimeout" };
+                }
             }
             // the manager arrives via install() — a bare tool never has one
             const manager = (agent.transient["bash.jobs"] as JobManager | undefined) ?? null;
@@ -582,20 +705,36 @@ export function createBashTool(options: BashToolOptions = {}) {
             };
             if (coreutilsBin) ensureOnPath(spawnContext.env, coreutilsBin);
             const final = options.spawnHook ? options.spawnHook(spawnContext) : spawnContext;
-            const timeoutMs =
+            // SOFT timeout (tool-side race) vs HARD timeout (process kill, shell-side).
+            // `timeout` never reaches the shell — at expiry we return "still running"
+            // and the job keeps going. Only `hardTimeout` arms the kill timer.
+            const softTimeoutMs =
                 typeof timeoutSec === "number" && timeoutSec > 0 ? Math.round(timeoutSec * 1000) : undefined;
+            const hardTimeoutMs =
+                typeof hardTimeoutSec === "number" && hardTimeoutSec > 0
+                    ? Math.round(hardTimeoutSec * 1000)
+                    : DEFAULT_HARD_TIMEOUT_MS;
 
             const output = new OutputAccumulator({
                 maxLines: options.maxLines,
                 maxBytes: options.maxBytes,
                 tempFilePrefix: options.tempFilePrefix,
             });
+            /** Live output tail for job_read while the job still runs. */
+            const liveTail = (): string => {
+                try {
+                    const snapshot = output.snapshot();
+                    return formatOutput(snapshot, output.getLastLineBytes());
+                } catch {
+                    return "(no output)";
+                }
+            };
             /** Spawn now; the caller owns the completion (await inline or park in a job). */
             const spawn = (): RunningShell =>
                 startLocalShell(final.command, {
                     cwd: final.cwd,
                     env: final.env,
-                    timeoutMs,
+                    timeoutMs: hardTimeoutMs,
                     abortSignal: agent.abortSignal,
                     shell,
                     onData: (data) => output.append(data),
@@ -617,14 +756,63 @@ export function createBashTool(options: BashToolOptions = {}) {
                 const facts = collectFacts(
                     output,
                     { timedOut, aborted, exitCode, execError },
-                    typeof timeoutSec === "number" ? timeoutSec : undefined,
+                    typeof hardTimeoutSec === "number" ? hardTimeoutSec : undefined,
                 );
                 await output.closeTempFile();
                 return facts;
             };
             const toResult = (facts: RunFacts): ToolResult => resultFromFacts(facts, final, description);
 
+            /** Register a live run as a visible job — stdin + live tail wired. */
+            const registerLive = (
+                m: JobManager,
+                running: RunningShell,
+                completion: Promise<{ text: string; failed?: boolean; timedOut?: boolean; exitCode?: number; fullOutputPath?: string }>,
+                foreground: boolean,
+            ): string =>
+                m.register(
+                    {
+                        completion,
+                        cancel: () => running.cancel(),
+                        pids: () => running.pids(),
+                        label: command,
+                        cwd: final.cwd,
+                        input: {
+                            get stdinOpen() {
+                                return running.stdinOpen;
+                            },
+                            write: (text: string) => running.writeStdin(text),
+                            end: () => running.endStdin(),
+                            interrupt: () => running.interrupt(),
+                            tail: liveTail,
+                        },
+                    },
+                    { foreground },
+                );
+            const bgNotice = (id: string): string =>
+                formatBackgroundNotice(
+                    id,
+                    typeof timeoutSec === "number" && timeoutSec > 0 ? timeoutSec : undefined,
+                    typeof hardTimeoutSec === "number" && hardTimeoutSec > 0 ? hardTimeoutSec : undefined,
+                );
+            const toStored = (id: string): ToolResult => ({
+                answer: "",
+                stored: { jobId: id, cwd: final.cwd } satisfies { jobId: string; cwd: string } as unknown as BashToolResult,
+            });
+            /** Soft-timeout answer for a still-alive job: error-as-result, job keeps running. */
+            const stillRunning = (id: string, startedAt: number): ToolResult => {
+                const elapsedSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+                const softSec = typeof timeoutSec === "number" && timeoutSec > 0 ? timeoutSec : elapsedSec;
+                return {
+                    answer: formatStillRunningNotice(id, elapsedSec, softSec, liveTail()),
+                    stored: { jobId: id, cwd: final.cwd } satisfies { jobId: string; cwd: string } as unknown as BashToolResult,
+                };
+            };
+
             // ---- door 1: explicit background — spawn, register, return the id ----
+            // Explicit bg ALWAYS returns immediately: the soft timeout only matters
+            // for the auto/foreground race (door 2/3). The hard timeout (shell-side)
+            // still kills the tree when it fires — that delivery says TIMED OUT.
             if (explicitBg && manager) {
                 if (manager.atCapacity) {
                     return { answer: `bash: job queue is full — wait for a running job or kill one`, error: true, errorMessage: "at capacity" };
@@ -637,20 +825,15 @@ export function createBashTool(options: BashToolOptions = {}) {
                     exitCode: facts.exitCode,
                     fullOutputPath: facts.fullOutputPath,
                 }));
-                const id = manager.register(
-                    { completion, cancel: () => running.cancel(), pids: () => running.pids(), label: command, cwd: final.cwd },
-                );
-                const notice = formatBackgroundNotice(id, typeof timeoutSec === "number" && timeoutSec > 0 ? timeoutSec : undefined);
-                return {
-                    answer: notice,
-                    stored: { jobId: id, cwd: final.cwd } satisfies { jobId: string; cwd: string } as unknown as BashToolResult,
-                };
+                const id = registerLive(manager, running, completion, false);
+                return { answer: bgNotice(id), stored: toStored(id).stored as unknown as BashToolResult };
             }
 
             // ---- door 2: auto-background — spawn, register hidden, race ----
             if (bgEnabled && manager && !manager.atCapacity) {
-                const waitMs = resolveAutoBackgroundWaitMs(background!.autoThresholdMs ?? DEFAULT_AUTO_THRESHOLD_MS, timeoutMs);
+                const waitMs = resolveAutoBackgroundWaitMs(background!.autoThresholdMs ?? DEFAULT_AUTO_THRESHOLD_MS);
                 const running = spawn();
+                const startedAt = Date.now();
                 const factsPromise = drain(running.completion);
                 // register FIRST so a fast settle still lands on a row the race can read
                 const settleBox: { facts?: RunFacts } = {};
@@ -664,11 +847,8 @@ export function createBashTool(options: BashToolOptions = {}) {
                         fullOutputPath: facts.fullOutputPath,
                     };
                 });
-                const id = manager.register(
-                    { completion, cancel: () => running.cancel(), pids: () => running.pids(), label: command, cwd: final.cwd },
-                    { foreground: true },
-                );
-                const race = await raceJobSettlement(factsPromise, waitMs, agent.abortSignal);
+                const id = registerLive(manager, running, completion, true);
+                const race = await raceJobSettlement(factsPromise, waitMs, softTimeoutMs, agent.abortSignal);
                 if (race.kind === "aborted") {
                     manager.cancel(id);
                     manager.releaseForegroundJob(id);
@@ -682,16 +862,76 @@ export function createBashTool(options: BashToolOptions = {}) {
                     manager.releaseForegroundJob(id);
                     return toResult(settleBox.facts);
                 }
-                // threshold elapsed (or settled-but-facts-missing — promote anyway, delivery owns it)
+                // soft timeout OR threshold elapsed (or settled-but-facts-missing):
+                // promote to a visible job and return — NEVER kill. Delivery owns it.
                 manager.backgroundJob(id);
-                const notice = formatBackgroundNotice(id, typeof timeoutSec === "number" && timeoutSec > 0 ? timeoutSec : undefined);
-                return {
-                    answer: notice,
-                    stored: { jobId: id, cwd: final.cwd } satisfies { jobId: string; cwd: string } as unknown as BashToolResult,
-                };
+                if (race.kind === "softTimeout") return stillRunning(id, startedAt);
+                return { answer: bgNotice(id), stored: toStored(id).stored as unknown as BashToolResult };
             }
 
-            // ---- door 3: foreground — spawn, await, return (at capacity falls through here too) ----
+            // ---- door 3: foreground — spawn, await, return ----
+            // Foreground-with-timeout is SOFT when a manager can own the job past
+            // this call (bg plugin installed): register hidden, promote on soft
+            // expiry, keep alive — the SAME race as door 2 with no auto-threshold.
+            // At capacity falls through here too — and a soft timeout at capacity
+            // still promotes (capacity counts RUNNING jobs; this one already runs).
+            if (softTimeoutMs !== undefined && bgEnabled && manager) {
+                const running = spawn();
+                const startedAt = Date.now();
+                const factsPromise = drain(running.completion);
+                const settleBox: { facts?: RunFacts } = {};
+                const completion = factsPromise.then((facts) => {
+                    settleBox.facts = facts;
+                    return {
+                        text: facts.answer,
+                        failed: facts.failed,
+                        timedOut: facts.timedOut,
+                        exitCode: facts.exitCode,
+                        fullOutputPath: facts.fullOutputPath,
+                    };
+                });
+                const id = registerLive(manager, running, completion, true);
+                const race = await raceJobSettlement(factsPromise, Number.POSITIVE_INFINITY, softTimeoutMs, agent.abortSignal);
+                if (race.kind === "aborted") {
+                    manager.cancel(id);
+                    manager.releaseForegroundJob(id);
+                    const facts = settleBox.facts ?? (await factsPromise.catch(() => null)) ?? {
+                        answer: "Command aborted.", failed: false, timedOut: false, aborted: true,
+                        exitCode: undefined, truncated: false, fullOutputPath: undefined,
+                    };
+                    return toResult({ ...facts, aborted: true });
+                }
+                if (race.kind === "settled" && settleBox.facts) {
+                    manager.releaseForegroundJob(id);
+                    return toResult(settleBox.facts);
+                }
+                manager.backgroundJob(id);
+                return stillRunning(id, startedAt);
+            }
+            if (softTimeoutMs !== undefined && !bgEnabled) {
+                // No manager (bare tool): nothing can own the job past this call,
+                // so the soft deadline degrades to a bounded wait that still returns
+                // "still running" TEXT — error-as-result — but the process is killed
+                // on expiry since nobody could poll or feed it afterwards.
+                const running = spawn();
+                const startedAt = Date.now();
+                const won = await Promise.race([
+                    running.completion.then((): string => "settled").catch((): string => "settled"),
+                    new Promise<string>((resolve) => setTimeout(() => resolve("soft"), softTimeoutMs)),
+                ]);
+                if (won === "soft") {
+                    running.cancel();
+                    await drain(running.completion).catch(() => null);
+                    const softSec = typeof timeoutSec === "number" && timeoutSec > 0 ? timeoutSec : 0;
+                    void startedAt;
+                    return {
+                        answer:
+                            `Still running after ${softSec}s with no job manager to own it — the command was stopped. ` +
+                            `Re-run with a larger timeout, or enable background so the job can keep running.`,
+                    };
+                }
+                return toResult(await drain(running.completion));
+            }
             const facts = await drain(spawn().completion);
             return toResult(facts);
         },
@@ -755,7 +995,7 @@ export function createBashPlugin(options: BashToolOptions = {}): Plugin & { jobs
                 abortListener = () => manager?.cancelAll();
                 agent.abortSignal.addEventListener("abort", abortListener);
                 for (const tool of createJobTools(() => manager)) agent.addTool(tool);
-                agent.addDeclaredCapability({ id: "bash.jobs", description: "background job inspection (jobs/job_read/job_kill/job_wait)" });
+                agent.addDeclaredCapability({ id: "bash.jobs", description: "background job inspection (jobs/job_read/job_kill/job_wait/job_send/job_key)" });
             }
             agent.addTool(createBashTool(options));
             agent.addDeclaredCapability({ id: "bash", description: "shell execution" });
@@ -772,6 +1012,8 @@ export function createBashPlugin(options: BashToolOptions = {}): Plugin & { jobs
             agent.removeTool("job_read");
             agent.removeTool("job_kill");
             agent.removeTool("job_wait");
+            agent.removeTool("job_send");
+            agent.removeTool("job_key");
             agent.removeDeclaredCapability("bash");
             agent.removeDeclaredCapability("bash.jobs");
         },

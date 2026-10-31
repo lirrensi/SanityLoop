@@ -105,9 +105,9 @@ test("slow call auto-backgrounds after the threshold, then delivers", async () =
   });
 });
 
-test("timeout kills the whole run and delivers TIMED OUT", async () => {
+test("hardTimeout kills the whole run and delivers TIMED OUT", async () => {
   const { agent } = bgAgent([
-    () => bashCall({ command: "sleep 30", background: true, timeout: 1 }),
+    () => bashCall({ command: "sleep 30", background: true, hardTimeout: 1 }),
     () => assistantTurn("working on it"),
     () => assistantTurn("done"),
   ]);
@@ -201,6 +201,136 @@ test("terminate() kills a running job via the signal — no delivery, no orphan"
   const users = userTexts(agent);
   assert.ok(!users.some((t) => t.includes("Background job bg_1")), "killed job never delivers");
   assert.equal(agent.loopState, "terminated");
+});
+
+test("soft timeout returns still-running, job stays alive, then delivers on completion", async () => {
+  const { agent, bash } = bgAgent([
+    () => bashCall({ command: "sleep 2 && echo soft-ok", timeout: 1 }),
+    () => assistantTurn("working on it"),
+    () => assistantTurn("done"),
+  ]);
+  await withDriver(agent, async () => {
+    seedAndKick(agent, "run long with soft deadline");
+    await waitUntil(() => agent.messages.some((m) => m.type === "toolResult"), { what: "soft-timeout toolResult to commit" });
+    const result = agent.messages.find((m) => m.type === "toolResult")!;
+    const content = result.content;
+    assert.ok(content && typeof content === "object" && "answer" in content);
+    const answer = String(content.answer);
+    assert.match(answer, /Still running as job bg_1/);
+    assert.match(answer, /NOT killed/);
+    assert.equal(bash.jobs.hasRunningJobs(), true);
+    await awaitDelivery(agent, "bg_1");
+    await awaitLanded(agent, { timeout: 10_000 });
+    const texts = userTexts(agent);
+    assert.ok(texts.some((t) => t.includes("soft-ok")), `completion delivery missing: ${texts.join(" | ")}`);
+    assert.equal(bash.jobs.hasRunningJobs(), false);
+  });
+});
+
+test("soft timeout job is pollable via job_read while running", async () => {
+  const { agent } = makeAgent({
+    script: [
+      () => bashCall({ command: "sleep 3 && echo poll-ok", timeout: 1 }),
+      () => toolCallTurn([callTo("job_read", { id: "bg_1" })]),
+      () => toolCallTurn([callTo("job_wait", { timeout: 10 })]),
+      () => assistantTurn("done"),
+    ],
+    agentId: "bg-test",
+  });
+  agent.install(createDefaultInputs());
+  agent.install(createBashPlugin({ background: {} }));
+  await withDriver(agent, async () => {
+    seedAndKick(agent, "run then poll");
+    await awaitLanded(agent, { timeout: 15_000 });
+    const results = agent.messages
+      .filter((m) => m.type === "toolResult")
+      .map((m) => {
+        const c = m.content;
+        return c && typeof c === "object" && "answer" in c ? String(c.answer) : "";
+      });
+    assert.ok(results.some((a) => a.includes("Still running as job bg_1")), `soft notice missing: ${results.join(" || ")}`);
+    assert.ok(results.some((a) => a.includes("bg_1 [bash] running")), `job_read poll missing: ${results.join(" || ")}`);
+  });
+});
+
+test("stdin wakes an interactive read prompt via job_send", async () => {
+  const { agent } = makeAgent({
+    script: [
+      () => bashCall({ command: "read -r name; echo hello-$name", background: true }),
+      () => toolCallTurn([callTo("job_send", { id: "bg_1", text: "world\n" })]),
+      () => assistantTurn("working on it"),
+      () => assistantTurn("done"),
+    ],
+    agentId: "bg-test",
+  });
+  agent.install(createDefaultInputs());
+  agent.install(createBashPlugin({ background: {} }));
+  await withDriver(agent, async () => {
+    seedAndKick(agent, "run interactive");
+    await awaitDelivery(agent, "bg_1");
+    await awaitLanded(agent, { timeout: 15_000 });
+    const texts = userTexts(agent);
+    assert.ok(texts.some((t) => t.includes("hello-world")), `stdin answer missing: ${texts.join(" | ")}`);
+    const results = agent.messages
+      .filter((m) => m.type === "toolResult")
+      .map((m) => {
+        const c = m.content;
+        return c && typeof c === "object" && "answer" in c ? String(c.answer) : "";
+      });
+    assert.ok(results.some((a) => a.includes("Sent") && a.includes("bg_1")), `send confirm missing: ${results.join(" || ")}`);
+  });
+});
+
+test("job_send to a settled job is a clean error, not a throw", async () => {
+  const { agent } = makeAgent({
+    script: [
+      () => bashCall({ command: "echo quick", background: true }),
+      () => toolCallTurn([callTo("job_wait", { timeout: 10 })]),
+      () => toolCallTurn([callTo("job_send", { id: "bg_1", text: "late\n" })]),
+      () => assistantTurn("done"),
+    ],
+    agentId: "bg-test",
+  });
+  agent.install(createDefaultInputs());
+  agent.install(createBashPlugin({ background: {} }));
+  await withDriver(agent, async () => {
+    seedAndKick(agent, "send after settle");
+    await awaitLanded(agent, { timeout: 15_000 });
+    const results = agent.messages
+      .filter((m) => m.type === "toolResult")
+      .map((m) => {
+        const c = m.content;
+        return c && typeof c === "object" && "answer" in c ? String(c.answer) : "";
+      });
+    assert.ok(results.some((a) => a.includes("already") && a.includes("bg_1")), `settled-send error missing: ${results.join(" || ")}`);
+  });
+});
+
+test("job_key CTRL_C aborts a running job without delivery", async () => {
+  const { agent } = makeAgent({
+    script: [
+      () => bashCall({ command: "sleep 30", background: true }),
+      () => toolCallTurn([callTo("job_key", { id: "bg_1", key: "CTRL_C" })]),
+      () => assistantTurn("killed it"),
+    ],
+    agentId: "bg-test",
+  });
+  agent.install(createDefaultInputs());
+  agent.install(createBashPlugin({ background: {} }));
+  await withDriver(agent, async () => {
+    seedAndKick(agent, "spawn then ctrl-c");
+    await awaitLanded(agent, { timeout: 15_000 });
+    const results = agent.messages
+      .filter((m) => m.type === "toolResult")
+      .map((m) => {
+        const c = m.content;
+        return c && typeof c === "object" && "answer" in c ? String(c.answer) : "";
+      });
+    assert.ok(results.some((a) => a.includes("Backgrounded as job bg_1")), `bg notice missing: ${results.join(" || ")}`);
+    assert.ok(results.some((a) => a.includes("Sent Ctrl-C to bg_1")), `ctrl-c confirm missing: ${results.join(" || ")}`);
+    const users = agent.messages.filter((m) => m.type === "user").map((m) => JSON.stringify(m.content));
+    assert.ok(!users.some((t) => t.includes("Background job bg_1")), "interrupted job must never deliver");
+  });
 });
 
 test("foreground stays foreground: no background opt = no param, no companions, no requires", async () => {

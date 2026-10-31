@@ -426,9 +426,16 @@ export interface ShellExecOptions {
   /** Each stdout/stderr chunk (Buffer) — the tool feeds this to its accumulator. */
   onData: (data: Buffer) => void;
   env?: NodeJS.ProcessEnv;
+  /** Hard kill budget ms — the process TREE dies when exceeded. The bash tool
+   * no longer passes its soft `timeout` here (soft = return + keep alive,
+   * decided tool-side); only `hardTimeout` reaches this field. */
   timeoutMs?: number;
   abortSignal?: AbortSignal;
   shell: ResolvedShell;
+  /** Keep stdin open as a pipe for later writes (interactive jobs).
+   * Default: pipe UNLESS the shell transports the command via stdin
+   * (legacy WSL — that pipe carries the command, then closes). */
+  stdin?: boolean;
 }
 
 export interface ShellExecResult {
@@ -449,19 +456,31 @@ export class ShellError extends Error {
  * A running shell — the background-capable handle. `completion` settles when
  * the process exits (same throw contract as executeLocalShell); `cancel()`
  * kills the process TREE (graceful escalation); `pids()` reports the live
- * root pid while running (empty before spawn / after exit).
+ * root pid while running (empty before spawn / after exit). `writeStdin`
+ * appends bytes to the process stdin; `endStdin` closes it (EOF).
+ * `interrupt()` sends Ctrl-C (SIGINT to the tree, best-effort).
  */
 export interface RunningShell {
   completion: Promise<ShellExecResult>;
   cancel: () => void;
   pids: () => readonly number[];
+  /** True when stdin is a live writable pipe (interactive-capable). */
+  readonly stdinOpen: boolean;
+  /** Write text to the process stdin. Returns false when stdin is unavailable
+   * (closed, never piped, or the process already exited). Never throws. */
+  writeStdin: (text: string) => boolean;
+  /** Close stdin (send EOF). No-op when already closed. Never throws. */
+  endStdin: () => void;
+  /** Send Ctrl-C (SIGINT to the process group/tree). Best-effort. */
+  interrupt: () => void;
 }
 
 /**
  * Spawn the shell, stream stdout+stderr into onData, kill the process TREE on
- * timeout or abort. Returns the live handle — the caller decides whether to
- * await it (foreground) or park it in a job (background). Throws `timeout:<ms>`
- * / `aborted` / cwd errors on `completion` — the tool formats them into the answer.
+ * timeout (hard kill) or abort. Returns the live handle — the caller decides
+ * whether to await it (foreground) or park it in a job (background). Throws
+ * `timeout:<ms>` / `aborted` / cwd errors on `completion` — the tool formats
+ * them into the answer.
  * Throws cwd errors SYNCHRONOUSLY (fail fast, before any job row exists).
  */
 export function startLocalShell(command: string, options: ShellExecOptions): RunningShell {
@@ -471,6 +490,9 @@ export function startLocalShell(command: string, options: ShellExecOptions): Run
 
   const shellConfig = options.shell;
   const commandFromStdin = shellConfig.commandTransport === "stdin";
+  // Interactive jobs need a writable stdin (read/prompts, Ctrl-C-adjacent flows).
+  // Legacy-WSL stdin transport owns the pipe for the command — never share it.
+  const wantStdinPipe = !commandFromStdin && (options.stdin ?? true);
   const child = spawn(
     shellConfig.shell,
     commandFromStdin ? shellConfig.args : [...shellConfig.args, command],
@@ -478,22 +500,61 @@ export function startLocalShell(command: string, options: ShellExecOptions): Run
       cwd: options.cwd,
       detached: process.platform !== "win32",
       env: options.env ?? process.env,
-      stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+      stdio: [commandFromStdin ? "pipe" : wantStdinPipe ? "pipe" : "ignore", "pipe", "pipe"],
       windowsHide: true,
     },
   );
   if (commandFromStdin) {
     child.stdin?.on("error", () => {});
     child.stdin?.end(command);
+  } else if (wantStdinPipe) {
+    child.stdin?.on("error", () => {});
   }
 
   let timedOut = false;
   let timeoutHandle: NodeJS.Timeout | undefined;
   let cancelRequested = false;
+  let settled = false;
   const onAbort = (): void => terminateGracefully(child);
   const cancel = (): void => {
     cancelRequested = true;
     terminateGracefully(child);
+  };
+  const alive = (): boolean =>
+    !settled && child.exitCode === null && child.signalCode === null && child.pid !== undefined;
+  const writeStdin = (text: string): boolean => {
+    try {
+      const stdin = child.stdin;
+      if (!wantStdinPipe || !stdin || stdin.destroyed || stdin.writableEnded || !alive()) return false;
+      return stdin.write(text);
+    } catch {
+      return false;
+    }
+  };
+  const endStdin = (): void => {
+    try {
+      child.stdin?.end();
+    } catch {
+      // already closed — EOF is best-effort
+    }
+  };
+  const interrupt = (): void => {
+    const pid = child.pid;
+    if (!pid || !alive()) return;
+    if (process.platform === "win32") {
+      // Windows has no SIGINT-to-group: hard tree-kill is the only honest Ctrl-C.
+      terminateGracefully(child);
+      return;
+    }
+    try {
+      process.kill(-pid, "SIGINT");
+    } catch {
+      try {
+        process.kill(pid, "SIGINT");
+      } catch {
+        // already dead
+      }
+    }
   };
 
   if (options.timeoutMs !== undefined && options.timeoutMs > 0) {
@@ -501,9 +562,11 @@ export function startLocalShell(command: string, options: ShellExecOptions): Run
       timedOut = true;
       terminateGracefully(child);
     }, options.timeoutMs);
+    timeoutHandle.unref();
   }
   child.stdout?.on("data", (data: Buffer) => options.onData(data));
   child.stderr?.on("data", (data: Buffer) => options.onData(data));
+  child.stdin?.on("close", () => {});
   if (options.abortSignal) {
     if (options.abortSignal.aborted) onAbort();
     else options.abortSignal.addEventListener("abort", onAbort, { once: true });
@@ -517,16 +580,24 @@ export function startLocalShell(command: string, options: ShellExecOptions): Run
       if (timedOut) throw new Error(`timeout:${options.timeoutMs}`);
       return { exitCode, timedOut: false };
     } finally {
+      settled = true;
       clearTimeout(timeoutHandle);
       options.abortSignal?.removeEventListener("abort", onAbort);
     }
   })();
 
-  return {
+  const handle: RunningShell = {
     completion,
     cancel,
-    pids: () => (child.exitCode === null && child.signalCode === null && child.pid !== undefined ? [child.pid] : []),
+    pids: () => (alive() ? [child.pid as number] : []),
+    get stdinOpen() {
+      return wantStdinPipe && !child.stdin?.destroyed && !child.stdin?.writableEnded && alive();
+    },
+    writeStdin,
+    endStdin,
+    interrupt,
   };
+  return handle;
 }
 
 /**

@@ -35,6 +35,24 @@ export interface Job {
   pids: () => readonly number[];
   /** Hidden from listings until promoted (auto-background foreground wait). */
   foreground?: boolean;
+  /** Live stdin/output hooks while running; absent once settled. */
+  input?: JobInput;
+}
+
+/**
+ * Live stdin for a running job — wired by the bash tool at register time to
+ * the process handle. `write` returns false (no throw) when stdin is gone;
+ * the companions turn that into a clean "already settled" answer.
+ */
+export interface JobInput {
+  /** True while the process stdin pipe is writable. */
+  readonly stdinOpen: boolean;
+  write: (text: string) => boolean;
+  end: () => void;
+  /** Best-effort Ctrl-C (SIGINT the tree; hard kill on Windows). */
+  interrupt: () => void;
+  /** Live output tail — what job_read shows while the job still runs. */
+  tail: () => string;
 }
 
 /** JSON-safe snapshot — what listings and transient observability carry. */
@@ -84,6 +102,7 @@ export interface JobRun {
   pids?: () => readonly number[];
   label?: string;
   cwd?: string;
+  input?: JobInput;
 }
 
 const DEFAULT_MAX_JOBS = 15;
@@ -146,6 +165,7 @@ export class JobManager {
       startTime: Date.now(),
       pids: run.pids ?? (() => []),
       ...(options.foreground ? { foreground: true } : {}),
+      ...(run.input ? { input: run.input } : {}),
     };
     this.jobs.set(id, job);
     this.cancels.set(id, run.cancel);
@@ -254,6 +274,7 @@ export class JobManager {
     const job = this.jobs.get(id);
     if (!job) return; // released/evicted while settling — nothing to record
     this.cancels.delete(id);
+    job.input = undefined; // stdin hooks die with the process — no writes past settle
     // cancel() marks the row FIRST and kills second — a late completion
     // (the drain resolves failures, never rejects) must not overwrite it.
     if (job.status !== "cancelled") job.status = status;
