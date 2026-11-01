@@ -184,7 +184,8 @@ export class PiAdapterModel extends SimpleModel {
 						type: "toolCall",
 						id: c.id,
 						name: c.name,
-						arguments: (c.parameters ?? {}) as Record<string, unknown>,
+						// JSON.parse output — JsonValue by construction (pi-ai 1.x types it strict)
+						arguments: (c.parameters ?? {}) as ToolCall["arguments"],
 					}));
 					const text = face.answer;
 					const content = [
@@ -294,14 +295,17 @@ export class PiAdapterModel extends SimpleModel {
 		const requestModel = this.baseUrl
 			? { ...model, baseUrl: this.baseUrl }
 			: model;
+		// pi-ai 1.x: providers take a TranscriptContext, not a raw Context —
+		// normalizeContext folds systemPrompt into the transcript's system message.
+		const transcript = piSdk.normalizeContext(context);
 		const stream = piSdk.lazyStream(requestModel as never, async () =>
 			(
 				provider.stream as (
 					m: unknown,
-					c: PiContext,
+					c: unknown,
 					o: Record<string, unknown>,
 				) => AssistantMessageEventStream
-			)(requestModel, context, {
+			)(requestModel, transcript, {
 				apiKey: this.apiKey ?? resolveEnvKey(this.provider),
 				signal: combined,
 				temperature: this.temperature,
