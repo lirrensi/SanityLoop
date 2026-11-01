@@ -162,7 +162,7 @@ function generateExtrasPackage(bricks: Brick[], extrasDir: string): void {
 	exports["."] = { default: "./index.ts" };
 	// INDEPENDENT VERSIONS — extras is NOT core's shadow. Its version and the
 	// MINIMUM core range it supports live in packages/extras/shelf.json:
-	//   { "version": "0.2.2", "core": "^0.2.0" }
+	//   { "version": "X.Y.Z", "core": "^x.y.0" } (read live — never hardcoded)
 	// Bump extras when a brick changes; bump core only when core changes.
 	// Released via `npm run release:extras` / `npm run release:core`
 	// (tags extras-vX.Y.Z / core-vX.Y.Z; the publish workflow validates the

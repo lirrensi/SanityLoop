@@ -1,17 +1,18 @@
 // ============================================================================
 // scripts/release.ts — the ONE-COMMAND release, TWO independent trains.
 //
-//   npm run release:core          <- bump core (0.2.2 -> 0.2.3), tag core-v0.2.3
-//   npm run release:extras        <- bump extras (0.2.1 -> 0.2.2), tag extras-v0.2.2
+//   npm run release:core          <- bump core (patch), tag core-vX.Y.Z
+//   npm run release:extras        <- bump extras (patch), tag extras-vX.Y.Z
 //   npm run release:core -- --minor / --major / --to X.Y.Z
 //   npm run release:core -- --dry-run
 //
 // The two packages are INDEPENDENT. Extras does not ship at core's version:
 // it declares a core RANGE (the minimum it supports, packages/extras/shelf.json
-// "core": "^0.2.0") and versions on its own. Core is bumped ONLY when core
-// itself changed. Never publish a new core because a shelf brick moved.
+// "core", e.g. "^0.3.0") and versions on its own. Core is bumped ONLY when
+// core itself changed. Never publish a new core because a shelf brick moved.
 //
 // Flow per train: verify clean tree -> bump the package's version file ->
+// (core minor/major: sweep workspace core ranges + shelf.json:core) ->
 // (core only: sync lockfile) -> commit -> push main -> tag -> push tag.
 // The tag namespaced core-vX.Y.Z / extras-vX.Y.Z is THE publish trigger;
 // .github/workflows/publish.yml validates it against THAT package's version
@@ -19,7 +20,8 @@
 // GITHUB_TOKEN push never triggers other workflows.
 // ============================================================================
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
@@ -91,10 +93,42 @@ if (!DRY) {
 		writeFileSync(train.pkg, `${JSON.stringify(pkg, null, "\t")}\n`);
 	}
 }
+
+// ---- 2b. core minor/major: sweep workspace ranges + shelf.json:core ----
+// A patch keeps every ^x.y.z satisfied; a minor/major orphans them.
+// The sweep rewrites ONLY the "@sanityloop/core" range line in workspace
+// manifests (byte-preserving elsewhere) and the shelf's published range.
+const needsSweep = which === "core" && (minor || major || target);
+const swept: string[] = [];
+if (needsSweep) {
+	const [nmaj, nmin] = next.split(".").map((n) => parseInt(n, 10));
+	const want = `^${nmaj}.${nmin}.0`;
+	const roots = ["packages", join("packages", "extras")];
+	for (const root of roots) {
+		for (const dir of readdirSync(root, { withFileTypes: true })) {
+			if (!dir.isDirectory()) continue;
+			const p = join(root, dir.name, "package.json");
+			if (!existsSync(p) || p === train.pkg) continue;
+			const src = readFileSync(p, "utf8");
+			const hit = src.match(/("@sanityloop\/core":\s*")\^[0-9]+\.[0-9]+\.[0-9]+(")/);
+			if (!hit) continue;
+			if (!DRY) writeFileSync(p, src.replace(hit[0], `${hit[1]}${want}${hit[2]}`));
+			swept.push(p);
+		}
+	}
+	const shelfPath = join("packages", "extras", "shelf.json");
+	if (!DRY) {
+		const shelf = JSON.parse(readFileSync(shelfPath, "utf8")) as { version: string; core: string };
+		shelf.core = want;
+		writeFileSync(shelfPath, `${JSON.stringify(shelf, null, "\t")}\n`);
+	}
+	swept.push(shelfPath);
+	console.log(`${DRY ? "[dry-run] would sweep" : "sweep"}: core range -> ${want} in ${swept.length} files`);
+}
 if (train.syncLock) sh("npm install --package-lock-only --ignore-scripts");
 
 // ---- 3. commit + push main ----
-sh(`git add ${train.pkg}${train.syncLock ? " package-lock.json" : ""}`);
+sh(`git add ${train.pkg}${train.syncLock ? " package-lock.json" : ""}${swept.length > 0 ? ` ${swept.join(" ")}` : ""}`);
 sh(`git commit -m "release: @sanityloop/${which} ${next}"`);
 sh("git push origin main");
 

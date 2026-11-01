@@ -40,21 +40,24 @@ flowchart LR
 ## Commands
 
 ```bash
-npm run release:core   -- --patch      # 0.2.3 → 0.2.4: bump, commit, push, tag, push tag
+npm run release:core   -- --patch      # patch: bump, commit, push, tag, push tag
 npm run release:extras -- --minor
-npm run release:core   -- --to 0.3.0   # exact version
+npm run release:core   -- --to X.Y.Z   # exact version
 npm run release:core   -- --dry-run    # prints the plan, changes nothing
 ```
 
 `scripts/release.ts` refuses a dirty tree, bumps that package's version file,
 syncs the lockfile for core, commits, pushes main, then tags and pushes the tag.
+On a core minor/major it also sweeps every workspace `@sanityloop/core` range
+plus `shelf.json:core` to the new `^x.y.0` (patches satisfy existing ranges, so
+the sweep no-ops) — same commit, nothing orphaned.
 
 If the versions are **already bumped** (e.g. the bump landed in a feature commit),
 the release is just the tags:
 
 ```bash
-git tag core-v0.2.3   && git push origin core-v0.2.3
-git tag extras-v0.2.4 && git push origin extras-v0.2.4
+git tag core-vX.Y.Z   && git push origin core-vX.Y.Z
+git tag extras-vX.Y.Z && git push origin extras-vX.Y.Z
 ```
 
 ## Verify without gh
@@ -64,16 +67,17 @@ git tag extras-v0.2.4 && git push origin extras-v0.2.4
 curl -s "https://api.github.com/repos/lirrensi/SanityLoop/actions/runs?per_page=6" \
   | grep -E '"(name|head_branch|head_sha|status|conclusion)"'
 
-# 2. the artifact — authoritative, no cache games
-curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fcore/0.2.3
-curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fextras/-/extras-0.2.4.tgz
+# 2. the artifact — authoritative, no cache games (X.Y.Z = the version just tagged)
+curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fcore/X.Y.Z
+curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fextras/-/extras-X.Y.Z.tgz
 
 # 3. dist-tags (may lag a minute behind a publish)
 curl -s "https://registry.npmjs.org/@sanityloop%2Fextras?cb=$RANDOM" | grep -o '"latest":"[^"]*"'
 ```
 
 A `404` on the version endpoint right after a green publish is replication lag —
-re-check in a minute. `npm view` on this machine is slow and cache-happy; prefer the
+re-check in a minute (tarballs lag longer than metadata — up to ~6 min observed).
+`npm view` on this machine is slow and cache-happy; prefer the
 URLs above (`--prefer-online` if you must use the CLI).
 
 ## Troubleshooting — the failures already paid for
@@ -91,8 +95,8 @@ URLs above (`--prefer-online` if you must use the CLI).
 Legitimate only while the version was **not** published (a red run publishes nothing):
 
 ```bash
-git tag -d extras-v0.2.4 && git push --delete origin extras-v0.2.4
-git tag extras-v0.2.4   && git push origin extras-v0.2.4
+git tag -d extras-vX.Y.Z && git push --delete origin extras-vX.Y.Z
+git tag extras-vX.Y.Z   && git push origin extras-vX.Y.Z
 ```
 
 ## One-time prerequisites (done 2026-10-18)
@@ -116,3 +120,8 @@ git tag extras-v0.2.4   && git push origin extras-v0.2.4
   been pushed since 2026-10-17, so no tag could exist and npm sat still for weeks; extras
   then failed once on the gate tsconfig drift (fixed in `cd95fcc`, which also made the
   gate inherit `target`/`lib` from `tsconfig.base.json`).
+- **2026-11-01** — first minor through this flow: `core 0.3.0` (run 41334646721),
+  `extras 0.3.0` (run 41334651246), both green first try. Taught `release.ts` the
+  range sweep (core minor/major rewrites all workspace core ranges + shelf
+  `core`), so minors never orphan ranges again. Tarball CDN lag ran ~6 min
+  while metadata was live — check metadata first, tarballs last.
