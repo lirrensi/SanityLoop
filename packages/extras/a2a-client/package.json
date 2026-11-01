@@ -1,0 +1,25 @@
+{
+  "name": "@sanityloop/a2a-client",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.3.0",
+    "@a2a-js/sdk": "1.3.0"
+  },
+  "files": [
+    "**/*.ts",
+    "!test",
+    "!**/test/**"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "description": "Client-only A2A adapter — remote A2A agents become native tools with taskId+contextId continuation. Nothing listens; no AgentCard endpoint."
+}
