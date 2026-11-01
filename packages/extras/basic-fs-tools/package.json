@@ -13,7 +13,7 @@
     "@sanityloop/core": "^0.2.0",
     "@sanityloop/util": "^0.1.0"
   },
-  "devDependencies": {},
+  "devDependencies": { "@sanityloop/test-kit": "^0.1.0" },
   "files": [
     "**/*.ts",
     "!test",

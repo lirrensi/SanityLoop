@@ -37,7 +37,7 @@ import type {
   TurnResult,
 } from "@sanityloop/core";
 import type { ToolCallRecord } from "@sanityloop/core";
-import { SimpleModel, attemptAborted } from "@sanityloop/core";
+import { SimpleModel, attemptAborted, costFromPrices } from "@sanityloop/core";
 
 /** Our ContentBlock → pi-ai user/toolResult part. Text stays text; image passes through; audio/video/document ride as text descriptors (pi-ai has no slots for them). Custom wire-ready parts ({type with underscore, e.g. video_url/image_url}) pass verbatim. */
 export function toPiParts(content: unknown): { type: string; text?: string; data?: string; mimeType?: string }[] {
@@ -402,13 +402,9 @@ export class PiAdapterModel extends SimpleModel {
 				cacheRead,
 				cacheWrite,
 				totalTokens: usage?.totalTokens ?? inputTokens + outputTokens + cacheRead + cacheWrite,
-				cost: {
-					input: usage?.cost?.input ?? 0,
-					output: usage?.cost?.output ?? 0,
-					cacheRead: usage?.cost?.cacheRead ?? 0,
-					cacheWrite: usage?.cost?.cacheWrite ?? 0,
-					total: usage?.cost?.total ?? 0,
-				},
+				// provider-reported total wins when present; otherwise the forwarded
+				// price card computes the buckets (costFromPrices).
+				cost: costFromPrices(usage?.cost?.total, this.prices, inputTokens, outputTokens, cacheRead, cacheWrite),
 				// Identity — which provider + model actually answered.
 				api: this.api,
 				provider: this.provider,

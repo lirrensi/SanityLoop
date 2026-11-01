@@ -316,7 +316,7 @@ export function handleRest(
 			}
 			if (seg.length === 3 && method === "POST") {
 				const body = await readObject(req);
-				if (!body && seg[2] !== "stop" && seg[2] !== "resume") {
+				if (!body && seg[2] !== "start" && seg[2] !== "restart" && seg[2] !== "stop") {
 					return fail(res, 400, "body must be a single JSON object with keys");
 				}
 				const b = body ?? {};

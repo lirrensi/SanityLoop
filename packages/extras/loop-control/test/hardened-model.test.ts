@@ -33,6 +33,12 @@ test("defaultClassify: abort escapes, everything else retries", () => {
   const abort = new Error("x");
   abort.name = "AbortError";
   assert.equal(defaultClassify(abort), "stop");
+  // a call-abort is a DECISION, never retried (core contract)
+  const callAbort = Object.assign(new Error("killed"), { attemptAborted: true });
+  assert.equal(defaultClassify(callAbort), "stop");
+  const stamped = new Error("killed");
+  stamped.name = "AttemptAbortedError";
+  assert.equal(defaultClassify(stamped), "stop");
 });
 
 test("chain walk: primary exhausts attempts, fallback answers", async () => {

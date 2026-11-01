@@ -25,13 +25,16 @@ const patchSchema: JsonSchema = {
 interface Hunk {
   /** 1-based line in the ORIGINAL file where the hunk starts. */
   oldStart: number;
+  /** Original-line count from the header (default 1 when omitted). */
+  oldCount: number;
   /** Lines the hunk expects to find (context + removals). */
   oldLines: string[];
   /** Lines the hunk emits (context + additions). */
   newLines: string[];
+  /** True when the NEW file must end without a trailing newline (git-apply semantics). */
+  noNewline?: boolean;
   header: string;
 }
-
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 const clip = (s: string, n = 80): string => (s.length > n ? `${s.slice(0, n)}…` : s);
 
@@ -52,12 +55,14 @@ function parsePatch(patch: string): { hunks: Hunk[]; error?: undefined } | { hun
       if (line.trim() === "") { i++; continue; } // blank between hunks
       return { hunks, error: `unrecognized patch line ${i + 1}: ${clip(line)}` };
     }
-    const hunk: Hunk = { oldStart: parseInt(m[1]!, 10), oldLines: [], newLines: [], header: line };
+    const hunk: Hunk = { oldStart: parseInt(m[1]!, 10), oldCount: m[2] === undefined ? 1 : parseInt(m[2], 10), oldLines: [], newLines: [], header: line };
     i++;
     while (i < lines.length) {
       const l = lines[i]!;
       if (l.startsWith("@@ ")) break; // next hunk — outer loop takes it
-      if (l === "\\ No newline at end of file") { i++; continue; }
+      // git-apply semantics: the marker binds to the LAST emitted line —
+      // a "+"-only hunk is a newline-only change, never a silent no-op.
+      if (l === "\\ No newline at end of file") { hunk.noNewline = true; i++; continue; }
       if (l.startsWith(" ")) { hunk.oldLines.push(l.slice(1)); hunk.newLines.push(l.slice(1)); }
       else if (l.startsWith("-")) { hunk.oldLines.push(l.slice(1)); }
       else if (l.startsWith("+")) { hunk.newLines.push(l.slice(1)); }
@@ -87,7 +92,7 @@ function applyHunks(
   let cursor = 0; // next unconsumed original line (0-based)
   for (let hi = 0; hi < hunks.length; hi++) {
     const h = hunks[hi]!;
-    const start = h.oldStart - 1; // hunk line numbers are 1-based
+    const start = h.oldCount === 0 ? h.oldStart : h.oldStart - 1; // @@ -0,0 = create-at-top; else 1-based
     if (start < 0 || start > orig.length) {
       return { error: `hunk ${hi + 1} starts at line ${h.oldStart}, file has ${orig.length} lines: ${clip(h.header)}` };
     }
@@ -122,6 +127,7 @@ export function createPatchTool() {
     description:
       "Edit a file by applying a unified diff. One file per call, one or more @@ hunks. " +
       "Context must match EXACTLY — a mismatch is an error, never a guess. " +
+      "LF line endings only — CRLF files fail verification loudly. " +
       "Call read() first for exact line numbers and content.",
     promptSnippet: "Edit a file by applying a unified diff",
     promptGuidelines: [
@@ -168,7 +174,12 @@ export function createPatchTool() {
           errorMessage: applied.error,
         };
       }
-      await writeAtomic(absolute, applied.lines.join("\n") + (trailingNl ? "\n" : ""));
+      // git-apply semantics: a trailing "\ No newline" marker drops the final
+      // newline; otherwise the file keeps its original trailing-newline state.
+      const last = parsed.hunks[parsed.hunks.length - 1]!;
+      const wantNl = last.noNewline ? false : trailingNl;
+      const body = applied.lines.length === 0 ? "" : applied.lines.join("\n") + (wantNl ? "\n" : "");
+      await writeAtomic(absolute, body);
       return {
         answer: `Successfully patched ${p}: ${parsed.hunks.length} hunk(s) applied.`,
         stored: { hunks: parsed.hunks.length },

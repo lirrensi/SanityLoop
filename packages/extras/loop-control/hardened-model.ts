@@ -71,8 +71,18 @@ export interface HardenOptions {
 }
 
 /** Default classify: the loop's kill signal always escapes, rest retries. */
+function isAttemptAborted(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  if (!("attemptAborted" in err)) return false;
+  const flag: unknown = err.attemptAborted;
+  return flag === true;
+}
 export function defaultClassify(err: unknown): HardenVerdict {
+  // a call-abort is a DECISION, never retried — loop kill escapes as stop,
+  // stamped AttemptAbortedError rethrows at the catch site (never classified).
   if (err instanceof Error && err.name === "AbortError") return "stop";
+  if (isAttemptAborted(err)) return "stop";
+  if (err instanceof Error && err.name === "AttemptAbortedError") return "stop";
   return "retry";
 }
 
@@ -114,36 +124,49 @@ async function raceAttempt(
   seen: { firstAt?: number; lastAt: number },
   opts: { attemptTimeoutMs?: number; firstTokenMs?: number; idleMs?: number },
 ): Promise<TurnResult> {
-  const kill = (stall: "timeout" | "first-token" | "idle", ms: number): StallError => {
-    model.abortCall?.(undefined, `harden ${stall} after ${ms}ms`);
+  const abortAttempt = (callId: string | undefined, reason: unknown): void => {
+    if (callId !== undefined) model.abortCall?.(callId, reason);
+    else model.abortCall?.(undefined, reason);
+  };
+  const kill = (callId: string | undefined, stall: "timeout" | "first-token" | "idle", ms: number): StallError => {
+    abortAttempt(callId, `harden ${stall} after ${ms}ms`);
     return new StallError(stall, ms);
   };
   const timers: ReturnType<typeof setTimeout>[] = [];
   try {
     return await new Promise<TurnResult>((resolve, reject) => {
       let settled = false;
+      let callId: string | undefined;
       const done = (fn: () => void): void => {
         if (settled) return;
         settled = true;
         for (const t of timers) clearTimeout(t);
         fn();
       };
+      const fire = (stall: "timeout" | "first-token" | "idle", ms: number): void => {
+        done(() => reject(kill(callId, stall, ms)));
+      };
+      // start FIRST: mint is sync at callNextTurn entry, so the fresh id is
+      // readable via inFlightCalls before any await — abort by id, never the
+      // "most recent" default that could hit an unrelated side call.
+      const pending = run();
+      callId = model.inFlightCalls?.at(-1);
       if (opts.attemptTimeoutMs !== undefined) {
         const ms = opts.attemptTimeoutMs;
-        timers.push(setTimeout(() => done(() => reject(kill("timeout", ms))), ms));
+        timers.push(setTimeout(() => fire("timeout", ms), ms));
       }
       const armStall = (): void => {
         if (settled) return;
         const now = Date.now();
         if (opts.firstTokenMs !== undefined && seen.firstAt === undefined) {
           const elapsed = now - seen.lastAt;
-          if (elapsed >= opts.firstTokenMs) return done(() => reject(kill("first-token", opts.firstTokenMs!)));
+          if (elapsed >= opts.firstTokenMs) return fire("first-token", opts.firstTokenMs!);
           timers.push(setTimeout(armStall, Math.min(opts.firstTokenMs - elapsed, 100)));
           return;
         }
         if (opts.idleMs !== undefined) {
           const idleFor = now - seen.lastAt;
-          if (idleFor >= opts.idleMs) return done(() => reject(kill("idle", opts.idleMs!)));
+          if (idleFor >= opts.idleMs) return fire("idle", opts.idleMs!);
           timers.push(setTimeout(armStall, Math.min(opts.idleMs - idleFor, 100)));
           return;
         }
@@ -151,7 +174,7 @@ async function raceAttempt(
       if (opts.firstTokenMs !== undefined || opts.idleMs !== undefined) {
         timers.push(setTimeout(armStall, 0));
       }
-      run().then(
+      pending.then(
         (r) => done(() => resolve(r)),
         (e: unknown) => done(() => reject(e)),
       );
@@ -165,9 +188,16 @@ function backoffSleep(n: number, baseMs: number, signal: AbortSignal | undefined
   const ms = baseMs * 2 ** (n - 1) * (0.5 + Math.random() / 2);
   if (signal?.aborted) return Promise.resolve();
   const { promise, resolve } = Promise.withResolvers<void>();
-  const timer = setTimeout(resolve, ms);
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort);
+    resolve();
+  }, ms);
+  const onAbort = (): void => {
+    clearTimeout(timer);
+    resolve();
+  };
   if (signal !== undefined) {
-    signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
   }
   return promise;
 }
@@ -274,6 +304,9 @@ export class HardenedModel implements ModelContract {
           lastErr = err;
           if (ctx.abortSignal?.aborted) throw err; // the loop's kill escapes
           if (err instanceof Error && err.name === "AbortError") throw err;
+          // a call-abort is a DECISION, never retried — rethrow, not classify.
+          if (isAttemptAborted(err)) throw err;
+          if (err instanceof Error && err.name === "AttemptAbortedError") throw err;
           const verdict = this.classify(err);
           if (verdict === "stop") break chainWalk;
           if (verdict === "fallback") break;

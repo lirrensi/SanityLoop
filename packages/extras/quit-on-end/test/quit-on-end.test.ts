@@ -87,7 +87,9 @@ test("terminated fires immediately even with work owed (canQuit bypassed)", asyn
     assert.equal(consults, 0, "terminated bypasses the predicate");
 });
 
-test("aborted takes the LANDING path: stands down while work is owed", async () => {
+test("aborted skips the built-in vetoes: owed work never strands the process", async () => {
+    // an aborted turn never commits, so owedResponse()/hasWork stay true
+    // forever and agentEnd fires once — vetoing here hung the process.
     const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
     agent.install(createQuitOnEndPlugin({ mode: "terminate" }));
     let terminateCalls = 0;
@@ -98,7 +100,7 @@ test("aborted takes the LANDING path: stands down while work is owed", async () 
     seed(agent);
     agent.loopState = "aborted";
     await fireAgentEnd(agent);
-    assert.equal(terminateCalls, 0, "aborted + owed work must stand down (landing path)");
+    assert.equal(terminateCalls, 1, "aborted + owed work must quit (built-ins skipped)");
 });
 
 test("aborted takes the LANDING path: quits when workless", async () => {
@@ -184,7 +186,7 @@ test("canQuit NOT consulted on terminated (deliberate death bypasses the gate)",
     assert.equal(terminateCalls, 1, "terminated quits immediately");
 });
 
-test("canQuit IS consulted on aborted (landing path)", async () => {
+test("canQuit IS consulted on aborted (landing path) — even with owed work", async () => {
     const agent = new Agent({ model: new StubModel([() => assistantTurn("done")]) });
     let consults = 0;
     agent.install(createQuitOnEndPlugin({
@@ -199,6 +201,7 @@ test("canQuit IS consulted on aborted (landing path)", async () => {
         terminateCalls += 1;
         return Promise.resolve();
     }) as typeof agent.terminate;
+    seed(agent); // owed work present — the veto must STILL stand down
     agent.loopState = "aborted";
     await fireAgentEnd(agent);
     assert.equal(consults, 1, "aborted path must consult the predicate");
@@ -369,12 +372,12 @@ test("MATRIX exit mode: aborted workless exits 0 via landing path", async () => 
     assert.equal(code, 0, "aborted-then-parked must exit 0");
 });
 
-test("MATRIX exit mode: aborted + owed work stands down (no exit)", async () => {
+test("MATRIX exit mode: aborted + owed work exits 0 (built-ins skipped)", async () => {
     const agent = exitAgent("exit");
     seed(agent);
     agent.loopState = "aborted";
     const { code } = await captureExit(agent);
-    assert.equal(code, null, "aborted + owed work must stand down");
+    assert.equal(code, 0, "aborted + owed work must quit");
 });
 
 test("MATRIX exit mode: graceful landing exits 0 (custom code honored)", async () => {

@@ -1,9 +1,13 @@
 ---
 node_type: index
-updated: 2026-10-18
+updated: 2026-11-01
 ---
 
 # architecture Index
+
+## Folder Registry
+
+- `docs/` — 2 direct files, 0 direct subfolders, 2 files recursively; INDEX.md
 
 ## Contents
 
@@ -21,13 +25,7 @@ updated: 2026-10-18
   → /packages/core/src/core/v1/index.ts (implemented_by)
   → /packages/core/src/core/v1/token-estimate.ts (implemented_by)
   → /packages/core/src/core/v1/stats-format.ts (implemented_by)
-  ← /guides/cookbook.md (depends_on)
-  ← /reference/api.md (depends_on)
-  ← /reference/events.md (depends_on)
-  ← /reference/state.md (depends_on)
-  ← /stories/2026-08-16-entity-refactor.md (relates_to)
-  ← /verification/strategy.md (depends_on)
-- [The Swarm — rooms, federation, and the honest mirror 🟢](swarm.md)
+- [The Swarm — PROCESS, TASK, AGENT, TEMPLATE and the honest mirror 🟢](swarm.md)
 
   → /reference/events.md (depends_on)
   → /packages/swarm/src/ (documents)
@@ -37,11 +35,18 @@ updated: 2026-10-18
   → /packages/swarm/src/server/federate.ts (implemented_by)
   → /packages/swarm/src/server/rest.ts (implemented_by)
   → /packages/swarm/src/server/config.ts (implemented_by)
-  → /packages/swarm/src/server/spawner.ts (implemented_by)
+  → /packages/swarm/src/server/stores.ts (implemented_by)
+  → /packages/swarm/src/server/templates.ts (implemented_by)
+  → /packages/swarm/src/server/pm2.ts (implemented_by)
 
 ## Tags
 
-`architecture` `blocked` `clock` `core` `daemon` `federation` `loop` `mirror` `observer` `protocol` `rooms` `swarm` `visibility` `worker`
+`agent` `architecture` `blocked` `clock` `core` `daemon` `federation` `loop` `mirror` `observer` `process` `protocol` `rooms` `swarm` `task` `template` `visibility` `worker`
+
+## Git Context
+
+- **Commit:** `74352e0`
+- **Branch:** `main`
 
 ---
-*Auto-generated. Last rebuilt: 2026-10-18*
+*Auto-generated. Last rebuilt: 2026-11-01*

@@ -125,9 +125,15 @@ async function main() {
 	console.log(`\n[demo] === WORKER REPLY (real llama.cpp @58080) ===`);
 	console.log(reply || "(no streamed text captured)");
 	console.log(`[demo] worker state: ${server.api.agents.get(sid)?.state}, lastEvent: ${server.api.agents.get(sid)?.lastEvent}`);
-
+	// stop the forked worker BEFORE removing the def — drop only forgets the
+	// agent entry and leaves the process running; stop actually kills it.
 	try {
-		await admin.rpc({ op: "drop", sessionId: sid });
+		await admin.rpc({ op: "proc_stop", name: "real-worker" });
+	} catch {
+		/* already gone */
+	}
+	try {
+		await admin.rpc({ op: "proc_remove", name: "real-worker" });
 	} catch {
 		/* already gone */
 	}

@@ -67,7 +67,9 @@ function snapshotHead(agent: GodObject, headMessages: number): HeadSnapshot {
 
 function diffHeads(prev: HeadSnapshot, next: HeadSnapshot, clip: number, causes: string[]): CacheBreakOp[] {
   const ops: CacheBreakOp[] = [];
-  const n = Math.max(prev.messages.length, next.messages.length);
+  // SHARED prefix only: extra right-side entries are appends, not breaks —
+  // appends don't bust a prefix cache.
+  const n = Math.min(prev.messages.length, next.messages.length);
   for (let i = 0; i < n; i++) {
     const b = prev.messages[i];
     const a = next.messages[i];

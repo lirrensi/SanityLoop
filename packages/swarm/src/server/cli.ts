@@ -103,12 +103,19 @@ function targetServer(args: Args): { url: string; home: string } {
 	return { url: `ws://127.0.0.1:${DEFAULT_PORT}`, home };
 }
 
-/** The operator's token: --token admin=<tok> (only needed when the daemon has tokens). */
+/** The operator's token: --token admin=<tok> (only needed when the daemon has tokens).
+ *  Repeated --token flags accumulate; prefer the admin value, else the
+ *  peer value — never the NUL-joined raw. */
 function opToken(args: Args): string | undefined {
-	const raw = args.flags.get("token");
-	if (typeof raw !== "string") return undefined;
-	const eq = raw.indexOf("=");
-	return eq >= 0 ? raw.slice(eq + 1) : raw;
+	let peer: string | undefined;
+	for (const t of flagValues(args.flags, "token")) {
+		const eq = t.indexOf("=");
+		const role = eq >= 0 ? t.slice(0, eq) : "";
+		const value = eq >= 0 ? t.slice(eq + 1) : t;
+		if (role === "admin") return value;
+		if (role === "peer" && peer === undefined) peer = value;
+	}
+	return peer;
 }
 
 /** A minimal WS client for the operator commands (the join extension needs an agent; this doesn't). */
@@ -281,6 +288,26 @@ async function main(): Promise<void> {
 					token: opToken(args),
 				});
 			}
+			// Graceful shutdown: children stop, the scoped daemon dies, no orphans.
+			// A second signal exits immediately (code 1).
+			let shuttingDown = false;
+			const shutdown = (sig: string): void => {
+				if (shuttingDown) {
+					console.error(`[swarm] ${sig} again — exiting immediately`);
+					process.exit(1);
+				}
+				shuttingDown = true;
+				void (async () => {
+					try {
+						await server.stop();
+						await server.killDaemon();
+					} finally {
+						process.exit(0);
+					}
+				})();
+			};
+			process.once("SIGINT", () => shutdown("SIGINT"));
+			process.once("SIGTERM", () => shutdown("SIGTERM"));
 			// keep the process alive — the daemon IS this process
 			await new Promise<void>(() => {});
 			return;
@@ -319,14 +346,14 @@ async function main(): Promise<void> {
 					break;
 				case "start": {
 					const [name, src] = rest;
-					if (!name || !src) die(HELP);
+					if (!name) die(HELP);
 					// source = template id when it resolves, else an agent file path
-					const looksFile = src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js");
+					const looksFile = !!src && (src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js"));
 					printJson(
 						await c.send({
 							op: "proc_start",
 							name,
-							...(looksFile ? { file: src } : { from: src }),
+							...(src ? (looksFile ? { file: src } : { from: src }) : {}),
 							...(args.flags.has("autorestart") ? { autorestart: true } : {}),
 							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
 						}),

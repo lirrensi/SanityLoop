@@ -342,6 +342,10 @@ export interface SwarmServer {
 	readonly port: number;
 	start(): Promise<void>;
 	stop(): Promise<void>;
+	/** Kill the scoped PM2 daemon itself (releases sockets/pids). The
+	 *  `serve` shutdown path calls this after stop(); tests share one
+	 *  process and must NOT call it (they only disconnect). */
+	killDaemon(): Promise<void>;
 	/** THE core — the same ops REST and the CLI speak. Embed away. */
 	api: FleetApi;
 	/** Registry snapshot — the observable truth. */
@@ -431,26 +435,63 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			const name = label.slice("proc:".length);
 			const def = processes.get(name);
 			if (!def) return;
+			// (a) Stale exits never poison the new life: a death from an OLD
+			// life can arrive after stop→start. When the def wants running,
+			// verify liveness before believing the death — a live pid means
+			// the exit is stale. Clean stale exits are ignored; dirty ones
+			// still record facts (diagnostic) without flipping to stopped.
+			if (def.status === "running") {
+				void supervisor.pidOf(label).then((pid) => {
+					const cur = processes.get(name);
+					if (!cur || cur.status !== "running") return;
+					if (pid !== undefined) {
+						if (facts.code !== 0 && facts.code !== null) {
+							cur.lastExit = { ...facts };
+							cur.updatedAt = Date.now();
+							persistProcesses();
+						}
+						return;
+					}
+					cur.pid = undefined;
+					cur.lastExit = { ...facts };
+					cur.status = "stopped";
+					cur.updatedAt = Date.now();
+					persistProcesses();
+				}, () => {
+					// liveness check itself failed (daemon gone mid-shutdown?) —
+					// believe the death: a missed genuine death strands the def
+					// in "running" forever, worse than a stale flip.
+					const cur = processes.get(name);
+					if (!cur || cur.status !== "running") return;
+					cur.pid = undefined;
+					cur.lastExit = { ...facts };
+					cur.status = "stopped";
+					cur.updatedAt = Date.now();
+					persistProcesses();
+				});
+				return;
+			}
 			def.pid = undefined;
 			def.lastExit = { ...facts };
 			def.updatedAt = Date.now();
-			// died and policy says stay dead — desired state follows.
-			// (autorestart=true never reaches here as a final death: PM2
-			// restarts it, the bus `restart` event clears the death.)
-			def.status = "stopped";
 			persistProcesses();
 			return;
 		}
 		if (label.startsWith("task:")) {
-			// `task:<name>#<n>` — record the outcome on the definition
+			// `task:<name>#<n>` — record the outcome on the definition, then
+			// drop the PM2 entry (fire-and-die: no entry leak).
 			const rest = label.slice("task:".length);
 			const hash = rest.lastIndexOf("#");
 			const name = hash >= 0 ? rest.slice(0, hash) : rest;
 			const def = tasks.get(name);
-			if (!def) return;
+			if (!def) {
+				void supervisor.forget(label);
+				return;
+			}
 			def.lastResult = { at: facts.at, code: facts.code, signal: facts.signal };
 			def.updatedAt = Date.now();
 			persistTasks();
+			void supervisor.forget(label);
 		}
 	};
 
@@ -872,11 +913,18 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			},
 
 			async start(name, startOpts = {}) {
-				let def = processes.get(name);
-				if (!def) {
-					if (startOpts.file === undefined && startOpts.from === undefined) return null;
+				const def = processes.get(name);
+				// Resolve the candidate source FIRST — before ANY map mutation.
+				// Unknown file/template 404s without poisoning the def.
+				const target = resolveAgentFile(
+					startOpts.file ?? def?.file,
+					startOpts.from ?? def?.from,
+				);
+				if (!target) return null;
+				let cur = def;
+				if (!cur) {
 					const now = Date.now();
-					def = {
+					cur = {
 						name,
 						file: startOpts.file,
 						from: startOpts.from,
@@ -886,22 +934,20 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 						createdAt: now,
 						updatedAt: now,
 					};
-					processes.set(name, def);
+					processes.set(name, cur);
 				} else {
-					if (startOpts.file !== undefined) def.file = startOpts.file;
-					if (startOpts.from !== undefined) def.from = startOpts.from;
-					if (startOpts.autorestart !== undefined) def.autorestart = startOpts.autorestart;
+					if (startOpts.file !== undefined) cur.file = startOpts.file;
+					if (startOpts.from !== undefined) cur.from = startOpts.from;
+					if (startOpts.autorestart !== undefined) cur.autorestart = startOpts.autorestart;
 				}
-				const target = resolveAgentFile(def.file, def.from);
-				if (!target) return null;
-				def.status = "running";
-				def.starts++;
-				def.updatedAt = Date.now();
+				cur.status = "running";
+				cur.starts++;
+				cur.updatedAt = Date.now();
 				persistProcesses();
 				const label = `proc:${name}`;
-				const r = await forkLabeled(name, label, target.path, target.env, startOpts.prompt, def.autorestart);
-				def.pid = r.pid;
-				def.updatedAt = Date.now();
+				const r = await forkLabeled(name, label, target.path, target.env, startOpts.prompt, cur.autorestart);
+				cur.pid = r.pid;
+				cur.updatedAt = Date.now();
 				persistProcesses();
 				return { name, sessionId: r.sessionId, pid: r.pid };
 			},
@@ -947,6 +993,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				const def = processes.get(name);
 				if (!def) return { ok: false, name };
 				supervisor.killSync(`proc:${name}`);
+				void supervisor.forget(`proc:${name}`);
 				processes.delete(name);
 				persistProcesses();
 				return { ok: true, name };
@@ -1011,6 +1058,10 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					lastSkipped: prev?.lastSkipped,
 					lastTrigger: prev?.lastTrigger,
 					lastResult: prev?.lastResult,
+					// (b) Redefine mid-claim must not drop the in-flight claim:
+					// preserve pendingFire so the fire still settles exactly
+					// once (no double-fire window through redefine).
+					pendingFire: prev?.pendingFire,
 					createdAt: prev?.createdAt ?? now,
 					updatedAt: now,
 				};
@@ -1773,6 +1824,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			// clean shutdown: stop every child, then detach from the scoped daemon
 			await supervisor.stopAll();
 			supervisor.disconnect();
+		},
+		async killDaemon() {
+			await supervisor.killDaemon();
 		},
 
 		registry() {

@@ -8,8 +8,8 @@
 //   ├── tasks.json                task definitions — named fire-and-die schedules
 //   ├── templates/                templates it can spawn (scanned at boot)
 //   ├── sessions/                 spawned workers' session storage
-//   ├── tasks/                    task working scratch (scaffolded; phase 2+ owns use)
-//   └── pm2/                      reserved for phase 2 (empty until then)
+//   ├── tasks/                    task working scratch (scaffolded; task working dirs land here)
+//   └── pm2/                      embedded supervisor state (scoped PM2 home — the daemon's muscle)
 // Isolation = a different directory: `swarm serve --dir /elsewhere --port 6123`
 // is a completely separate swarm (own config, own templates, own sessions).
 // Resolution order: --dir flag > $SWARM_HOME > the default.

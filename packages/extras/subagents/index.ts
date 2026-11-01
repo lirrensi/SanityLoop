@@ -36,7 +36,9 @@
 //
 // NESTING: each manager sits at `depth` (default 0); its children are born
 // at depth+1. `maxDepth` refuses deeper spawns BEFORE the builder runs.
-// A nested manager passes its birth depth + 1 — the bound holds across levels.
+// A nested manager (installed inside a child) passes the enclosing child's
+// depth — the bound holds across levels. Each level re-declares ITS OWN
+// maxDepth (the bound is per-manager, not inherited via ctx).
 // ============================================================================
 
 import { Agent, EVENTS, Tool, answerText, validateToolArgs } from "@sanityloop/core";
@@ -65,8 +67,8 @@ export interface SubBuildContext {
     kind: string;
     /** The parent agent — undefined when the manager is never installed. */
     parent: GodObject | undefined;
-    /** Nesting depth: 0 for a manager's direct children. A nested manager
-     * passes depth+1 to its own spawnInstance — see maxDepth. */
+    /** Nesting depth: 1 for a top-level manager's direct children
+     * (manager depth + 1). Hosts read it for per-child session dirs etc. */
     depth: number;
 }
 
@@ -710,12 +712,14 @@ export interface CreateSubAgentsOptions {
     /** Birth hook — the child's Agent ref, the moment it exists. Attach
      * filters, install storage, read state — the host's full-expression door. */
     onSpawn?: (spawn: SubAgentSpawn) => void;
-    /** Nesting bound — a child born at depth >= maxDepth is refused BEFORE
-     * the builder runs (spawn returns an error). Absent = unbounded. */
+    /** Nesting bound — a child that WOULD be born at depth > maxDepth is
+     * refused BEFORE the builder runs (spawn returns an error).
+     * maxDepth: 1 = direct children only. Absent = unbounded.
+     * Per-manager: a nested manager needs its own maxDepth to stay bounded. */
     maxDepth?: number;
     /** This manager's own depth — 0 for a top-level manager. A nested
-     * manager (installed inside a child) passes its birth depth + 1 so the
-     * bound holds across levels. Default 0. */
+     * manager (installed inside a child born at depth D) passes D, so its
+     * children sit at D+1. Default 0. */
     depth?: number;
     /** Translators for answering foreign gate families in escalate/auto flows.
      * Built-ins exist for "ask-question/question" and "loop-control/doom". */
@@ -805,6 +809,8 @@ interface SubInstance {
     send?: Deferred;
     /** The last death's facts — set on terminal reconcile, cleared on a fresh run. */
     lastError?: string;
+    /** Death notice sent — the flag gates onDone exactly-once across the 2-3 death beats. Cleared on a fresh run. */
+    doneFired?: boolean;
     /** Await items already surfaced (proxied or auto-handled) — identity-keyed. */
     handled: Set<PendingAwait>;
 }
@@ -930,7 +936,9 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         pump();
     };
 
-    /** Reconcile an instance after ANY lifecycle beat (stop + death events). */
+    /** Reconcile an instance after ANY lifecycle beat (stop + death events).
+     * onDone fires on EVERY landing (send-backed or woken-by-mail/steer) —
+     * the manager's own notify channel; the parent loop is never poked. */
     const reconcile = (inst: SubInstance): void => {
         const a = inst.agent;
         if (TERMINAL_STATES.has(a.loopState)) {
@@ -938,6 +946,11 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
             if (inst.send !== undefined) {
                 inst.send.resolve({ ok: false, error: inst.lastError });
                 inst.send = undefined;
+            }
+            // exactly-once per death: reconcile rides 2-3 death beats
+            // (error+abort, or abort+beforeTerminate) — the flag gates all.
+            if (!inst.doneFired) {
+                inst.doneFired = true;
                 opts.onDone?.({ id: inst.id, kind: inst.kind, ok: false, error: inst.lastError });
             }
             releaseAllProxies(inst);
@@ -950,8 +963,9 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                 const reply = collectFinalAnswer(a.messages) ?? "";
                 inst.send.resolve({ ok: true, reply });
                 inst.send = undefined;
-                opts.onDone?.({ id: inst.id, kind: inst.kind, ok: true, reply });
             }
+            // every landing — a mail/steer-woken child with no send lands too
+            opts.onDone?.({ id: inst.id, kind: inst.kind, ok: true, reply: collectFinalAnswer(a.messages) });
             freeSlot(inst);
             return;
         }
@@ -1080,6 +1094,7 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         inst.started = true;
         inst.queued = false;
         inst.lastError = undefined; // a fresh run owns a fresh verdict
+        inst.doneFired = undefined; // and a fresh death notice
         if (useSlot) {
             inst.usedSlot = true;
             activeBackground++;
@@ -1182,7 +1197,14 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         installSiblingSend(inst);
         attachWatcher(inst);
         instances.set(id, inst);
-        opts.onSpawn?.({ id, kind, depth: childDepth, agent });
+        try {
+            opts.onSpawn?.({ id, kind, depth: childDepth, agent });
+        } catch (err) {
+            // a throwing birth hook must not leave an unstartable instance:
+            // sub_await spins forever on !started && !queued && !terminal
+            instances.delete(id);
+            throw err;
+        }
         return inst;
     };
 
@@ -1201,6 +1223,7 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
         inst.usedSlot = false;
         inst.send = undefined;
         inst.lastError = undefined;
+        inst.doneFired = undefined;
         inst.handled = new Set();
         installSiblingSend(inst);
         attachWatcher(inst);
@@ -1577,7 +1600,15 @@ export function createSubAgents(opts: CreateSubAgentsOptions): SubAgentsManager 
                     const msg = err instanceof Error ? err.message : String(err);
                     return { answer: `${names.restart}: rebirth failed — ${msg}`, error: true, stored: { id: inst.id } };
                 }
-                opts.onSpawn?.({ id: inst.id, kind: inst.kind, depth: inst.depth, agent: fresh });
+                try {
+                    opts.onSpawn?.({ id: inst.id, kind: inst.kind, depth: inst.depth, agent: fresh });
+                } catch (err) {
+                    // same as spawnInstance: a throwing birth hook must not leave
+                    // an unstartable instance (sub_await would spin forever on it)
+                    instances.delete(inst.id);
+                    const msg = err instanceof Error ? err.message : String(err);
+                    return { answer: `${names.restart}: onSpawn failed — ${msg}`, error: true, stored: { id: inst.id } };
+                }
                 if (!wantBackground) {
                     startRun(inst, p.text, false, contextN);
                     const outcome = await awaitSettled(inst);

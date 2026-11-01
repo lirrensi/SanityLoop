@@ -120,7 +120,7 @@ de-facto gates for the architecture.
 | Recipes run (`/guides/cookbook.md`) | `V-RCP-001` | component | cookbook exam via `npm test` | local | assertions | verified (11/11 at last full run; recipes edited 2026-08-23 — re-run pending) |
 | Filter throw → `handlerError`, loop survives | `V-FIL-001` | component | `packages/core/test/filter-bus.test.ts` (throw → skip + handlerError) | local | assertions | verified (2026-08-23) |
 | Swarm join/server handshake + protocol + room lifecycle | `V-SWRM-001` | component | `npm test` (`packages/swarm/test/*`: join, protocol, rooms, rest, server, processes, real child-worker e2e) | local + CI | assertions | verified (2026-10-19) |
-| Swarm TASK clock — durable exactly-once fires (pre-dispatch claim, grace/catch-up, logged skips) + paused-immune `trigger` (WS+REST+CLI, transient context, at-most-once) + kill -9 drill | `V-SWRM-002` | component | `packages/swarm/test/tasks.test.ts` (6 durability cases) + kill -9 drill transcript (phase-3 report) | local | assertions + drill transcript | verified (2026-10-19) |
+| Swarm TASK clock — durable exactly-once fires (pre-dispatch claim, grace/catch-up, logged skips) + paused-immune `trigger` (WS+REST+CLI, transient context, at-most-once) + kill -9 drill | `V-SWRM-002` | component | `packages/swarm/test/tasks.test.ts` (6 durability cases, incl. the boot-reconciliation test simulating kill -9 between claim and fork) | local | assertions | verified (2026-10-19) |
 
 ## Environments and Test Data
 

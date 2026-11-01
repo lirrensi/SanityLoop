@@ -117,9 +117,14 @@ export class Supervisor {
 	private readonly onRestart?: (label: string) => void;
 	private pm2: Pm2Api | null = null;
 	private connected = false;
+	private connecting: Promise<void> | null = null;
 	private tails = new Map<string, string>();
 	private dead = new Map<string, ExitFacts>();
 	private stopping = new Set<string>();
+	/** Labels whose next `online` is fork()'s own birth (already counted by
+	 *  the daemon's starts++) — not a PM2 restart. Cleared by the birth
+	 *  itself, by any death, or by forget/kill. */
+	private fresh = new Set<string>();
 	/** The autorestart policy per label (set at fork; PM2 owns the enforcement). */
 	private policy = new Map<string, boolean>();
 
@@ -132,9 +137,19 @@ export class Supervisor {
 
 	/** Connect (spawning the scoped daemon when absent), wipe any stale PM2
 	 *  memory (dump file = never resurrected — we submit desired state), and
-	 *  attach the event bus so exits surface as ExitFacts. Idempotent. */
+	 *  attach the event bus so exits surface as ExitFacts. Idempotent,
+	 *  single-flight: concurrent callers share one in-flight connect. */
 	async connect(): Promise<void> {
 		if (this.connected && this.pm2) return;
+		if (this.connecting) return this.connecting;
+		this.connecting = this.open();
+		try {
+			await this.connecting;
+		} finally {
+			this.connecting = null;
+		}
+	}
+	private async open(): Promise<void> {
 		// Stale dump from a previous life: our stores are the only memory —
 		// PM2 programmatic never auto-resurrects, but a CLI-driven daemon on
 		// the same home could have left one. Remove it so no ghosts return.
@@ -204,14 +219,25 @@ export class Supervisor {
 		// The daemon stamps the parent backlink (process name / task fire id)
 		// via extraEnv; fall back to the PM2 label only when it doesn't.
 		if (!env.SWARM_SPAWN_ID) env.SWARM_SPAWN_ID = opts.label;
-		// Fill the daemon-side vars PM2 would otherwise leave undefined.
 		if (!env.SWARM_HOME) env.SWARM_HOME = this.homeDir;
-		// Kill-then-start under a reused label: drop the old death first —
-		// the new life owns the label (matches the old refork-clears-death).
-		this.dead.delete(opts.label);
-		this.stopping.delete(opts.label);
-		this.tails.delete(opts.label);
 		this.policy.set(opts.label, opts.autorestart ?? false);
+		this.fresh.add(opts.label);
+		// Kill-then-start under a reused label: delete the stale entry FIRST so
+		// every fork prepares the CURRENT spec — then drop the old death and
+		// hand the new life the label (matches refork-clears-death). The label
+		// is guarded in `stopping` so the delete's exit event never corrupts state.
+		this.stopping.add(opts.label);
+		try {
+			const delCall = Promise.withResolvers<void>();
+			pm2.delete(opts.label, () => delCall.resolve());
+			await delCall.promise;
+		} catch {
+			/* unknown/not-found: nothing stale to clear */
+		} finally {
+			this.stopping.delete(opts.label);
+		}
+		this.dead.delete(opts.label);
+		this.tails.delete(opts.label);
 		const startCall = Promise.withResolvers<Pm2Proc[]>();
 		pm2.start(
 			{
@@ -244,7 +270,8 @@ export class Supervisor {
 		);
 		const procs = await startCall.promise;
 		const first = procs[0];
-		const pid = typeof first?.pid === "number" && first.pid > 0 ? first.pid : undefined;
+		let pid = typeof first?.pid === "number" && first.pid > 0 ? first.pid : undefined;
+		if (pid === undefined) pid = await this.pidOf(opts.label);
 		return { sessionId, pid };
 	}
 
@@ -304,6 +331,24 @@ export class Supervisor {
 			return false;
 		}
 		return true;
+	}
+	/** Drop the PM2 entry under a label (task fire-and-die cleanup). Ignores
+	 *  unknown/not-found labels. The label is guarded so the delete's exit
+	 *  event never corrupts state. */
+	async forget(label: string): Promise<void> {
+		if (!this.connected || !this.pm2) return;
+		const pm2 = this.pm2;
+		this.fresh.delete(label);
+		this.stopping.add(label);
+		try {
+			const delCall = Promise.withResolvers<void>();
+			pm2.delete(label, () => delCall.resolve());
+			await delCall.promise;
+		} catch {
+			/* unknown/not-found: nothing to drop */
+		} finally {
+			this.stopping.delete(label);
+		}
 	}
 
 	/** Restart a live label in place (PM2 stop→start under the same name).
@@ -444,9 +489,10 @@ export class Supervisor {
 			// Intentional deaths never read as crashes: kill/stop/restart go
 			// through `stopping`.
 			if (this.stopping.has(label)) return;
+			this.fresh.delete(label);
 			// PM2-owned restarts never reach here as deaths: when the policy
 			// is autorestart=true PM2 restarts the child itself and the new
-			// life is reported via `start`/`online` (→ onRestart). Only a
+			// life is reported via `online` (→ onRestart). Only a
 			// label that should stay dead reports its death — except the
 			// overlimit give-up, which is final under any policy.
 			if (p.event === "exit" && (this.policy.get(label) ?? false)) {
@@ -468,21 +514,29 @@ export class Supervisor {
 			} catch {
 				/* the hook is a courtesy, never a contract */
 			}
-		} else if (p.event === "start" || p.event === "online") {
-			// PM2 restarted the child itself (autorestart, backoff). The new
-			// life supersedes any recorded death — matches refork-clears-death.
-			// Only count it when the policy says the label should survive:
-			// fork() is the first life, exits with autorestart=false stay dead.
-			const firstLife = !this.policy.has(label);
+		} else if (p.event === "online") {
+			// Exactly one count per life, on `online` only. PM2 emits BOTH
+			// `start` (God.prepare) and `online` (readyCb) for a forked birth,
+			// but only `online` for a PM2-owned auto-restart (handleExit calls
+			// executeApp directly) — so `start` is never counted, and fork()'s
+			// own birth (already counted by the daemon's starts++) is skipped
+			// via `fresh`. The old `!policy.has` guard was dead: fork() sets the
+			// policy before pm2.start, so every life had a policy.
 			this.dead.delete(label);
 			this.tails.delete(label);
-			if (!firstLife && (this.policy.get(label) ?? false)) {
-				try {
-					this.onRestart?.(label);
-				} catch {
-					/* the hook is a courtesy, never a contract */
-				}
+			if (this.fresh.delete(label)) return;
+			if (!(this.policy.get(label) ?? false)) return;
+			try {
+				this.onRestart?.(label);
+			} catch {
+				/* the hook is a courtesy, never a contract */
 			}
+		} else if (p.event === "start") {
+			// Fork birth's companion to `online` — supersedes any recorded
+			// death (matches refork-clears-death) but never counts: the daemon
+			// counted the birth, and auto-restarts don't emit `start`.
+			this.dead.delete(label);
+			this.tails.delete(label);
 		}
 	}
 

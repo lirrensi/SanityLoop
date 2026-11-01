@@ -12,8 +12,9 @@
 //   - terminated → quit immediately, canQuit bypassed, exit 0 (deliberate
 //     death, clean — exiting 1 here lied to supervisors: PM2 sees "crash",
 //     may restart what you asked to die).
-//   - aborted then parked → LANDING path (built-ins + canQuit consulted),
-//     exit 0 if clear; stand down + warn if vetoed.
+//   - aborted then parked → LANDING path (built-ins SKIPPED — an aborted
+//     turn never commits, so hasWork stays true forever and vetoing would
+//     strand the process; canQuit still consulted), exit 0 if clear.
 //   - errored → log loudly, then gate: canQuit consulted, exit 1 if clear;
 //     stand down + warn if vetoed.
 //
@@ -117,21 +118,27 @@ export function createQuitOnEndPlugin(opts: QuitOnEndOptions = {}): Plugin {
 					// on the abort channel.
 					// Built-ins first: owed work or a compaction rebuild in
 					// flight means the machine will keep going — stand down.
+					// ...except on an aborted turn: it never commits, so
+					// owedResponse()/hasWork stay true forever and agentEnd fires
+					// once — vetoing here would hang the process. canQuit below
+					// is still consulted.
+					if (s !== "aborted") {
 					if (agent.hasWork) return;
 					if (agent.state.compacting) return;
+					}
 					// YOUR gate last — out-of-band work the loop can't see.
 					if (!(await gateClear(agent, canQuit))) return;
 					if (mode === "destroy") {
-						void agent.destroy("quit-on-end:done");
-						return;
+					void agent.destroy("quit-on-end:done");
+					return;
 					}
 					if (mode === "terminate") {
-						// heart-stop lane — idempotent, safe even mid-teardown
-						void agent.terminate("quit-on-end:done");
-						return;
+					// heart-stop lane — idempotent, safe even mid-teardown
+					void agent.terminate("quit-on-end:done");
+					return;
 					}
 					process.exit(code);
-				},
+					},
 			});
 			agent.addDeclaredCapability({ id: "quit-on-end", description: "worker exits when the work is done" });
 		},

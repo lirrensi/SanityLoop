@@ -36,7 +36,7 @@ The whole machine is four definitions plus whoever showed up:
 | --- | --- | --- | --- |
 | **PROCESS** | a named remembered fork — long-lived, PM2-supervised, `autorestart` decides whether a crash reforks | `processes.json` (the only memory) | `start` forks now; `stop` murders the pid (desired → stopped); `restart` kills then reforks; boot reforks every `running` def |
 | **TASK** | a named fire-and-die definition — `every` (interval), `at` (one-shot epoch), `manual` (only by hand) | `tasks.json` (the only memory) | `define` remembers; the 60s clock `fire`s due slots; `trigger` fires a manual run on the paused-immune path; `at` is consumed by its fire |
-| **AGENT** | whoever joined — wild (no parent) or forked (parent = process name or `task:<name>#<n>`, echoed from `SWARM_SPAWN_ID`) | registry (live only) + history (every agent ever seen) | joins via `register`, reports voices, takes `input`/`control`, dies into `lastExit`/`lastResult` facts |
+| **AGENT** | whoever joined — wild (no parent) or forked (parent = the bare process name or `task:<name>#<n>`, echoed from `SWARM_SPAWN_ID`) | registry (live only) + history (every agent ever seen) | joins via `register`, reports voices, takes `input`/`control`, dies into `lastExit`/`lastResult` facts |
 | **TEMPLATE** | a JSON manifest pointing at an agent file — the menu of what the daemon may spawn | `templates/` scanned at boot | `scanTemplates`/`findTemplate` resolve `from` → file; never executed by the scan itself |
 
 Asking an agent for a pid is a category error (ask `processes`/`tasks`).
@@ -214,7 +214,7 @@ until the single-server story is fully proven.
 | `register` | `room?` | worker: where I live. peer/admin: my mount point. Default `global`. |
 | `broadcast` | `room?` | Optional blast-radius scope (subtree). |
 | `welcome` | `swarm?` | The daemon's declared name — the handshake answer to "who are you?". Undefined = hermit. |
-| `AgentInfo` | `room?`, `address?`, `origin?`, `parent?` | Where it lives, its full address, `local` \| `mirrored`, fork backlink (`proc:<name>` / `task:<name>#<n>` / unset = wild). |
+| `AgentInfo` | `room?`, `address?`, `origin?`, `parent?` | Where it lives, its full address, `local` \| `mirrored`, fork backlink (bare process name / `task:<name>#<n>` / unset = wild). |
 | `task_trigger` | `context?`, `prompt?` | Paused-immune manual run; transient context rides the fork prompt, never stored; concurrent claims refuse `busy`. |
 | `list` | — | Compat alias of `agents_list` — the federation mount's wire, never advertised. |
 
@@ -264,8 +264,9 @@ Operator doors: `swarm tasks define <name> <every|at|manual> [--every-ms N]
   same-sessionId-on-both-sides, no-transit, offline-follow, hermit refusal,
   collision refusal).
 - `/packages/swarm/test/join.test.ts`, `/packages/swarm/test/e2e.test.ts` —
-  the pre-rooms behavior, still green unchanged (the default path is
-  byte-identical).
+  the pre-rooms behavior, still green unchanged (the default path keeps the
+  same wire semantics; the fork layer is now the embedded PM2 supervisor,
+  not the pre-rooms spawner).
 - `/packages/swarm/test/tasks.test.ts` — durable fires: pre-dispatch advance,
   grace/catch-up, past-grace `at` skips, trigger paused-immune/transient/
   at-most-once (WS+REST), boot reconciliation of the crash window,

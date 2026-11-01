@@ -489,7 +489,11 @@ function createJobTools(getManager: ManagerOf) {
       if (job.status !== "running" || !job.input) return { answer: `job_key: ${id} already ${job.status} — input goes nowhere`, error: true, errorMessage: "job settled" };
       const name = key.trim().toUpperCase();
       if (name === "CTRL_C" || name === "C-C" || name === "SIGINT") {
-        job.input.interrupt();
+        // gentle SIGINT (NOT cancel()'s hard kill): the row stays running and
+        // settles honestly, but suppressDelivery keeps onSettle from firing a
+        // bogus "completed" delivery — a SIGINT-ignoring survivor stays
+        // killable via job_kill and keeps counting against capacity.
+        m.interrupt(id);
         return { answer: `Sent Ctrl-C to ${id}.` };
       }
       const seq: Record<string, string> = {
@@ -648,6 +652,10 @@ export function createBashTool(options: BashToolOptions = {}) {
                     type: "number",
                     description: "Hard kill deadline in seconds: the process tree dies when it fires. Optional — off unless set.",
                 },
+                description: {
+                    type: "string",
+                    description: "Why the command is being run (logged and shown for approval).",
+                },
                 ...(background
                     ? {
                         background: {
@@ -730,6 +738,9 @@ export function createBashTool(options: BashToolOptions = {}) {
                 }
             };
             /** Spawn now; the caller owns the completion (await inline or park in a job). */
+            // stdin pipes ONLY when a manager could own/promote the job (door 2's
+            // speculative pipe feeds promote→job_send); plain foreground runs get
+            // `ignore`, restoring EOF-on-no-input behavior.
             const spawn = (): RunningShell =>
                 startLocalShell(final.command, {
                     cwd: final.cwd,
@@ -737,6 +748,7 @@ export function createBashTool(options: BashToolOptions = {}) {
                     timeoutMs: hardTimeoutMs,
                     abortSignal: agent.abortSignal,
                     shell,
+                    stdin: bgEnabled,
                     onData: (data) => output.append(data),
                 });
             /** Drain one completion into facts — shared by all three doors. */
@@ -869,45 +881,6 @@ export function createBashTool(options: BashToolOptions = {}) {
                 return { answer: bgNotice(id), stored: toStored(id).stored as unknown as BashToolResult };
             }
 
-            // ---- door 3: foreground — spawn, await, return ----
-            // Foreground-with-timeout is SOFT when a manager can own the job past
-            // this call (bg plugin installed): register hidden, promote on soft
-            // expiry, keep alive — the SAME race as door 2 with no auto-threshold.
-            // At capacity falls through here too — and a soft timeout at capacity
-            // still promotes (capacity counts RUNNING jobs; this one already runs).
-            if (softTimeoutMs !== undefined && bgEnabled && manager) {
-                const running = spawn();
-                const startedAt = Date.now();
-                const factsPromise = drain(running.completion);
-                const settleBox: { facts?: RunFacts } = {};
-                const completion = factsPromise.then((facts) => {
-                    settleBox.facts = facts;
-                    return {
-                        text: facts.answer,
-                        failed: facts.failed,
-                        timedOut: facts.timedOut,
-                        exitCode: facts.exitCode,
-                        fullOutputPath: facts.fullOutputPath,
-                    };
-                });
-                const id = registerLive(manager, running, completion, true);
-                const race = await raceJobSettlement(factsPromise, Number.POSITIVE_INFINITY, softTimeoutMs, agent.abortSignal);
-                if (race.kind === "aborted") {
-                    manager.cancel(id);
-                    manager.releaseForegroundJob(id);
-                    const facts = settleBox.facts ?? (await factsPromise.catch(() => null)) ?? {
-                        answer: "Command aborted.", failed: false, timedOut: false, aborted: true,
-                        exitCode: undefined, truncated: false, fullOutputPath: undefined,
-                    };
-                    return toResult({ ...facts, aborted: true });
-                }
-                if (race.kind === "settled" && settleBox.facts) {
-                    manager.releaseForegroundJob(id);
-                    return toResult(settleBox.facts);
-                }
-                manager.backgroundJob(id);
-                return stillRunning(id, startedAt);
-            }
             if (softTimeoutMs !== undefined && !bgEnabled) {
                 // No manager (bare tool): nothing can own the job past this call,
                 // so the soft deadline degrades to a bounded wait that still returns

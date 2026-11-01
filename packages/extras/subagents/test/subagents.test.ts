@@ -1039,3 +1039,72 @@ test("manager: restart refuses a live instance; revives an errored one", async (
     assert.equal(revive.error, undefined);
     assert.equal(revive.answer, "doomed done");
 });
+
+// ---------------------------------------------------------------------------
+// BIRTH-HOOK SAFETY + EVERY-LANDING onDone
+// ---------------------------------------------------------------------------
+
+test("manager: throwing onSpawn leaves no unstartable instance — sub_await never hangs", async () => {
+    const mgr = createSubAgents({
+        onSpawn: () => { throw new Error("storage exploded"); },
+        subs: [
+            {
+                id: "fragile",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("x")]) }),
+            },
+        ],
+    });
+    const r = await mgr.tools["spawn"].execute({ sub: "fragile", text: "go", background: true }, {} as never);
+    assert.equal(r.error, true);
+    assert.match(r.answer!, /storage exploded/);
+    assert.equal(mgr.instances().length, 0, "no corpse left behind");
+    const all = await mgr.tools["await"].execute({}, {} as never);
+    assert.match(all.answer!, /nothing is running/, "await-all resolves, never hangs");
+});
+
+test("manager: onDone fires on mail-woken landings with no send — exactly once each", async () => {
+    const dones: Array<{ id: string; ok: boolean }> = [];
+    const mgr = createSubAgents({
+        onDone: (d) => dones.push({ id: d.id, ok: d.ok }),
+        subs: [
+            {
+                id: "ear",
+                build: () => new Agent({ model: new StubModel([
+                    () => assistantTurn("first"),
+                    () => assistantTurn("second"),
+                ]) }),
+            },
+            {
+                id: "mouth",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("mail sent")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "ear", text: "listen" }, {} as never);
+    assert.deepEqual(dones, [{ id: "ear-1", ok: true }], "the send-backed landing fires");
+    // mail wakes the idle child with NO send outstanding — its next landing still notifies
+    mgr.get("mouth-1") ?? (await mgr.tools["spawn"].execute({ sub: "mouth", text: "wake" }, {} as never));
+    dones.length = 0;
+    await mgr.get("mouth-1")!.tools.find((t) => t.name === "sibling_send")!.execute!({ to: "ear-1", text: "ping" }, {} as never);
+    await waitUntil(() => dones.length > 0, { what: "mail-woken landing notifies" });
+    assert.deepEqual(dones, [{ id: "ear-1", ok: true }], "exactly once for the mail-woken landing");
+});
+
+test("manager: onDone fires exactly once on death (2-3 death beats, one notice)", async () => {
+    const dones: Array<{ id: string; ok: boolean; error?: string }> = [];
+    const mgr = createSubAgents({
+        onDone: (d) => dones.push({ id: d.id, ok: d.ok, error: d.error }),
+        subs: [
+            {
+                id: "doomed",
+                build: () => new Agent({ model: new StubModel([() => assistantTurn("never")]) }),
+            },
+        ],
+    });
+    await mgr.tools["spawn"].execute({ sub: "doomed", text: "go", background: true }, {} as never);
+    mgr.get("doomed-1")!.abort("test kill");
+    await sleep(50); // let the abort+beforeAbort microtask reconciles all land
+    assert.equal(dones.length, 1, `one notice across all death beats, got ${JSON.stringify(dones)}`);
+    assert.equal(dones[0]!.ok, false);
+    assert.match(dones[0]!.error!, /test kill/);
+});

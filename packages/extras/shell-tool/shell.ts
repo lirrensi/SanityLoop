@@ -526,7 +526,10 @@ export function startLocalShell(command: string, options: ShellExecOptions): Run
     try {
       const stdin = child.stdin;
       if (!wantStdinPipe || !stdin || stdin.destroyed || stdin.writableEnded || !alive()) return false;
-      return stdin.write(text);
+      // write() false = backpressure-queued, NOT lost — the bytes still land.
+      // Only the guards above mean "closed".
+      stdin.write(text);
+      return true;
     } catch {
       return false;
     }

@@ -35,8 +35,10 @@ export interface Job {
   pids: () => readonly number[];
   /** Hidden from listings until promoted (auto-background foreground wait). */
   foreground?: boolean;
-  /** Live stdin/output hooks while running; absent once settled. */
-  input?: JobInput;
+  /** Ctrl-C'd: settle records honestly but never delivers. Status stays
+   * truthful (running→ completed/failed) so job_kill still works and
+   * capacity still counts a SIGINT-ignoring survivor. */
+  suppressDelivery?: boolean;
 }
 
 /**
@@ -228,7 +230,21 @@ export class JobManager {
     this.changed();
     return true;
   }
-
+  /** Ctrl-C a running job — gentle SIGINT, never delivers. Unlike cancel()
+   * (hard kill + status flip), the row stays `running` and settles honestly:
+   * a SIGINT-ignoring survivor keeps its slot and stays killable. */
+  interrupt(id: string): boolean {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running" || !job.input) return false;
+    job.suppressDelivery = true;
+    try {
+      job.input.interrupt();
+    } catch {
+      // best-effort; settle still records the row
+    }
+    this.changed();
+    return true;
+  }
   cancelAll(): void {
     for (const job of this.jobs.values()) {
       if (job.status === "running") this.cancel(job.id);
@@ -288,7 +304,7 @@ export class JobManager {
     if (job.foreground) return;
     this.scheduleEviction(id);
     this.changed();
-    if (job.status === "cancelled") return; // kills never deliver (OMP parity)
+    if (job.status === "cancelled" || job.suppressDelivery) return; // kills + ctrl-c never deliver (OMP parity)
     try {
       this.onSettle?.(job);
     } catch (err) {
