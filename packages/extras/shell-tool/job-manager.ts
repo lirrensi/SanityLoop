@@ -35,6 +35,8 @@ export interface Job {
   pids: () => readonly number[];
   /** Hidden from listings until promoted (auto-background foreground wait). */
   foreground?: boolean;
+  /** Live stdin, when the run wired one (interactive jobs). */
+  input?: JobInput;
   /** Ctrl-C'd: settle records honestly but never delivers. Status stays
    * truthful (running→ completed/failed) so job_kill still works and
    * capacity still counts a SIGINT-ignoring survivor. */
