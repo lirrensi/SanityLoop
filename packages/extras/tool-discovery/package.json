@@ -7,7 +7,7 @@
     ".": "./index.ts"
   },
   "dependencies": {
-    "@sanityloop/core": "^0.2.0"
+    "@sanityloop/core": "^0.3.0"
   },
   "scripts": {
     "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""

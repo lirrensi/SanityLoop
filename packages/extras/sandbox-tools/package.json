@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@sanityloop/basic-fs-tools": "^0.1.0",
-    "@sanityloop/core": "^0.2.0",
+    "@sanityloop/core": "^0.3.0",
     "@sanityloop/shell-tool": "^0.1.0",
     "@sanityloop/util": "^0.1.0",
     "dockerode": "^5.0.1"

@@ -12,7 +12,7 @@ Two independent trains, one trigger each:
 | core | `packages/core/package.json` | `core-vX.Y.Z` | `@sanityloop/core` |
 | extras | `packages/extras/shelf.json` | `extras-vX.Y.Z` | `@sanityloop/extras` |
 
-Extras declares a core **range** (`"core": "^0.2.0"` in `shelf.json`), never a lockstep
+Extras declares a core **range** (`"core": "^0.3.0"` in `shelf.json`), never a lockstep
 copy — bump core only when core itself changed.
 
 ## The contract
