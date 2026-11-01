@@ -317,14 +317,16 @@ function callsForGate(agent: GodObject, event?: { call?: ToolCallRecord }): Tool
   return (stored ?? []).filter((c) => !c.preResolved);
 }
 
-/** Find a parked call by id across the transcript (the resolver's half of the rendezvous). */
+/** Find a parked call by id: transcript first, then in-flight calls (the
+ * resolver's half of the rendezvous for out-of-band programmatic calls,
+ * which have no transcript entry yet). */
 function findCallById(agent: GodObject, id: string): ToolCallRecord | undefined {
   for (const msg of agent.messages) {
     const stored = (msg.content as { stored?: ToolCallRecord[] } | undefined)?.stored;
     const hit = stored?.find((c) => c.id === id);
     if (hit) return hit;
   }
-  return undefined;
+  return agent.activeCall?.(id);
 }
 
 /** Field-level fallback: entry value → defaults value → hard default. `null` stays null. */

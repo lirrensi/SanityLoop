@@ -64,11 +64,11 @@ Verified against `EVENTS` in `packages/core/src/core/v1/types.ts`
 
 | Event | When |
 | --- | --- |
-| `beforeTool` | per-call gate — blocking wall; carries `{ batch, call, tool }` |
-| `afterTool` | the patch point — rewrite the result before commit |
-| `toolStart` | execution began |
+| `beforeTool` | per-call gate — blocking wall; carries `{ batch, call, tool, via?, depth? }` |
+| `afterTool` | the patch point — rewrite the result before commit; `{ call, result, via?, depth? }` |
+| `toolStart` | execution began; `{ call, tool, via?, depth? }` |
 | `toolChanged` | one tool changed — per-tool detail `{ toolName, change, before, after }` |
-| `toolEnd` | execution done |
+| `toolEnd` | execution done; `{ call, result, via?, depth? }` |
 | `toolListChanged` | the tool LIST changed — summary `{ added, removed, updated, visibility, availability, cacheBreak }` |
 
 ## Output stream (6)
@@ -107,6 +107,13 @@ While the tool batch executes the transcript is SEALED. Events in the
 deferral whitelist — `toolChanged`, `toolListChanged` — fired mid-batch are
 held in the lane and drain at the seams (`closeCycle` / `land`), after tool
 results commit. Control/abort events are never deferred.
+
+Tool events carry `via` (who called: `"loop"` for model batches, `"code"`
+for code cells, `"tool"` for `call_tool`, `"direct"` otherwise — open,
+future callers self-name) and `depth` (nesting, 0 = top level). Watchers
+that count failures or print names should discriminate on `via`: a nested
+call's `toolEnd` is real telemetry, but it has no transcript message and
+`currentTurn` still points at the outer call.
 
 ## Custom events
 

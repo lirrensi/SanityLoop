@@ -24,7 +24,8 @@
 // are in the DECLARED `tools` array — a hidden tool name is physically
 // un-callable no matter how smart the model is. The `call_tool` dispatcher is
 // the bridge: ONE visible tool that resolves ANY registered name (incl.
-// hidden) through the schema wall + disabled check + the tool's own execute.
+// hidden) through agent.callTool — the full wall (gate → schema → execute →
+// toolEnd), exactly as if the model had called it directly.
 //   discover via tool_search/enumerate_tools  →  call via call_tool.
 //
 // CAVEAT — whether ANY of this works depends on the model + its inference
@@ -38,16 +39,16 @@
 //      arguments, hidden tools are simply unusable on that backend.
 // Test against your real endpoint before betting on hidden-tool UX.
 //
-// PERMISSION NOTE: call_tool delegates to the target tool's execute directly,
-// so it BYPASSES the beforeTool gate for the inner call. Permission it at the
-// dispatcher level (gate `call_tool` itself) for strict setups.
+// PERMISSION NOTE: the inner call re-enters the beforeTool gate chain with
+// via:"tool" — permission gates fire for the inner call exactly as for a
+// model call. Gate `call_tool` itself AND/OR the inner tool; both apply.
 //
 //   const agent = new Agent({ model, tools: [...], ... });
 //   agent.install(createToolDiscoveryPlugin());
 //   await agent.run();
 //
 // The discovery tools themselves are VISIBLE (the door must be findable).
-import { Tool, validateToolArgs } from "@sanityloop/core";
+import { Tool } from "@sanityloop/core";
 import type { GodObject, Plugin, ToolType } from "@sanityloop/core";
 
 // ----------------------------------------------------------------------------
@@ -288,21 +289,10 @@ export function createCallToolTool(): ToolType {
       if (typeof name !== "string" || name.length === 0) {
         return { answer: "call_tool: `name` is required (a registered tool name)", error: true, errorMessage: "name required" };
       }
-      const tool = agent.tools.find((t) => t.name === name);
-      if (!tool) return { answer: `Unknown tool: ${name}`, error: true, errorMessage: "unknown tool" };
-      if (tool.disabled) return { answer: `Tool ${name} is disabled`, error: true, errorMessage: "disabled" };
-      const callArgs = args ?? {};
-      // THE SCHEMA WALL — same discipline as the core: custom validate overrides the JSON-Schema check.
-      const errors = tool.validate ? (tool.validate(callArgs) ?? []) : validateToolArgs(tool.inputSchema, callArgs);
-      if (errors.length > 0) {
-        return {
-          answer: `Invalid arguments for ${name}: ${errors.join("; ")}`,
-          error: true,
-          errorMessage: "invalid_arguments",
-          stored: { errors },
-        };
-      }
-      return tool.execute(callArgs, agent);
+      // ONE PIPELINE — the inner call re-enters the full wall (gate → schema
+      // → execute → toolEnd) with via:"tool", so permission gates fire for
+      // the inner call exactly as for a model call. No bypass.
+      return (await agent.callTool(name, args ?? {}, { via: "tool" })).result;
     },
   });
 }

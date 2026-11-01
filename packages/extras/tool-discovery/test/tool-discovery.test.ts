@@ -197,10 +197,53 @@ test("call_tool: unknown name and disabled target return structured errors", asy
     const dispatcher = createCallToolTool();
     const ghost = await dispatcher.execute({ name: "nope" }, agent);
     assert.equal(ghost.error, true);
-    assert.equal(ghost.errorMessage, "unknown tool");
+    assert.equal(ghost.errorMessage, "unknown_tool");
     const disabled = await dispatcher.execute({ name: "off" }, agent);
     assert.equal(disabled.error, true);
-    assert.equal(disabled.errorMessage, "disabled");
+    assert.equal(disabled.errorMessage, "tool_disabled");
+});
+
+test("call_tool re-enters the beforeTool gate (no bypass) with via tool", async () => {
+    const target = makeTool("inner", "inner tool");
+    const agent = new Agent({ model: new StubModel([]), tools: [target], agentId: "call-gate" });
+    const seen: Array<{ via?: unknown; name?: unknown }> = [];
+    agent.addFilter({
+        event: "beforeTool",
+        id: "test/gate-watch",
+        priority: 0,
+        fn: async (_a, e) => {
+            const p = e as { via?: unknown; call?: { name?: unknown } };
+            seen.push({ via: p.via, name: p.call?.name });
+        },
+    });
+    const dispatcher = createCallToolTool();
+    const res = await dispatcher.execute({ name: "inner", arguments: {} }, agent);
+    assert.equal(res.error, undefined);
+    assert.deepEqual(seen, [{ via: "tool", name: "inner" }]);
+});
+
+test("call_tool honors inner gate denials without executing", async () => {
+    let executed = 0;
+    const target = Tool.define({
+        name: "inner",
+        description: "inner tool",
+        inputSchema: { type: "object", properties: {} },
+        execute: async () => { executed++; return { answer: "ran" }; },
+    });
+    const agent = new Agent({ model: new StubModel([]), tools: [target], agentId: "call-deny" });
+    agent.addFilter({
+        event: "beforeTool",
+        id: "test/deny",
+        priority: 0,
+        fn: async (_a, raw) => {
+            const call = (raw as { call?: { preResolved?: unknown } }).call;
+            if (call) call.preResolved = { answer: "denied", error: true, errorMessage: "denied" };
+        },
+    });
+    const dispatcher = createCallToolTool();
+    const res = await dispatcher.execute({ name: "inner", arguments: {} }, agent);
+    assert.equal(res.answer, "denied");
+    assert.equal(executed, 0);
 });
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,10 @@ updated: 2026-09-05
 tags: [log, history]
 ---
 
+## 2026-11-02
+
+- universal `agent.callTool` core seam: one wall body (`runToolCall`) for loop batches, code cells, `call_tool`, timers, tests — gate → park-wait → preResolved → resolve → schema → toolStart → execute → toolEnd, error-as-result, depth ceiling 8, timeout/signal orphan semantics, opt-in afterTool/commit; `executeOne` delegates (loop behavior unchanged); `activeCall(id)` rendezvous closes the permission OOB resolver gap; `call_tool` bypass closed (inner gates fire with via tool); `ToolCallRecord` moved agent.ts → types.ts (barrel-invisible); `@sanityloop/code-mode` shipped (py/js persistent kernels, fd-3 bridge, per-cell stubs) with its caller as a via:code preset
+
 ## 2026-09-05
 
 - swarm package: rooms + federation shipped. A room is a path prefix on registry entries (never an object); ONE visibility rule — an ancestor sees its descendants, 404 for the invisible; the daemon STAMPS its declared name onto every address (`--name`, optional, absent = hermit, federation refused both directions). Registry re-keyed to full addresses (`<swarm>/<room>/<sessionId>`, bare sessionIds via index, locals outrank mirrors). Federation = the daemon dials a remote as a peer and mirrors its online workers under the remote's declared name as a room subtree (`global/<mount>/...`) — state folds from the remote's own reports, offline follows TCP, authority stays home, no transit, name collisions refuse loudly. REST loses its x-ray (`?room=` / `X-Swarm-Room` mount point, same law). New: server/federate.ts; tests: rooms.test.ts (6 tests, full suite 10/10). Architecture doc: /architecture/swarm.md

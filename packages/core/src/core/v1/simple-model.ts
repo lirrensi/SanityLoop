@@ -18,8 +18,7 @@
 // error results — the model sees them and self-corrects (item 21.6).
 // ============================================================================
 
-import type { GodObject, Message, ModelPrices, StreamSink, ToolResultContent, ToolResultMessage, TurnResult, UsageCost } from "./types.ts";
-import type { ToolCallRecord } from "./agent.ts";
+import type { GodObject, Message, ModelPrices, StreamSink, ToolCallRecord, ToolResultContent, ToolResultMessage, TurnResult, UsageCost } from "./types.ts";
 import { estimateInputTokens, estimateOutputTokens } from "./token-estimate.ts";
 // ============================================================================
 // normalizeForAlternation — the SIMPLE model's own message-shaping strategy.

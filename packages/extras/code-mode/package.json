@@ -1,0 +1,30 @@
+{
+  "name": "@sanityloop/code-mode",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Persistent Python/JS code-mode kernels: one code tool, NDJSON cell protocol, separate fd-3 return bridge, per-cell stubs from the live registry.",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "**/*.ts",
+    "**/*.py",
+    "**/*.mjs",
+    "!test/**"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --experimental-transform-types --test --test-force-exit \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@sanityloop/core": "^0.3.0",
+    "@sanityloop/shell-tool": "^0.1.0",
+    "@sanityloop/util": "^0.1.0"
+  },
+  "devDependencies": {
+    "@sanityloop/test-kit": "^0.1.0"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

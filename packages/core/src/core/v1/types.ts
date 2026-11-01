@@ -687,6 +687,22 @@ export interface GodObject extends Session {
   listDeclaredEvents(): DeclaredEvent[];
   getDeclaredEvent(id: string): DeclaredEvent | undefined;
   /**
+   * PROGRAMMATIC TOOL CALL — run one tool through the full wall from ANYWHERE:
+   * loop batch, code cell, dispatcher tool, timer, test. The wall is ONE body:
+   * resolve → beforeTool → preResolved → schema → toolStart → execute →
+   * toolEnd. Never throws (error-as-result); never touches `messages` unless
+   * `commit: true`. Nested calls (a tool calling callTool from execute) are
+   * depth-capped; past the ceiling the call is refused, not stacked.
+   */
+  callTool(name: string, params: unknown, opts?: CallToolOptions): Promise<CallToolOutcome>;
+  /**
+   * Look up an IN-FLIGHT tool call by id — the rendezvous for resolvers when
+   * the call has no transcript entry (out-of-band programmatic calls).
+   * Populated around every wall run, deleted on settle. Undefined for
+   * unknown/settled ids.
+   */
+  activeCall(id: string): ToolCallRecord | undefined;
+  /**
    * MASS MERGE — write the whole god object silently (restore / checkpoint /
    * sync-apply). `fn` receives the observed data container, manipulates it
    * (or returns a NEW one), returns it. NO patches fire — the diff is
@@ -1005,7 +1021,88 @@ export interface Tool {
 }
 
 // ============================================================================
+// CALLTOOL — the universal programmatic tool-call seam
+// ============================================================================
+
+/** Options for GodObject.callTool. Every knob defaults to the full wall. */
+export interface CallToolOptions {
+  /** Rendezvous key for gates/waits/audit. Default: generated crypto id. */
+  id?: string;
+  /** Who called — "loop" | "code" | "tool" | ... OPEN: future callers
+   * self-name. Rides every event payload so watchers can discriminate. */
+  via?: string;
+  /** Nesting depth of this call (0 = top level). callTool refuses past
+   * MAX_CALLTOOL_DEPTH instead of stacking. Callers inside tool.execute
+   * pass parent depth + 1. */
+  depth?: number;
+  /** Run the beforeTool gate chain. Default true. false = escape hatch for
+   * trusted internal dispatchers — explicit and auditable, never silent. */
+  gate?: boolean;
+  /** Run the schema wall (tool.validate ?? JSON-Schema). Default true.
+   * false = caller pre-validated (typed proxies skip double work). */
+  validate?: boolean;
+  /** Inject a verdict and skip execute (denial, cache hit, crash-heal).
+   * Same shape the loop reads from call.preResolved. */
+  preResolved?: { answer: string | ContentBlock[]; stored?: unknown; error?: boolean; errorMessage?: string };
+  /** Fire toolStart/toolEnd (with via/depth). Default true. false = hot
+   * paths that deliberately skip observability (speculative fan-out). */
+  events?: boolean;
+  /** Run the afterTool patch chain. Default false: a nested call has no
+   * commit to patch. true = opt IN to retry/patch semantics. */
+  afterTool?: boolean;
+  /** Caller abort — releases a PARKED gate wait promptly (truthful
+   * gated/waitedMs). Execute itself always runs to settle: tools have no
+   * cancel channel, so racing it would only orphan work and lie about the
+   * outcome. Pre-aborted at entry → immediate aborted result, nothing runs. */
+  signal?: AbortSignal;
+  /** Deadline in ms for the whole call (gate waits included). On fire the
+   * caller gets a timeout error result and the work is orphaned: late
+   * settle still unregisters + fires toolEnd, but skips afterTool/commit.
+   * Absent/non-positive = unbounded. */
+  timeoutMs?: number;
+  /** Commit a toolCall + toolResult message pair (full loop semantics incl.
+   * currentTurn repoint). Default false: return data, touch nothing. The
+   * pair keeps simple-model's by-ID pairing sound — never an orphan result.
+   * Committed messages are enabled:false (harness truth, off the wire). */
+  commit?: boolean;
+}
+
+/** What GodObject.callTool resolves with. Never throws — see result.error. */
+export interface CallToolOutcome {
+  /** The record that went through (preResolved visible for audit). */
+  call: ToolCallRecord;
+  /** Normalized result — answer always present. */
+  result: ToolResult;
+  /** True when a gate parked mid-call (resumed or still waiting at return). */
+  gated: boolean;
+  /** Time spent parked on gates, ms. */
+  waitedMs: number;
+}
+
+/** Nesting ceiling for callTool-inside-execute. Past it → recursion_blocked. */
+export const MAX_CALLTOOL_DEPTH = 8;
+
+// ============================================================================
 // MISC SHARED
+// ============================================================================
+
+/** One tool invocation inside a toolCall message's two-face `stored`.
+ * Canonical shape { id, type, name, parameters } + the optional preResolved
+ * verdict a filter wrote BEFORE the batch executes (denial, cache, heal). */
+export interface ToolCallRecord {
+  id: string;
+  /**
+   * The tool type — "function" in the canonical form, but OPEN: custom types
+   * are strings (like MessageType). Create your own fucked up custom type.
+   */
+  type: "function" | (string & {});
+  name: string;
+  parameters: Record<string, unknown>;
+  /** A filter pre-resolved this call's outcome BEFORE the batch executes — the
+   * result is PREDETERMINED: a denial, a cached result, or crash-healing.
+   * `error` is a SEPARATE dimension — denial/heal = true; a cache hit omits it. */
+  preResolved?: { answer: string | ContentBlock[]; stored?: unknown; error?: boolean; errorMessage?: string };
+}
 // ============================================================================
 
 /** JSON Schema — boring, standard, everywhere. */

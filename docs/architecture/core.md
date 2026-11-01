@@ -168,9 +168,13 @@ Gates all pass (`gateCursor` reaches the end) → `batchStep()`: phase
   stop/pause breaks between calls.
 - Otherwise parallel exec (`Promise.all`), then SYNCHRONOUS sequential commit
   in call order.
-- `executeOne`: preResolved → unknown tool → disabled tool → the real tool.
-  A throwing tool becomes an ERROR RESULT (`error: true` + trace in `stored`)
-  — never a thrown exception, the batch never dies.
+- `executeOne` delegates to `runToolCall` — the ONE wall body shared with
+  programmatic `agent.callTool` (code cells, `call_tool`, timers, tests):
+  gate → park-wait → preResolved → unknown → disabled → schema → toolStart
+  → execute → normalize. A throwing tool becomes an ERROR RESULT
+  (`error: true` + trace in `stored`) — never a thrown exception, the batch
+  never dies. Only the loop lane commits (afterTool → push → repoint →
+  toolEnd); programmatic calls return data unless `commit: true`.
 - **The crash-heal rule:** a call whose result is already committed in history
   is DONE — the batch skips it (never re-run, never re-commit).
 
@@ -271,7 +275,7 @@ extension doors, no fork:
    never changes.
 2. **Inheritance (the override seam)** — every meaningful machine method is
    `protected`: `loop1`/`loop2` (the whole machine shape), `step`/`providerStep`/
-   `batchStep`/`executeToolBatch`/`executeOne`/`commitProviderResponse`/
+   `batchStep`/`executeToolBatch`/`executeOne`/`runToolCall`/`commitProviderResponse`/
    `commitToolResult` (the pipeline), `land`/`parkNow`/`startTurn`/`fail`
    (lifecycle), `deriveLoopState`, `drainInputs`/`processInputSeq`, the chores.
    Import the class, extend it, override ONE seam, call `super` for the rest.

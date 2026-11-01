@@ -40,6 +40,8 @@
 
 import { FilterBus } from "./filter-bus.ts";
 import type {
+    CallToolOptions,
+    CallToolOutcome,
     ContentBlock,
     CycleState,
     ErrorFacts,
@@ -65,6 +67,7 @@ import type {
     SettledResult,
     SettledState,
     Tool,
+    ToolCallRecord,
     ToolResult,
     ToolResultMessage,
     TurnResult,
@@ -74,7 +77,7 @@ import type {
     DeclaredInput,
     InstallStep,
 } from "./types.ts";
-import { EVENTS, PER_CALL_TELEMETRY_KEYS, PluginDependencyError, addStats, emptySessionStats } from "./types.ts";
+import { EVENTS, MAX_CALLTOOL_DEPTH, PER_CALL_TELEMETRY_KEYS, PluginDependencyError, addStats, emptySessionStats } from "./types.ts";
 import { validateToolArgs } from "./tool.ts";
 
 /**
@@ -153,28 +156,6 @@ function normalizeToolResult(raw: unknown, name: string): ToolResult {
         };
     }
     return r;
-}
-
-/**
- * A stored tool call inside a toolCall message's two-face `stored` list.
- * THE CANONICAL SHAPE — clean and provider-agnostic:
- *   { id, type: "function", name, parameters }
- * The wire fuckery (OpenAI's `function: { name, arguments }` with JSON-string
- * arguments, provider-specific type names) lives in the TRANSFORM, never here.
- */
-export interface ToolCallRecord {
-    id: string;
-    /**
-     * The tool type — "function" in the canonical form, but OPEN: custom types
-     * are strings (like MessageType). Create your own fucked up custom type.
-     */
-    type: "function" | (string & {});
-    name: string;
-    parameters: Record<string, unknown>;
-    /** A filter pre-resolved this call's outcome BEFORE the batch executes — the
-     * result is PREDETERMINED: a denial, a cached result, or crash-healing.
-     * `error` is a SEPARATE dimension — denial/heal = true; a cache hit omits it. */
-    preResolved?: { answer: string | ContentBlock[]; stored?: unknown; error?: boolean; errorMessage?: string };
 }
 
 /**
@@ -281,6 +262,10 @@ export class Agent implements GodObject {
     /** Side-call controllers — terminate() fires them all; abort()/stop() don't
      * (side chains are not the loop's job). Deleted on settle. */
     private sideControllers = new Set<AbortController>();
+    /** In-flight tool calls by id — populated around EVERY runToolCall
+     * (loop lane AND programmatic). The rendezvous resolvers use when the
+     * call has no transcript entry yet (out-of-band calls). Deleted on settle. */
+    private activeCalls = new Map<string, ToolCallRecord>();
     /** Installed plugins by id — the extension storage. */
     private pluginMap = new Map<string, Plugin>();
     /** ---- declared registries (private Maps — the agent's contract surface) ---- */
@@ -1702,7 +1687,292 @@ export class Agent implements GodObject {
         );
     }
 
-    /** The tool batch: gates already ran; execute + commit results. */
+    // ==========================================================================
+    // CALLTOOL — the universal programmatic tool-call seam
+    // ==========================================================================
+    //
+    //   callTool(name, params, opts)   PUBLIC — the one door. Builds the call
+    //       record, races the wall against timeout/signal, then (unless the
+    //       caller already gave up) runs afterTool?, commit?, toolEnd.
+    //   runToolCall(call, opts, turn?) PROTECTED — the wall body, and the
+    //       override seam: gate → park-wait → preResolved → resolve → schema
+    //       → toolStart → execute → normalize. Never touches messages.
+    //   executeOne(call, callMsg)      the loop lane: runToolCall with
+    //       { via: "loop", gate: false } (gates ran in step()) + commit.
+    //
+    // INVARIANTS: never throws (error-as-result); never touches messages
+    // unless commit:true; toolEnd fires exactly once per call, at work-settle.
+
+    /** Look up an in-flight call — the OOB resolver rendezvous. */
+    activeCall(id: string): ToolCallRecord | undefined {
+        return this.activeCalls.get(id);
+    }
+
+    /** Run one tool through the full wall, from anywhere. See GodObject.callTool. */
+    async callTool(name: string, params: unknown, opts: CallToolOptions = {}): Promise<CallToolOutcome> {
+        const depth = opts.depth ?? 0;
+        const via = opts.via ?? "direct";
+        const call: ToolCallRecord = {
+            id: opts.id ?? `call-${crypto.randomUUID().slice(0, 8)}`,
+            type: "function",
+            name,
+            parameters: (typeof params === "object" && params !== null && !Array.isArray(params)
+                ? params
+                : {}) as Record<string, unknown>,
+        };
+        if (opts.preResolved) call.preResolved = opts.preResolved;
+        if (depth > MAX_CALLTOOL_DEPTH) {
+            return {
+                call,
+                result: {
+                    answer: `callTool: nesting depth ${depth} exceeds the ceiling (${MAX_CALLTOOL_DEPTH}) — refusing ${name} instead of stacking.`,
+                    error: true,
+                    errorMessage: "recursion_blocked",
+                },
+                gated: false,
+                waitedMs: 0,
+            };
+        }
+        const runOpts: CallToolOptions = { ...opts, via, depth };
+        // Pre-aborted: return immediately without running anything (a dying
+        // loop has no gates to consult). The call record exists for audit.
+        if (this.abortSignal.aborted || opts.signal?.aborted === true) {
+            return {
+                call,
+                result: { answer: `callTool: ${name} aborted before it started.`, error: true, errorMessage: "aborted" },
+                gated: false,
+                waitedMs: 0,
+            };
+        }
+        // SIGNAL = park-release only: it frees a gate wait inside runToolCall
+        // (prompt, truthful gated/waitedMs). Execute itself always runs to
+        // settle — tools have no cancel channel, so racing it would only
+        // orphan work and lie about the outcome. TIMEOUT is the bounded-wait
+        // tool: on fire the caller gets a timeout result and the work is
+        // orphaned (late settle still unregisters + fires toolEnd, but skips
+        // afterTool/commit — no surprise retries or transcript writes).
+        const timeoutMs = typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+            ? opts.timeoutMs
+            : undefined;
+        const work = this.runToolCall(call, runOpts);
+        if (timeoutMs !== undefined) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const winner = await Promise.race([
+                work.then((): null => null),
+                new Promise<"timeout">((resolve) => {
+                    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+                    timer.unref?.();
+                }),
+            ]);
+            clearTimeout(timer);
+            if (winner === "timeout") {
+                void work.then(
+                    (late) => this.finishLateCall(late.call, late.result, via, depth, opts.events !== false),
+                    () => {},
+                );
+                return {
+                    call,
+                    result: {
+                        answer: `callTool: ${name} timed out after ${timeoutMs}ms — the tool keeps running in the background.`,
+                        error: true,
+                        errorMessage: "timeout",
+                    },
+                    gated: false,
+                    waitedMs: 0,
+                };
+            }
+        }
+        const outcome = await work;
+        // afterTool (opt-in patch chain — filters mutate payload.result in place).
+        if (opts.afterTool === true) {
+            await this.bus.runFromRegistry(EVENTS.afterTool, { call: outcome.call, result: outcome.result, via, depth });
+        }
+        // Commit (opt-in full loop semantics: paired messages + repoint).
+        if (opts.commit === true) {
+            this.commitCallToolResult(outcome.call, outcome.result);
+        }
+        // toolEnd: the committed truth (or the bare result). Awaited, registry
+        // lane — reaches listeners any time, mid-cycle or post-cycle.
+        if (opts.events !== false) {
+            await this.bus.runFromRegistry(EVENTS.toolEnd, { call: outcome.call, result: outcome.result, via, depth });
+        }
+        return outcome;
+    }
+
+    /** Late settle for an orphaned (timed-out/aborted) call: unregister is
+     * already done by runToolCall's finally — only the truthful toolEnd. */
+    private async finishLateCall(call: ToolCallRecord, result: ToolResult, via: string, depth: number, events: boolean): Promise<void> {
+        if (events) {
+            await this.bus.runFromRegistry(EVENTS.toolEnd, { call, result, via, depth });
+        }
+    }
+
+    /** Commit one programmatic call: PAIRED toolCall + toolResult messages
+     * (enabled:false — harness truth, off the wire) + currentTurn repoint.
+     * The pair keeps needsBatch/crash-heal sound — never an orphan result. */
+    private commitCallToolResult(call: ToolCallRecord, result: ToolResult): void {
+        const callMsg: Message = {
+            id: `toolcall-${crypto.randomUUID().slice(0, 8)}`,
+            enabled: false,
+            type: "toolCall",
+            committedAt: Date.now(),
+            content: { answer: "", stored: [call] },
+        };
+        const resultMsg: ToolResultMessage = {
+            id: `toolresult-${crypto.randomUUID().slice(0, 8)}`,
+            enabled: false,
+            type: "toolResult",
+            committedAt: Date.now(),
+            toolCallId: call.id,
+            toolName: call.name,
+            content: {
+                answer: result.answer,
+                stored: result.stored,
+                error: result.error,
+                errorMessage: result.errorMessage,
+            },
+        };
+        this.messages.push(callMsg, resultMsg);
+        this.currentTurn = resultMsg;
+    }
+
+    /** THE WALL BODY — gate → park-wait → preResolved → resolve → schema →
+     * toolStart → execute → normalize. No messages, no afterTool, no toolEnd
+     * (the caller owns those). The override seam for subclasses. */
+    protected async runToolCall(
+        call: ToolCallRecord,
+        opts: CallToolOptions = {},
+        turn?: Message,
+    ): Promise<{ call: ToolCallRecord; result: ToolResult; gated: boolean; waitedMs: number }> {
+        const via = opts.via ?? "direct";
+        const depth = opts.depth ?? 0;
+        const fail = (answer: string, errorMessage: string, stored?: unknown): { call: ToolCallRecord; result: ToolResult; gated: boolean; waitedMs: number } => ({
+            call,
+            result: { answer, error: true, errorMessage, ...(stored !== undefined ? { stored } : {}) },
+            gated: false,
+            waitedMs: 0,
+        });
+        this.activeCalls.set(call.id, call);
+        try {
+            // 1. GATE — registry lane (reaches listeners ANY time; the cycle
+            // queue is empty outside a cycle and gates would silently not fire).
+            let gated = false;
+            let waitedMs = 0;
+            if (opts.gate !== false) {
+                const toolForGate = this.tools.find((t) => t.name === call.name);
+                await this.bus.runFromRegistry(EVENTS.beforeTool, { batch: [call], call, tool: toolForGate, via, depth });
+                // A gate parked a question for this call: wait for the answer.
+                // Loop 1 keeps draining inputs while the worker is suspended
+                // inside execute — the park releases from the input lane.
+                if (!call.preResolved && this.pendingAwaits.some((a) => a.id === call.id)) {
+                    gated = true;
+                    const waitStart = Date.now();
+                    const released = await this.waitForGateRelease(call.id, opts.signal);
+                    waitedMs = Date.now() - waitStart;
+                    if (!released) {
+                        return {
+                            call,
+                            result: { answer: `callTool: ${call.name} aborted while awaiting approval.`, error: true, errorMessage: "aborted" },
+                            gated,
+                            waitedMs,
+                        };
+                    }
+                }
+            }
+            // 2. PRE-RESOLVED — denial / cache / heal. Verbatim, no events
+            // (the gate that set it already audited).
+            if (call.preResolved) {
+                const p = call.preResolved;
+                return {
+                    call,
+                    result: {
+                        answer: p.answer,
+                        ...(p.stored !== undefined ? { stored: p.stored } : {}),
+                        ...(p.error !== undefined ? { error: p.error } : {}),
+                        ...(p.errorMessage !== undefined ? { errorMessage: p.errorMessage } : {}),
+                    },
+                    gated,
+                    waitedMs,
+                };
+            }
+            // 3. RESOLVE — unknown, then disabled. Hidden tools stay callable.
+            const tool = this.tools.find((t) => t.name === call.name);
+            if (!tool) {
+                return fail(`Unknown tool: ${call.name}`, "unknown_tool");
+            }
+            if (tool.disabled) {
+                return fail(`This tool is currently disabled: ${call.name}`, "tool_disabled");
+            }
+            // 4. SCHEMA WALL — tool.validate REPLACES the JSON-Schema check.
+            if (opts.validate !== false) {
+                const argErrors = tool.validate
+                    ? (tool.validate(call.parameters) ?? [])
+                    : validateToolArgs(tool.inputSchema, call.parameters);
+                if (argErrors.length > 0) {
+                    return {
+                        call,
+                        result: {
+                            answer: `Invalid arguments for ${call.name}: ${argErrors.join("; ")}`,
+                            error: true,
+                            errorMessage: "invalid_arguments",
+                            stored: { errors: argErrors },
+                        },
+                        gated,
+                        waitedMs,
+                    };
+                }
+            }
+            // 5. ANNOUNCE + EXECUTE. toolStart floats (fire returns at the
+            // first await) unless events:false. Loop lane keeps the cycle
+            // queue + turn repoint; every other lane uses the registry
+            // (audible any time) and never touches currentTurn (observed
+            // state — no patch churn for OOB).
+            if (opts.events !== false) {
+                const fromRegistry = via !== "loop";
+                this.fire(EVENTS.toolStart, { call, tool, via, depth }, fromRegistry, true, via === "loop" ? turn : undefined);
+            }
+            try {
+                const raw = await tool.execute(call.parameters, this);
+                return { call, result: normalizeToolResult(raw, call.name), gated, waitedMs };
+            } catch (err) {
+                // error-as-result — the model self-corrects; the trace stays
+                // in stored (for us, never on the wire).
+                const message = err instanceof Error ? err.message : String(err);
+                const trace = err instanceof Error ? err.stack : undefined;
+                return {
+                    call,
+                    result: {
+                        answer: `Tool ${call.name} failed: ${message}`,
+                        error: true,
+                        errorMessage: message,
+                        stored: trace ? { trace } : undefined,
+                    },
+                    gated,
+                    waitedMs,
+                };
+            }
+        } finally {
+            this.activeCalls.delete(call.id);
+        }
+    }
+
+    /** Wait until every pendingAwait for callId is spliced out (answered) or
+     * an abort lands. Polls — the splice happens on loop 1's beat. */
+    private waitForGateRelease(callId: string, signal?: AbortSignal): Promise<boolean> {
+        const { promise, resolve } = Promise.withResolvers<boolean>();
+        const timer = setInterval(() => {
+            if (signal?.aborted === true || this.abortSignal.aborted) {
+                clearInterval(timer);
+                resolve(false);
+            } else if (!this.pendingAwaits.some((a) => a.id === callId)) {
+                clearInterval(timer);
+                resolve(true);
+            }
+        }, 10);
+        timer.unref?.();
+        return promise;
+    }
+
     protected async executeToolBatch(callMsg: Message): Promise<void> {
         const content = callMsg.content as { answer: string; stored: unknown };
         const calls = (content.stored as ToolCallRecord[]) ?? [];
@@ -1736,66 +2006,12 @@ export class Agent implements GodObject {
         }
     }
 
-    /** Execute ONE call: preResolved → disabled → unknown → the real tool. */
+    /** The loop lane: the wall body with gates already run (step() gated via
+     * the cycle queue) + the callMsg turn for toolStart observers. Commit
+     * stays in commitToolResult (afterTool → push → repoint → toolEnd). */
     protected async executeOne(call: ToolCallRecord, callMsg: Message) {
-        // a filter pre-resolved this call's outcome (deny, synthetic result)
-        if (call.preResolved) {
-            return {
-                call,
-                result: {
-                    answer: call.preResolved.answer,
-                    stored: call.preResolved.stored,
-                    error: call.preResolved.error,
-                    errorMessage: call.preResolved.errorMessage,
-                },
-            };
-        }
-        const tool = this.tools.find((t) => t.name === call.name);
-        if (!tool) {
-            return { call, result: { answer: `Unknown tool: ${call.name}`, error: true } };
-        }
-        if (tool.disabled) {
-            return { call, result: { answer: `This tool is currently disabled: ${call.name}`, error: true } };
-        }
-        // THE SCHEMA WALL — arguments are validated BEFORE execution. A model
-        // that hallucinates bad args gets a structured invalid_arguments result,
-        // not a tool-specific crash. A tool-provided `validate` REPLACES the
-        // default JSON-Schema check (the tool owns its contract fully); an empty
-        // schema or a clean custom check never blocks.
-        const argErrors = tool.validate
-            ? (tool.validate(call.parameters) ?? [])
-            : validateToolArgs(tool.inputSchema, call.parameters);
-        if (argErrors.length > 0) {
-            return {
-                call,
-                result: {
-                    answer: `Invalid arguments for ${call.name}: ${argErrors.join("; ")}`,
-                    error: true,
-                    errorMessage: "invalid_arguments",
-                    stored: { errors: argErrors },
-                },
-            };
-        }
-        this.fire(EVENTS.toolStart, { call, tool }, false, true, callMsg);
-        try {
-            const raw = await tool.execute(call.parameters, this);
-            return { call, result: normalizeToolResult(raw, call.name) };
-        } catch (err) {
-            // error-as-result — the model sees the failure and self-corrects;
-            // the orchestrator sees error: true + errorMessage; the trace stays
-            // in stored (for us, never on the wire)
-            const message = err instanceof Error ? err.message : String(err);
-            const trace = err instanceof Error ? err.stack : undefined;
-            return {
-                call,
-                result: {
-                    answer: `Tool ${call.name} failed: ${message}`,
-                    error: true,
-                    errorMessage: message,
-                    stored: trace ? { trace } : undefined,
-                },
-            };
-        }
+        const outcome = await this.runToolCall(call, { via: "loop", depth: 0, gate: false }, callMsg);
+        return { call: outcome.call, result: outcome.result };
     }
 
 

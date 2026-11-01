@@ -651,3 +651,40 @@ test("approve(): bindArgs denies when the args drift since the ask", async () =>
     assert.equal(content.error, true);
     assert.equal(content.errorMessage, "args drift");
 });
+
+// ---------------------------------------------------------------------------
+// OUT-OF-BAND calls — the resolver rendezvous without a transcript entry
+// ---------------------------------------------------------------------------
+// A programmatic agent.callTool parks with NO toolCall message. The resolver
+// must find the call via agent.activeCall(id) — otherwise a human "no" is
+// silently lost and the nested call runs un-gated.
+
+test("OOB: classicResolve 'no' binds a denial to a transcript-less call (tool never runs)", async () => {
+    const { agent, spy } = makePermAgent([]);
+    agent.install(createPermissions({ defaults: { gate: askAll, resolve: classicResolve } }));
+    await withDriver(agent, async () => {
+        const pending = agent.callTool("dummy", {}, { id: "oob-no" });
+        while (agent.pendingAwaits.length === 0) await new Promise((r) => setImmediate(r));
+        assert.equal(agent.messages.length, 0, "no transcript entry for the OOB call");
+        answerOnce(agent, "oob-no", { choice: "no" });
+        const outcome = await pending;
+        assert.equal(outcome.result.error, true);
+        assert.match(outcome.result.answer as string, /declined|denied|no/i);
+    });
+    assert.equal(spy.executes, 0, "denied OOB call never executed");
+    assert.equal(agent.pendingAwaits.length, 0, "park released");
+});
+
+test("OOB: classicResolve 'once' is silent — the transcript-less call executes", async () => {
+    const { agent, spy } = makePermAgent([]);
+    agent.install(createPermissions({ defaults: { gate: askAll, resolve: classicResolve } }));
+    await withDriver(agent, async () => {
+        const pending = agent.callTool("dummy", {}, { id: "oob-once" });
+        while (agent.pendingAwaits.length === 0) await new Promise((r) => setImmediate(r));
+        answerOnce(agent, "oob-once", { choice: "once" });
+        const outcome = await pending;
+        assert.equal(outcome.result.answer, "ran");
+        assert.equal(outcome.gated, true);
+    });
+    assert.equal(spy.executes, 1, "approved OOB call executed for real");
+});

@@ -175,6 +175,33 @@ message — what the model sees), `stored` (raw, verbatim, never on the wire),
 a tool). Return garbage (no answer face at all) and the core synthesizes an
 error result telling the model it was a tool bug.
 
+## callTool — run any tool programmatically
+
+```ts
+const outcome = await agent.callTool("bash", { command: "ls" }, {
+  via: "code",        // who called — rides every event payload
+  depth: 1,           // nesting depth (ceiling: MAX_CALLTOOL_DEPTH = 8)
+  id: "c7_c3",        // rendezvous key (default: generated)
+  gate: true,         // beforeTool chain (false = explicit escape hatch)
+  validate: true,     // schema wall (false = caller pre-validated)
+  events: true,       // toolStart/toolEnd (false = hot paths opt out)
+  afterTool: false,   // patch chain (no commit to patch by default)
+  signal, timeoutMs,  // park-release + whole-call deadline (orphans, never kills)
+  preResolved,        // inject a verdict, skip execute
+  commit: false,      // paired toolCall+toolResult messages (enabled:false)
+});
+// outcome: { call, result, gated, waitedMs } — never throws.
+agent.activeCall(id); // in-flight record (the OOB resolver rendezvous)
+```
+
+One wall for every caller: the loop batch (`via: "loop"`), code cells
+(`via: "code"`), `call_tool` (`via: "tool"`), timers, tests. Order is
+resolve → beforeTool → preResolved → schema → toolStart → execute →
+toolEnd; `messages` is untouched unless `commit: true`. A gate parked
+mid-call waits for loop 1 to drain the answer (the worker is suspended
+inside execute); `signal`/loop-abort releases the wait, `timeoutMs`
+orphans the work (late settle still fires toolEnd, skips afterTool/commit).
+
 ## Plugin — the named bundle
 
 ```ts
@@ -268,7 +295,7 @@ extend it, override ONE seam, call `super` for the rest. No fork, no side repo.
 
 - **Whole machine:** `loop1()` / `loop2()`
 - **The pipeline:** `step()` / `providerStep()` / `batchStep()` /
-  `executeToolBatch()` / `executeOne()` / `commitProviderResponse()` /
+  `executeToolBatch()` / `executeOne()` / `runToolCall()` / `commitProviderResponse()` /
   `commitToolResult()`
 - **Lifecycle:** `startTurn()` / `parkNow()` / `land()` / `fail()`
 - **Derivation + chores:** `deriveLoopState()` / `drainInputs()` /
