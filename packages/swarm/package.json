@@ -20,8 +20,12 @@
   "devDependencies": {
     "@types/ws": "^8.5.13"
   },
+  "bin": {
+    "swarm": "./bin/swarm.js"
+  },
   "files": [
-    "src"
+    "src",
+    "bin"
   ],
   "engines": {
     "node": ">=22.6"

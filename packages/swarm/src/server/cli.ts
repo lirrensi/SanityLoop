@@ -12,16 +12,26 @@
 //   swarm listen (--session <id> | --run <id-or-name> | --program <name>) [--server ws://...]
 //   swarm programs list|get|define|patch|launch|remove|preview|logs
 //   swarm runs list|get|logs|wait|kill|signal|save|restart|prune
-//   swarm exec [--wait-ms N] [--detach] [--cwd DIR] -- <cmd> [args...]
+//   swarm exec [--wait-ms N] [--timeout-ms N] [--name NAME] [--detach] [--cwd DIR] -- <cmd> [args...]
 //   swarm send <sessionId> <text>              [--server ws://...]
 //   swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset>
 //   swarm history | templates | events <sessionId>
-//   swarm scan [--templates DIR]
+//   swarm scan [--dir HOME] [--templates DIR]
+//   swarm doctor [--dir HOME] [--json]
+//   swarm install [--dir HOME] [--port N] [--name N] [--as NAME] [--force]
+//   swarm uninstall [--dir HOME] [--as NAME]
 //
 // `serve` runs the daemon in-process (it IS the daemon). The rest are clients
 // that talk to a running daemon over the wire — the same protocol the UI will
 // speak. Boot resubmits every kept program whose desired state is running —
 // there is no resurrect flag; the definitions ARE the desired state.
+//
+// MULTI-DAEMON RULE: a home = a daemon. --dir ($SWARM_HOME, then the default
+// ~/.sanity/swarm) selects the home; the default is a convenience, not a
+// limit. `install` gives each home its own OS unit (swarm-<slug(home)>
+// unless --as), so N homes = N daemons. (NOTE: --as on `serve` is something
+// else — a federation alias paired with --connect. On install/uninstall --as
+// names the OS unit.)
 // ============================================================================
 import { createSwarmServer } from "./index.ts";
 import { ensureScaffold, homeLayout, loadConfig, resolveHome } from "./config.ts";
@@ -29,6 +39,13 @@ import { scanTemplates } from "./templates.ts";
 import { DEFAULT_PORT } from "../protocol.ts";
 import type { ControlAction, SwarmRole } from "../protocol.ts";
 import WebSocket from "ws";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, statfsSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { createRequire } from "node:module";
+import { createConnection } from "node:net";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const HELP = `usage:
   swarm serve [--dir HOME] [--port N] [--addr H] [--templates DIR]
@@ -63,6 +80,11 @@ const HELP = `usage:
   swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset> [--server ws://H:P]
   swarm history | swarm templates [--server ws://H:P]
   swarm scan [--dir HOME] [--templates DIR]
+  swarm doctor [--dir HOME] [--json]           preflight checks for a home
+  swarm install [--dir HOME] [--port N] [--name N] [--as UNIT] [--force]
+      register the daemon with the OS (a home = a daemon; each home gets
+      its own unit: swarm-<slug(home)> unless --as)
+  swarm uninstall [--dir HOME] [--as UNIT]     stop + remove the OS unit (home data untouched)
   swarm help`;
 
 interface Args {
@@ -243,6 +265,375 @@ const die = (msg: string): never => {
 	process.exitCode = 1;
 	throw new Error(msg);
 };
+
+// ---------------------------------------------------------------------------
+// doctor / install / uninstall — the install story.
+// MULTI-DAEMON RULE (owner decision): a home = a daemon. --dir ($SWARM_HOME,
+// then ~/.sanity/swarm) selects the home; the default is a convenience, not a
+// limit. daemon.lock + config.json (with port) already make homes independent,
+// so install supports N daemons: unit names derive from the home unless --as.
+// Install never touches home data; uninstall removes only the OS unit.
+// ---------------------------------------------------------------------------
+
+type CheckStatus = "PASS" | "FAIL" | "SKIP";
+
+interface DoctorCheck {
+	name: string;
+	status: CheckStatus;
+	detail: string;
+}
+
+/** The port the daemon would serve: --port wins, else the home config, else the default. */
+function doctorPort(args: Args, home: string): number {
+	const raw = flag(args, "port");
+	if (raw !== undefined) {
+		const n = Number(raw);
+		return Number.isFinite(n) ? n : DEFAULT_PORT;
+	}
+	return loadConfig(home)?.port ?? DEFAULT_PORT;
+}
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function portFree(port: number): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const sock = createConnection({ host: "127.0.0.1", port }, () => {
+		sock.destroy();
+		resolve(false);
+	});
+	sock.on("error", () => {
+		sock.destroy();
+		resolve(true);
+	});
+	sock.setTimeout(2000, () => {
+		sock.destroy();
+		resolve(true);
+	});
+	return promise;
+}
+
+async function runDoctor(home: string, args: Args): Promise<DoctorCheck[]> {
+	const checks: DoctorCheck[] = [];
+	// 1. node version: engines demand >=22.6
+	{
+		const m = /^v(\d+)\.(\d+)/.exec(process.version);
+		const ok = !!m && (Number(m[1]!) > 22 || (Number(m[1]!) === 22 && Number(m[2]!) >= 6));
+		checks.push({
+			name: "node",
+			status: ok ? "PASS" : "FAIL",
+			detail: ok ? `${process.version} (>=22.6)` : `${process.version} — need >=22.6`,
+		});
+	}
+	// 2. home writable (scaffold best-effort so a fresh tmp home passes)
+	{
+		try {
+			mkdirSync(home, { recursive: true });
+			ensureScaffold(home);
+			const probe = join(home, `.doctor-${process.pid}`);
+			writeFileSync(probe, "ok", "utf8");
+			rmSync(probe, { force: true });
+			checks.push({ name: "home", status: "PASS", detail: `${home} writable` });
+		} catch (err) {
+			checks.push({
+				name: "home",
+				status: "FAIL",
+				detail: `${home} not writable: ${err instanceof Error ? err.message : String(err)}`,
+			});
+		}
+	}
+	// 3. port from config or default free (or owned by our lock pid)
+	{
+		const port = doctorPort(args, home);
+		const free = Number.isFinite(port) ? await portFree(port) : false;
+		if (free) {
+			checks.push({ name: "port", status: "PASS", detail: `${port} free` });
+		} else {
+			checks.push({ name: "port", status: "FAIL", detail: `${port} in use` });
+		}
+	}
+	// 4. daemon.lock state
+	{
+		const lockPath = join(home, "daemon.lock");
+		if (!existsSync(lockPath)) {
+			checks.push({ name: "lock", status: "PASS", detail: "absent (no daemon holds this home)" });
+		} else {
+			let raw = "";
+			try {
+				raw = readFileSync(lockPath, "utf8").trim();
+			} catch {
+				raw = "";
+			}
+			const pid = Number(raw);
+			if (raw && raw === String(process.pid)) {
+				checks.push({ name: "lock", status: "PASS", detail: `owned by this process (pid ${raw})` });
+			} else if (raw && Number.isFinite(pid) && pid > 0 && processAlive(pid)) {
+				checks.push({ name: "lock", status: "FAIL", detail: `held by live pid ${pid}` });
+			} else if (raw && Number.isFinite(pid) && pid > 0) {
+				checks.push({ name: "lock", status: "FAIL", detail: `stale pid ${pid} (dead)` });
+			} else {
+				checks.push({ name: "lock", status: "FAIL", detail: `unreadable content: ${raw || "(empty)"}` });
+			}
+		}
+	}
+	// 5. templates dir scannable
+	{
+		try {
+			const dir = flag(args, "templates") ?? homeLayout(home).templatesDir;
+			const found = scanTemplates(dir).length;
+			checks.push({ name: "templates", status: "PASS", detail: `${dir} scannable (${found} found)` });
+		} catch (err) {
+			checks.push({
+				name: "templates",
+				status: "FAIL",
+				detail: `scan failed: ${err instanceof Error ? err.message : String(err)}`,
+			});
+		}
+	}
+	// 6. croner importable + tz db (Intl check)
+	{
+		try {
+			const require = createRequire(import.meta.url);
+			require.resolve("croner");
+			const tzOk = (() => {
+				try {
+					new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York" }).format(new Date(0));
+					new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Tokyo" }).format(new Date(0));
+					return true;
+				} catch {
+					return false;
+				}
+			})();
+			checks.push(
+				tzOk
+					? { name: "cron", status: "PASS", detail: "croner resolvable, tz db present" }
+					: { name: "cron", status: "FAIL", detail: "croner resolvable but tz db missing (Intl)" },
+			);
+		} catch (err) {
+			checks.push({
+				name: "cron",
+				status: "FAIL",
+				detail: `croner not resolvable: ${err instanceof Error ? err.message : String(err)}`,
+			});
+		}
+	}
+	// 7. disk space, best-effort (SKIP when the platform refuses to say)
+	{
+		try {
+			const st = statfsSync(home);
+			const free = typeof st.bfree === "number" && typeof st.bsize === "number" ? st.bfree * st.bsize : NaN;
+			if (Number.isFinite(free)) {
+				checks.push({
+					name: "disk",
+					status: free > 64 * 1024 * 1024 ? "PASS" : "FAIL",
+					detail: `${Math.round(free / 1024 / 1024)}MB free on ${home}`,
+				});
+			} else {
+				checks.push({ name: "disk", status: "SKIP", detail: "free space unknown on this platform" });
+			}
+		} catch {
+			checks.push({ name: "disk", status: "SKIP", detail: "statfs unavailable (best-effort)" });
+		}
+	}
+	return checks;
+}
+
+async function cmdDoctor(args: Args): Promise<void> {
+	const home = resolveHome(args.flags);
+	const checks = await runDoctor(home, args);
+	const asJson = args.flags.get("json") !== undefined;
+	if (asJson) {
+		console.log(JSON.stringify({ home, checks }, null, 2));
+	} else {
+		for (const c of checks) console.log(`${c.status.padEnd(4)} ${c.name}: ${c.detail}`);
+	}
+	if (checks.some((c) => c.status === "FAIL")) process.exitCode = 1;
+}
+
+/** Unit-name slug for a home: lowercase alnum runs joined by `-`. */
+function slugHome(home: string): string {
+	const slug = basename(resolve(home))
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return slug || "default";
+}
+
+function unitName(home: string, args: Args): string {
+	const as = flag(args, "as");
+	if (as) return as.replace(/\.service$/, "").replace(/\.plist$/, "");
+	return `swarm-${slugHome(home)}`;
+}
+
+/** Absolute path to bin/swarm.js next to this package (works from source checkout + installed layout). */
+function launcherPath(): string {
+	const here = dirname(fileURLToPath(import.meta.url));
+	return resolve(here, "..", "..", "bin", "swarm.js");
+}
+
+function hasSystemdUser(): boolean {
+	if (process.platform !== "linux") return false;
+	try {
+		spawnSync("systemctl", ["--user", "show", "--property=Version"], { stdio: "ignore" });
+		execFileSync("systemctl", ["--user", "show", "-p", "Id", "--value", "default.target"], {
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 10000,
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function hasLaunchd(): boolean {
+	if (process.platform !== "darwin") return false;
+	try {
+		execFileSync("launchctl", ["list"], { stdio: ["ignore", "pipe", "ignore"], timeout: 10000 });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function manualInstructions(unit: string, home: string, port: number, name: string | undefined): string {
+	return [
+		`[swarm] no supported service manager found (no systemd --user, no launchd).`,
+		`[swarm] to run this daemon under the OS, register it yourself:`,
+		``,
+		`  unit/home: ${unit}  (a home = a daemon; --dir selects the home)`,
+		`  command:   ${process.execPath} ${launcherPath()} serve --dir ${home} --port ${port}${name ? ` --name ${name}` : ""}`,
+		``,
+		`  Linux (systemd --user): write ~/.config/systemd/user/${unit}.service with`,
+		`    [Install] WantedBy=default.target, [Service] ExecStart=<command above>, Restart=always,`,
+		`    then: systemctl --user daemon-reload && systemctl --user enable --now ${unit}.service`,
+		`    (boot-without-login needs: loginctl enable-linger $USER)`,
+		`  macOS (launchd): write ~/Library/LaunchAgents/${unit}.plist with Label ${unit}`,
+		`    + ProgramArguments <command above split>, RunAtLoad=true, KeepAlive=true,`,
+		`    then: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${unit}.plist`,
+		`  Windows: no service support — run the command above via Task Scheduler.`,
+	].join("\n");
+}
+
+async function cmdInstall(args: Args): Promise<void> {
+	const home = resolveHome(args.flags);
+	const unit = unitName(home, args);
+	const force = args.flags.get("force") !== undefined || args.flags.get("f") !== undefined;
+	const rawPort = flag(args, "port");
+	const port = rawPort !== undefined ? Number(rawPort) : (loadConfig(home)?.port ?? DEFAULT_PORT);
+	if (!Number.isFinite(port) || port <= 0 || port > 65535) die(`[swarm] --port must be 1-65535`);
+	const name = flag(args, "name");
+	const absHome = resolve(home);
+	const launcher = launcherPath();
+	const execStart = `${process.execPath} ${launcher} serve --dir ${absHome} --port ${port}${name ? ` --name ${name}` : ""}`;
+
+	if (hasSystemdUser()) {
+		const dir = join(homedir(), ".config", "systemd", "user");
+		const file = join(dir, `${unit}.service`);
+		if (existsSync(file) && !force) {
+			console.error(`[swarm] unit ${unit} already installed (${file}) — uninstall first, or --force to overwrite`);
+			process.exitCode = 1;
+			return;
+		}
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			file,
+			`[Unit]\nDescription=swarm daemon (${absHome})\nAfter=network.target\n\n[Service]\nExecStart=${execStart}\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n`,
+			"utf8",
+		);
+		const reload = spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" });
+		if (reload.status !== 0) {
+			console.error(`[swarm] daemon-reload failed — unit file left at ${file}`);
+			process.exitCode = 1;
+			return;
+		}
+		const enable = spawnSync("systemctl", ["--user", "enable", "--now", `${unit}.service`], {
+			stdio: "inherit",
+		});
+		if (enable.status !== 0) {
+			console.error(`[swarm] enable --now failed — unit file left at ${file}`);
+			process.exitCode = 1;
+			return;
+		}
+		console.log(`[swarm] installed ${unit}.service for home ${absHome} (port ${port})`);
+		try {
+			execFileSync("loginctl", ["show-user", process.env.USER ?? "", "--property=Linger"], {
+				stdio: ["ignore", "pipe", "ignore"],
+				timeout: 10000,
+			});
+		} catch {
+			console.log(`[swarm] hint: run \`loginctl enable-linger $USER\` for boot-without-login`);
+		}
+		console.log(`[swarm] hint: \`swarm doctor --dir ${absHome}\` checks the home`);
+		return;
+	}
+	if (hasLaunchd()) {
+		const dir = join(homedir(), "Library", "LaunchAgents");
+		const label = unit.endsWith(".plist") ? unit : unit;
+		const file = join(dir, `${label}.plist`);
+		if (existsSync(file) && !force) {
+			console.error(`[swarm] unit ${label} already installed (${file}) — uninstall first, or --force to overwrite`);
+			process.exitCode = 1;
+			return;
+		}
+		mkdirSync(dir, { recursive: true });
+		const progArgs = execStart.split(" ").map((s) => `    <string>${s}</string>`).join("\n");
+		writeFileSync(
+			file,
+			`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n  <key>Label</key>\n  <string>${label}</string>\n  <key>ProgramArguments</key>\n  <array>\n${progArgs}\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n</dict>\n</plist>\n`,
+			"utf8",
+		);
+		const uid = process.getuid?.() ?? 0;
+		const boot = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, file], { stdio: "inherit" });
+		if (boot.status !== 0) {
+			console.error(`[swarm] launchctl bootstrap failed — plist left at ${file}`);
+			process.exitCode = 1;
+			return;
+		}
+		console.log(`[swarm] installed ${label} for home ${absHome} (port ${port})`);
+		console.log(`[swarm] hint: \`swarm doctor --dir ${absHome}\` checks the home`);
+		return;
+	}
+	// Else (Windows / no systemd / no launchd): print manual instructions, exit 2, create nothing.
+	console.error(manualInstructions(unit, absHome, port, name));
+	process.exitCode = 2;
+}
+
+async function cmdUninstall(args: Args): Promise<void> {
+	const home = resolveHome(args.flags);
+	const unit = unitName(home, args);
+	if (hasSystemdUser()) {
+		const file = join(homedir(), ".config", "systemd", "user", `${unit}.service`);
+		if (!existsSync(file)) {
+			console.log(`[swarm] unit ${unit} not installed — nothing to do`);
+			return;
+		}
+		spawnSync("systemctl", ["--user", "disable", "--now", `${unit}.service`], { stdio: "inherit" });
+		rmSync(file, { force: true });
+		spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "inherit" });
+		console.log(`[swarm] uninstalled ${unit} (home data at ${resolve(home)} untouched)`);
+		return;
+	}
+	if (hasLaunchd()) {
+		const file = join(homedir(), "Library", "LaunchAgents", `${unit}.plist`);
+		if (!existsSync(file)) {
+			console.log(`[swarm] unit ${unit} not installed — nothing to do`);
+			return;
+		}
+		const uid = process.getuid?.() ?? 0;
+		spawnSync("launchctl", ["bootout", `gui/${uid}/${unit}`], { stdio: "inherit" });
+		rmSync(file, { force: true });
+		console.log(`[swarm] uninstalled ${unit} (home data at ${resolve(home)} untouched)`);
+		return;
+	}
+	console.error(manualInstructions(unit, resolve(home), doctorPort(args, home), flag(args, "name")));
+	process.exitCode = 2;
+}
 
 async function main(): Promise<void> {
 	const argv = process.argv.slice(2);
@@ -781,6 +1172,18 @@ async function main(): Promise<void> {
 					`${(t.id ?? "?").padEnd(20)} ${t.file} → ${t.path}${t.description ? ` — ${t.description}` : ""}`,
 				);
 			}
+			return;
+		}
+		case "doctor": {
+			await cmdDoctor(args);
+			return;
+		}
+		case "install": {
+			await cmdInstall(args);
+			return;
+		}
+		case "uninstall": {
+			await cmdUninstall(args);
 			return;
 		}
 		default:

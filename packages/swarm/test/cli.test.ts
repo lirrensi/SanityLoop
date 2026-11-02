@@ -231,3 +231,44 @@ test("CLI: listen requires exactly one target", async () => {
 		await server.stop();
 	}
 });
+
+test("CLI: doctor --json exits 0 on a fresh tmp home with machine-parseable checks", async () => {
+	const home = tmpHome();
+	try {
+		const { stdout } = await cli(home, 0, ["doctor", "--dir", home, "--json"]);
+		const parsed = JSON.parse(stdout) as {
+			home: string;
+			checks: { name: string; status: string; detail: string }[];
+		};
+		assert.equal(parsed.home, home);
+		assert.ok(parsed.checks.length >= 5, "doctor reports its checks");
+		for (const c of parsed.checks) {
+			assert.ok(c.name, "check has a name");
+			assert.ok(["PASS", "FAIL", "SKIP"].includes(c.status), `check ${c.name} has a status`);
+		}
+	} finally {
+		rmHome(home);
+	}
+});
+
+test("CLI: install without a service manager prints instructions, exit 2, creates nothing", async () => {
+	const home = tmpHome();
+	try {
+		try {
+			await cli(home, 0, ["install", "--dir", home]);
+			// a manager IS present (container systemctl --user): real install
+			// succeeded — uninstall again so the test leaves nothing behind.
+			await cli(home, 0, ["uninstall", "--dir", home]);
+		} catch (e: unknown) {
+			// no manager: manual instructions on stderr, exit 2, nothing created.
+			assert.ok(e instanceof Error, "install rejects without a manager");
+			assert.ok("code" in e && e.code === 2, "install exits 2 without a manager");
+			assert.ok(
+				"stderr" in e && typeof e.stderr === "string" && e.stderr.includes("swarm serve"),
+				"instructions name the serve command",
+			);
+		}
+	} finally {
+		rmHome(home);
+	}
+});
