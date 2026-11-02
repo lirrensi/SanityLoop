@@ -24,7 +24,8 @@
         "publish": "node --experimental-strip-types --experimental-transform-types scripts/publish.ts",
         "release:core": "node --experimental-strip-types --experimental-transform-types scripts/release.ts core",
         "release:extras": "node --experimental-strip-types --experimental-transform-types scripts/release.ts extras",
-        "release:dry": "node --experimental-strip-types --experimental-transform-types scripts/release.ts core --dry-run && node --experimental-strip-types --experimental-transform-types scripts/release.ts extras --dry-run"
+        "release:swarm": "node --experimental-strip-types --experimental-transform-types scripts/release.ts swarm",
+        "release:dry": "node --experimental-strip-types --experimental-transform-types scripts/release.ts core --dry-run && node --experimental-strip-types --experimental-transform-types scripts/release.ts extras --dry-run && node --experimental-strip-types --experimental-transform-types scripts/release.ts swarm --dry-run"
     },
     "devDependencies": {
         "@types/node": "^26.4.0",

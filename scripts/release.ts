@@ -1,22 +1,25 @@
 // ============================================================================
-// scripts/release.ts — the ONE-COMMAND release, TWO independent trains.
+// scripts/release.ts — the ONE-COMMAND release, THREE independent trains.
 //
-//   npm run release:core          <- bump core (patch), tag core-vX.Y.Z
-//   npm run release:extras        <- bump extras (patch), tag extras-vX.Y.Z
+//   npm run release:core           <- bump core (patch), tag core-vX.Y.Z
+//   npm run release:extras         <- bump extras (patch), tag extras-vX.Y.Z
+//   npm run release:swarm          <- bump swarm (patch), tag swarm-vX.Y.Z
 //   npm run release:core -- --minor / --major / --to X.Y.Z
 //   npm run release:core -- --dry-run
 //
-// The two packages are INDEPENDENT. Extras does not ship at core's version:
+// The three packages are INDEPENDENT. Extras does not ship at core's version:
 // it declares a core RANGE (the minimum it supports, packages/extras/shelf.json
-// "core", e.g. "^0.3.0") and versions on its own. Core is bumped ONLY when
-// core itself changed. Never publish a new core because a shelf brick moved.
+// "core", e.g. "^0.3.0") and versions on its own. Swarm versions on its own
+// too, declaring its own core range in packages/swarm/package.json. Core is
+// bumped ONLY when core itself changed. Never publish a new core because a
+// shelf brick or swarm moved.
 //
 // Flow per train: verify clean tree -> bump the package's version file ->
 // (core minor/major: sweep workspace core ranges + shelf.json:core) ->
-// (core only: sync lockfile) -> commit -> push main -> tag -> push tag.
-// The tag namespaced core-vX.Y.Z / extras-vX.Y.Z is THE publish trigger;
-// .github/workflows/publish.yml validates it against THAT package's version
-// and publishes only that package. Tags must be pushed locally — a
+// (core/swarm: sync lockfile) -> commit -> push main -> tag -> push tag.
+// The tag namespaced core-vX.Y.Z / extras-vX.Y.Z / swarm-vX.Y.Z is THE publish
+// trigger; .github/workflows/publish.yml validates it against THAT package's
+// version and publishes only that package. Tags must be pushed locally — a
 // GITHUB_TOKEN push never triggers other workflows.
 // ============================================================================
 import { execSync } from "node:child_process";
@@ -29,10 +32,10 @@ const toIdx = args.indexOf("--to");
 const target = toIdx >= 0 ? args[toIdx + 1] : undefined;
 const minor = args.includes("--minor");
 const major = args.includes("--major");
-const which = args.find((a) => a === "core" || a === "extras");
+const which = args.find((a) => a === "core" || a === "extras" || a === "swarm");
 
-if (which !== "core" && which !== "extras") {
-	console.error("usage: release.ts <core|extras> [--minor|--major|--to X.Y.Z] [--dry-run]");
+if (which !== "core" && which !== "extras" && which !== "swarm") {
+	console.error("usage: release.ts <core|extras|swarm> [--minor|--major|--to X.Y.Z] [--dry-run]");
 	process.exit(1);
 }
 
@@ -42,9 +45,10 @@ interface Train {
 	syncLock: boolean;
 }
 
-const TRAINS: Record<"core" | "extras", Train> = {
+const TRAINS: Record<"core" | "extras" | "swarm", Train> = {
 	core: { pkg: "packages/core/package.json", tagPrefix: "core-v", syncLock: true },
 	extras: { pkg: "packages/extras/shelf.json", tagPrefix: "extras-v", syncLock: false },
+	swarm: { pkg: "packages/swarm/package.json", tagPrefix: "swarm-v", syncLock: true },
 };
 
 const train = TRAINS[which];
@@ -82,7 +86,7 @@ console.log(`release: @sanityloop/${which} ${cur} -> ${next}`);
 
 // ---- 2. bump the package's own version file ----
 if (!DRY) {
-	if (train.tagPrefix === "core-v") {
+	if (train.pkg.endsWith("package.json")) {
 		// preserve the file's existing formatting except the version field
 		if (!raw.includes(`"version": "${cur}"`)) {
 			throw new Error(`could not locate "version": "${cur}" in ${train.pkg} — bump by hand`);

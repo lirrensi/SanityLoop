@@ -5,6 +5,7 @@ on:
     tags:
       - "core-v*"
       - "extras-v*"
+      - "swarm-v*"
   workflow_dispatch:
 
 # npm trusted publishing uses GitHub's short-lived OIDC identity.
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Verify and publish (core / extras — per tag)
+    name: Verify and publish (core / extras / swarm — per tag)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -42,12 +43,13 @@ jobs:
         id: release
         shell: bash
         run: |
-          # TWO INDEPENDENT TRAINS — the tag names the package AND the version:
+          # THREE INDEPENDENT TRAINS — the tag names the package AND the version:
           #   core-vX.Y.Z   -> publish @sanityloop/core only, at its own version
           #   extras-vX.Y.Z -> publish @sanityloop/extras only, at its own version
+          #   swarm-vX.Y.Z  -> publish @sanityloop/swarm only, at its own version
           # Each tag is validated against THAT package's version file. Extras
-          # declares a core RANGE (packages/extras/shelf.json), never a lockstep
-          # copy — bump core only when core changed.
+          # copy — bump core only when core changed. Swarm carries its own deps
+          # (croner, ws) + a core range in packages/swarm/package.json.
           REF="${GITHUB_REF_NAME}"
           case "$REF" in
             core-v*)
@@ -62,8 +64,14 @@ jobs:
               VERSION="$(node -p "JSON.parse(require('fs').readFileSync('packages/extras/shelf.json','utf8')).version")"
               TAG_VERSION="${REF#extras-v}"
               ;;
+            swarm-v*)
+              PKG=swarm
+              ONLY=swarm
+              VERSION="$(node -p "JSON.parse(require('fs').readFileSync('packages/swarm/package.json','utf8')).version")"
+              TAG_VERSION="${REF#swarm-v}"
+              ;;
             *)
-              echo "::error::tag must be core-vX.Y.Z or extras-vX.Y.Z, got: $REF"
+              echo "::error::tag must be core-vX.Y.Z or extras-vX.Y.Z or swarm-vX.Y.Z, got: $REF"
               exit 1
               ;;
           esac
@@ -74,8 +82,8 @@ jobs:
             fi
             echo "Publishing @sanityloop/$PKG @ $VERSION (from tag $REF)"
           else
-            echo "Manual dispatch — publishing core @ $(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json','utf8')).version") + extras @ $(node -p "JSON.parse(require('fs').readFileSync('packages/extras/shelf.json','utf8')).version")"
-            ONLY="core,extras"
+            echo "Manual dispatch — publishing core @ $(node -p "JSON.parse(require('fs').readFileSync('packages/core/package.json','utf8')).version") + extras @ $(node -p "JSON.parse(require('fs').readFileSync('packages/extras/shelf.json','utf8')).version") + swarm @ $(node -p "JSON.parse(require('fs').readFileSync('packages/swarm/package.json','utf8')).version")"
+            ONLY="core,extras,swarm"
           fi
           {
             echo "pkg=$PKG"

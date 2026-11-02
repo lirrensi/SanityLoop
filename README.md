@@ -131,52 +131,42 @@ Zero surprises.
 
 The repository is a monorepo, so its development folders do not map one-to-one
 to npm packages. The source is kept in separate folders for focused development
-and testing; the GitHub Actions publish workflow curates those folders into the
-two public packages:
+and testing; the GitHub Actions publish workflow curates those folders into
+three public packages:
 
 ```text
 packages/
 ├── core/        → @sanityloop/core
 ├── extras/      → optional bricks, bundled into @sanityloop/extras
-├── swarm/       → developed separately, bundled as @sanityloop/extras/swarm
+├── swarm/       → @sanityloop/swarm (daemon hub + join + `swarm` bin)
 └── test-kit/    → private development/test helper; not published
 ```
 
 Install the published packages with:
 
 ```sh
-npm install @sanityloop/core @sanityloop/extras
+npm install @sanityloop/core @sanityloop/extras @sanityloop/swarm
 ```
 
-Although `swarm` lives at `packages/swarm` in the source tree, its published
-import path is:
+Run the swarm daemon without installing: `npx @sanityloop/swarm help`
+(bin `swarm`).
 
-```ts
-import { /* swarm APIs */ } from "@sanityloop/extras/swarm";
-```
+Every push to `main` runs the verification gate and publishes nothing; each
+`core-v*` / `extras-v*` / `swarm-v*` tag publishes only that train, in the
+order core → extras → swarm.
 
-Every push to `main` runs the verification gate and publishes only `core` and
-`extras`, in that order.
-
-Publishing is deliberately gated by explicit package version changes. Core and
-the aggregate extras shelf are versioned independently:
+Publishing is deliberately gated by explicit package version changes. The three
+trains are versioned independently (see [Releasing](docs/guides/releasing.md)):
 
 - Change `packages/core/package.json` to release **only** `@sanityloop/core`.
-- Change `packages/extras/VERSION` to release **only** `@sanityloop/extras`.
-- Change both to release both packages.
+- Change `packages/extras/shelf.json` to release **only** `@sanityloop/extras`.
+- Change `packages/swarm/package.json` to release **only** `@sanityloop/swarm`.
 
-For example, to release a new extras version after changing one or more bricks:
+For example, to release a new swarm version: `npm run release:swarm -- --patch`
+(bumps `packages/swarm/package.json`, syncs the lockfile, pushes `swarm-vX.Y.Z`;
+CI publishes only `@sanityloop/swarm`).
 
-```sh
-npm version patch --no-git-tag-version --prefix packages/core   # only if core changed
-echo 0.1.1 > packages/extras/VERSION                           # only if extras changed
-git add packages/core/package.json packages/extras/VERSION package-lock.json
-git commit -m "release: core/extras version bump"
-git push origin main
-```
-
-The workflow detects each version change and publishes only the corresponding
-package. Ordinary code, documentation, or workflow pushes run no npm publish.
+Ordinary code, documentation, or workflow pushes run no npm publish.
 
 ## What you can build
 
@@ -334,7 +324,7 @@ Delete any of these folders and the core still runs.
 | Package | When you want it |
 | --- | --- |
 |  [`@sanityloop/extras/pi-model`](packages/extras/pi-model/) | Multi-provider models beyond OpenAI-compatible APIs, via the pi provider library. |
-|  [`@sanityloop/extras/swarm`](packages/swarm/) | Many agents, many machines. A dumb daemon hub + a join extension: agents join, report state, get commanded — never owned. |
+|  [`@sanityloop/swarm`](packages/swarm/) | Many agents, many machines. A dumb daemon hub + a join extension: agents join, report state, get commanded — never owned. `npx @sanityloop/swarm` (bin `swarm`). |
 
 ### Utilities
 

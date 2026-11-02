@@ -1,10 +1,13 @@
 // ============================================================================
-// scripts/bundle.ts - stage the publishable trees for the TWO-package model:
+// scripts/bundle.ts - stage the publishable trees for the THREE-package model:
 //
 //   .publish/pkgs/core    <- @sanityloop/core: the loop, zero deps (as-is)
 //   .publish/pkgs/extras  <- @sanityloop/extras: the SHELF - every extras
 //                             brick bundled under its own subpath export,
 //                             zero declared deps, core as the only dependency.
+//   .publish/pkgs/swarm   <- @sanityloop/swarm: its OWN train (src + bin,
+//                             own package.json with own deps incl. croner+ws,
+//                             core stays external - never rewritten).
 //
 // The shelf bundle:
 //   - copies each brick folder (minus test/) under extras/<brick>/
@@ -59,6 +62,7 @@ function gatherBricks(): Brick[] {
 			if (!name.startsWith("@sanityloop/")) continue;
 			if (name === "@sanityloop/core" || j.private === true) continue;
 			const short = name.replace("@sanityloop/", "");
+			if (short === "swarm") continue; // own train - staged by stageSwarm(), not the shelf
 			if (seen.has(short)) continue;
 			seen.add(short);
 			if (ONLY && !ONLY.includes(short)) continue;
@@ -300,6 +304,49 @@ function stageCore(): void {
   if (existsSync(readme)) cpSync(readme, join(coreDir, "README.md"));
 }
 
+// Swarm rides its OWN train: copy src + bin as-is, keep its own package.json
+// (own version, own deps incl. croner+ws, bin field — no rewrite needed: its
+// only @sanityloop dep is core, which stays external). Gate tsconfig resolves
+// core + croner + ws from the workspace so publish.ts can typecheck the stage.
+function stageSwarm(): void {
+  const swarmDir = join(STAGE, "swarm");
+  if (existsSync(swarmDir)) rmSync(swarmDir, { recursive: true, force: true });
+  mkdirSync(swarmDir, { recursive: true });
+  cpSync(join(ROOT, "packages", "swarm", "src"), join(swarmDir, "src"), { recursive: true });
+  cpSync(join(ROOT, "packages", "swarm", "bin"), join(swarmDir, "bin"), { recursive: true });
+  const pkg = json(join(ROOT, "packages", "swarm", "package.json"));
+  writeFileSync(join(swarmDir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
+  const readme = join(ROOT, "packages", "swarm", "README.md");
+  if (existsSync(readme)) cpSync(readme, join(swarmDir, "README.md"));
+  const base = JSON.parse(readFileSync(join(ROOT, "tsconfig.base.json"), "utf8")) as {
+    compilerOptions?: { target?: string; lib?: string[] };
+  };
+  const baseOpts = base.compilerOptions ?? {};
+  writeFileSync(
+    join(swarmDir, "tsconfig.json"),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: baseOpts.target ?? "ES2022",
+          ...(baseOpts.lib ? { lib: baseOpts.lib } : {}),
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          strict: true,
+          noEmit: true,
+          allowImportingTsExtensions: true,
+          erasableSyntaxOnly: true,
+          skipLibCheck: true,
+          types: ["node"],
+          paths: { "@sanityloop/core": ["../../../packages/core/src/index.ts"] },
+        },
+        include: ["src/**/*.ts", "bin/**/*.js"],
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
 function main(): void {
   if (args.includes("--clean") && existsSync(join(ROOT, ".publish"))) {
     rmSync(join(ROOT, ".publish"), { recursive: true, force: true });
@@ -322,12 +369,14 @@ function main(): void {
 	generateShelfReadme(bricks, join(STAGE, "extras"));
 	generateGateTsconfig(join(STAGE, "extras"));
 	stageCore();
+	stageSwarm();
 
   console.log(`staged ${bricks.length} bricks -> .publish/pkgs/extras`);
   console.log(`subpaths: ${bricks.map((b) => b.short).join(", ")}`);
   console.log(`cross-brick imports rewritten: ${touched.length}`);
   for (const t of touched) console.log(`  ${t}`);
   console.log(`core staged -> .publish/pkgs/core (${readdirSync(join(STAGE, "core")).join(", ")})`);
+  console.log(`swarm staged -> .publish/pkgs/swarm (${readdirSync(join(STAGE, "swarm")).join(", ")})`);
 }
 
 main();

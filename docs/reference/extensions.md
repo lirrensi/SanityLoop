@@ -15,9 +15,10 @@ last_synced: 2026-08-23
 
 # The Extensions Catalog
 
-Every ready-made Lego brick. Install only what you import — each extra is its
-own npm package (`@sanityloop/<name>`, source-distributed TypeScript). The
-core imports nothing here; delete any folder and the core still runs.
+Every ready-made Lego brick. Core imports nothing from here; delete any folder
+and the core still runs. Shelf bricks install as subpaths of one package
+(`@sanityloop/extras/<brick>`, source-distributed TypeScript); the swarm is
+its own package (`@sanityloop/swarm`, source + `swarm` bin).
 
 Wiring pattern is always the same:
 
@@ -101,7 +102,7 @@ agent.install(createSomething({ /* opts */ }));
 | Package | Entry point | What it gives you |
 | --- | --- | --- |
 | `@sanityloop/pi-model` | `PiAdapterModel` | Model adapter riding the pi provider library (multi-provider beyond OpenAI-compatible). |
-| `@sanityloop/swarm` | `createSwarmServer()`, `wireSwarm()` / `createSwarmJoin()` | The dumb daemon hub + the join extension. Four nouns: PROGRAM (one saved table — kind service/job preset, promotion=PATCH), RUN (every life — uniform logs/kill/status, orphans), AGENT (whoever joined — wild or forked, spawnId=runId backlink), TEMPLATE (spawn menu). Supervisor is node:child_process; schedules run cron (croner v11) + overlap + catchup + retries; `FleetApi` programs/runs ops over WS, REST (`/api/v1`), and the CLI. Workers never belong to the hub — they answer to their own definition. |
+| `@sanityloop/swarm` | `createSwarmServer()`, `wireSwarm()` / `createSwarmJoin()` + `swarm` bin (`npx @sanityloop/swarm`) | The dumb daemon hub + the join extension (own package with `swarm` CLI). Four nouns: PROGRAM (one saved table — kind service/job preset, promotion=PATCH), RUN (every life — uniform logs/kill/status, orphans), AGENT (whoever joined — wild or forked, spawnId=runId backlink), TEMPLATE (spawn menu). Supervisor is node:child_process; schedules run cron (croner v11) + overlap + catchup + retries; `FleetApi` programs/runs ops over WS, REST (`/api/v1`), and the CLI. Workers never belong to the hub — they answer to their own definition. |
 | `@sanityloop/subagents` | `agentAsTool`, `createSubAgents`, `runOnce`, `fork` | Sub-agents as tools: a sub-agent is just an Agent nobody ran yet — the parent delegates, results come back as tool answers. Manager tools: spawn/await/steer/list/read/restart; children carry `sibling_send`; builders get `{id, kind, parent, depth}`; `maxDepth` bounds nesting. |
 | `@sanityloop/a2a-client` | `createA2aClient(config)` | Call remote A2A agents as tools with full conversation continuation (taskId+contextId threading): per-agent `a2a_<key>_send` / `a2a_<key>_cancel` tools plus `state.a2a` bookkeeping. Client-only — nothing listens. |
 

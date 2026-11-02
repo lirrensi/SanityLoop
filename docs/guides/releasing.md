@@ -5,21 +5,24 @@ updated: 2026-10-18
 
 # Releasing — "say release, then walk off"
 
-Two independent trains, one trigger each:
+Three independent trains, one trigger each:
 
 | train | version file | tag | npm package |
 |---|---|---|---|
 | core | `packages/core/package.json` | `core-vX.Y.Z` | `@sanityloop/core` |
 | extras | `packages/extras/shelf.json` | `extras-vX.Y.Z` | `@sanityloop/extras` |
+| swarm | `packages/swarm/package.json` | `swarm-vX.Y.Z` | `@sanityloop/swarm` |
 
 Extras declares a core **range** (`"core": "^0.3.0"` in `shelf.json`), never a lockstep
-copy — bump core only when core itself changed.
+copy — bump core only when core itself changed. Swarm declares its own core range
+in `packages/swarm/package.json` (+ its own deps `croner`, `ws`) and versions on
+its own too.
 
 ## The contract
 
 - **A push to main is inert.** It runs `ci.yml` (verify: typecheck → unit → e2e →
   templates → live) and nothing else. It never touches npm.
-- **A tag push is the release.** `core-vX.Y.Z` / `extras-vX.Y.Z` runs `publish.yml`,
+- **A tag push is the release.** `core-vX.Y.Z` / `extras-vX.Y.Z` / `swarm-vX.Y.Z` runs `publish.yml`,
   which validates the tag against that package's own version file, dry-runs the
   staged publish, then publishes **only that train**.
 - **"release" = run the command, don't ask.** No manual `npm publish`, ever, from any
@@ -42,12 +45,13 @@ flowchart LR
 ```bash
 npm run release:core   -- --patch      # patch: bump, commit, push, tag, push tag
 npm run release:extras -- --minor
+npm run release:swarm  -- --patch      # swarm bumps packages/swarm/package.json + lockfile
 npm run release:core   -- --to X.Y.Z   # exact version
 npm run release:core   -- --dry-run    # prints the plan, changes nothing
 ```
 
 `scripts/release.ts` refuses a dirty tree, bumps that package's version file,
-syncs the lockfile for core, commits, pushes main, then tags and pushes the tag.
+syncs the lockfile for core and swarm, commits, pushes main, then tags and pushes the tag.
 On a core minor/major it also sweeps every workspace `@sanityloop/core` range
 plus `shelf.json:core` to the new `^x.y.0` (patches satisfy existing ranges, so
 the sweep no-ops) — same commit, nothing orphaned.
@@ -58,6 +62,7 @@ the release is just the tags:
 ```bash
 git tag core-vX.Y.Z   && git push origin core-vX.Y.Z
 git tag extras-vX.Y.Z && git push origin extras-vX.Y.Z
+git tag swarm-vX.Y.Z  && git push origin swarm-vX.Y.Z
 ```
 
 ## Verify without gh
@@ -70,6 +75,7 @@ curl -s "https://api.github.com/repos/lirrensi/SanityLoop/actions/runs?per_page=
 # 2. the artifact — authoritative, no cache games (X.Y.Z = the version just tagged)
 curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fcore/X.Y.Z
 curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fextras/-/extras-X.Y.Z.tgz
+curl -s -o /dev/null -w "%{http_code}\n" https://registry.npmjs.org/@sanityloop%2Fswarm/-/swarm-X.Y.Z.tgz
 
 # 3. dist-tags (may lag a minute behind a publish)
 curl -s "https://registry.npmjs.org/@sanityloop%2Fextras?cb=$RANDOM" | grep -o '"latest":"[^"]*"'

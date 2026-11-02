@@ -5,9 +5,9 @@ status: active
 updated: 2026-09-05
 tags: [log, history]
 ---
-
 ## 2026-11-03
 
+- swarm own-train cutover: `@sanityloop/swarm` extracted from the extras shelf into its own publish train (own version `packages/swarm/package.json`, own deps croner+ws, `swarm` bin) — bundle stages `.publish/pkgs/swarm` untouched, publish gates + pack-checks it separately (order core → extras → swarm), release via `npm run release:swarm` (tag `swarm-vX.Y.Z`), swarm gone from the extras catalog
 - swarm 0.2 cutover: external supervisor → node:child_process supervisor, processes+tasks → programs+runs (one def table, per-life ledger under `runs/<id>/`), schedules on croner v11 (expr+tz, overlap policies, catchupWindow+missPolicy, retries/pauseOnFail, triggerToken watchdog), FleetApi v2 programs/runs ops over WS+REST+CLI, home lock `daemon.lock`; 69 tests green
 
 ## 2026-11-02

@@ -1,23 +1,21 @@
 // ============================================================================
-// scripts/publish.ts - the TWO-package publish gate:
+// scripts/publish.ts - the THREE-package publish gate:
 //
 //   @sanityloop/core     the loop, zero deps
 //   @sanityloop/extras   the shelf (staged + verified by scripts/bundle.ts)
+//   @sanityloop/swarm    own train: src + bin, own deps (croner, ws), core external
 //
 // Flow (verify FIRST, publish LAST):
-//   1. bundle    - stage .publish/pkgs/{core,extras} (rewrites + exports map)
-//   2. GATE      - tsc the staged shelf with ONLY @sanityloop/core resolvable;
+//   1. bundle    - stage .publish/pkgs/{core,extras,swarm} (rewrites + exports map)
+//   2. GATE      - extras: tsc the staged shelf with ONLY @sanityloop/core resolvable;
 //                  any leftover bare @sanityloop/* import fails the gate
-//   3. pack+check- pack both dirs as tarballs, verify entries present
-//   4. publish   - core first, then extras (dependency order)
+//                  swarm:  tsc the staged swarm (core + croner + ws resolvable)
+//   3. pack+check- pack all staged dirs as tarballs, verify entries present
+//   4. publish   - core first, then extras, then swarm (dependency order)
 //
 //   node scripts/publish.ts --dry-run   <- pack + verify, publish NOTHING
 //   node scripts/publish.ts             <- the real thing
 //   node scripts/publish.ts --otp CODE  <- pass a one-time password through
-//
-// Command construction: static tokens + allowlisted args only. Every
-// interpolated path is validated against the repo root (safePath) before it
-// reaches execSync.
 // ============================================================================
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -28,7 +26,7 @@ const args = process.argv.slice(2);
 const DRY_RUN = args.includes("--dry-run");
 const ONLY = (() => {
 	const idx = args.indexOf("--only");
-	return idx >= 0 ? new Set((args[idx + 1] ?? "").split(",").map((s) => s.trim()).filter(Boolean)) : new Set(["core", "extras"]);
+	return idx >= 0 ? new Set((args[idx + 1] ?? "").split(",").map((s) => s.trim()).filter(Boolean)) : new Set(["core", "extras", "swarm"]);
 })();
 const OTP = (() => {
   const idx = args.indexOf("--otp");
@@ -128,18 +126,19 @@ function packAndCheck(dir: string, name: string): void {
 }
 
 function main(): void {
-	if (![...ONLY].every((name) => name === "core" || name === "extras")) {
-		throw new Error(`--only accepts core, extras; received ${[...ONLY].join(", ")}`);
+	if (![...ONLY].every((name) => name === "core" || name === "extras" || name === "swarm")) {
+		throw new Error(`--only accepts core, extras, swarm; received ${[...ONLY].join(", ")}`);
 	}
 	if (ONLY.size === 0) throw new Error("--only selected no packages");
 	const wantsCore = ONLY.has("core");
 	const wantsExtras = ONLY.has("extras");
+	const wantsSwarm = ONLY.has("swarm");
 
   // 1. bundle
   console.log("bundle: staging .publish/pkgs ...");
 	run(sh(["node", "--experimental-strip-types", "--experimental-transform-types", BUNDLE_SCRIPT, "--clean"]));
 
-  // 2. GATE - staged shelf, only core resolvable
+  // 2. GATE - staged shelf, only core resolvable; staged swarm, core+croner+ws
   const gateTsconfig = join(STAGE, "extras", "tsconfig.json");
   if (!existsSync(gateTsconfig)) throw new Error("gate tsconfig missing - did bundle.ts run?");
 	if (wantsExtras) {
@@ -147,20 +146,29 @@ function main(): void {
 		run(sh(["node", TSC, "-p"], [gateTsconfig]));
 		console.log("gate: PASS");
 	}
+	const swarmGateTsconfig = join(STAGE, "swarm", "tsconfig.json");
+	if (wantsSwarm) {
+		if (!existsSync(swarmGateTsconfig)) throw new Error("swarm gate tsconfig missing - did bundle.ts run?");
+		console.log("gate: staged swarm typecheck (core + croner + ws)...");
+		run(sh(["node", TSC, "-p"], [swarmGateTsconfig]));
+		console.log("gate: PASS");
+	}
 
   // 3. verify + pack-check
 	if (wantsCore) verifyPkgJson(join(STAGE, "core"), "@sanityloop/core");
 	if (wantsExtras) verifyPkgJson(join(STAGE, "extras"), "@sanityloop/extras");
+	if (wantsSwarm) verifyPkgJson(join(STAGE, "swarm"), "@sanityloop/swarm");
 	console.log(`verify: ${[...ONLY].join(" + ")} pass\n`);
 	if (wantsCore) packAndCheck(join(STAGE, "core"), "@sanityloop/core");
 	if (wantsExtras) packAndCheck(join(STAGE, "extras"), "@sanityloop/extras");
+	if (wantsSwarm) packAndCheck(join(STAGE, "swarm"), "@sanityloop/swarm");
 
   if (DRY_RUN) {
     console.log("\ndry-run complete - nothing published. Remove --dry-run to publish.");
     return;
   }
 
-	// 4. publish, dependency order: core first, then the shelf
+	// 4. publish, dependency order: core first, then the shelf, swarm last
   const publishDir = (dir: string): void => {
     const otpArg = OTP ? ["--otp", OTP] : [];
     console.log(`\n→ publishing ${dir}`);
@@ -169,6 +177,7 @@ function main(): void {
   };
 	if (wantsCore) publishDir(join(STAGE, "core"));
 	if (wantsExtras) publishDir(join(STAGE, "extras"));
+	if (wantsSwarm) publishDir(join(STAGE, "swarm"));
   console.log("\nall published.");
 }
 

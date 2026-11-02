@@ -1,9 +1,13 @@
 {
   "name": "@sanityloop/swarm",
   "version": "0.2.0",
+  "description": "the swarm — a dumb daemon hub + the join extension agents import, with the `swarm` CLI. One package: without the join there's no hub to talk to, without the hub there's nothing to join.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lirrensi/SanityLoop.git"
+  },
   "type": "module",
-  "description": "the swarm — a dumb daemon hub + the join extension agents import. One package: without the join there's no hub to talk to, without the hub there's nothing to join.",
   "exports": {
     ".": "./src/index.ts",
     "./server": "./src/server/index.ts",
