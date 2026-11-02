@@ -6,6 +6,10 @@ updated: 2026-09-05
 tags: [log, history]
 ---
 
+## 2026-11-03
+
+- swarm 0.2 cutover: external supervisor → node:child_process supervisor, processes+tasks → programs+runs (one def table, per-life ledger under `runs/<id>/`), schedules on croner v11 (expr+tz, overlap policies, catchupWindow+missPolicy, retries/pauseOnFail, triggerToken watchdog), FleetApi v2 programs/runs ops over WS+REST+CLI, home lock `daemon.lock`; 69 tests green
+
 ## 2026-11-02
 
 - universal `agent.callTool` core seam: one wall body (`runToolCall`) for loop batches, code cells, `call_tool`, timers, tests — gate → park-wait → preResolved → resolve → schema → toolStart → execute → toolEnd, error-as-result, depth ceiling 8, timeout/signal orphan semantics, opt-in afterTool/commit; `executeOne` delegates (loop behavior unchanged); `activeCall(id)` rendezvous closes the permission OOB resolver gap; `call_tool` bypass closed (inner gates fire with via tool); `ToolCallRecord` moved agent.ts → types.ts (barrel-invisible); `@sanityloop/code-mode` shipped (py/js persistent kernels, fd-3 bridge, per-cell stubs) with its caller as a via:code preset

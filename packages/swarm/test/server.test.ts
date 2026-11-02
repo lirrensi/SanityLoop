@@ -2,11 +2,15 @@
 // server.test.ts — the daemon hub, end-to-end over raw WS clients.
 // No full agent needed: we speak the wire directly. Covers register/report →
 // state folding, agents_list/agents_get + talk, spawnId→parent echo, wild
-// agents, drop removes from list (idempotent), proc/task doors, role
-// permissions, and the token gate.
+// agents, drop removes from list (idempotent), program_*/run_* doors, role
+// permissions (peer can't touch programs/runs), the token gate, the home lock
+// (a second daemon on the same home refuses), migration of legacy files,
+// drop history/templates/events.
 // ============================================================================
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { startDaemon, WsClient, tmpHome, rmHome } from "./harness.ts";
 
 test("open daemon: register/report folds state; peer agents_list/get/events/listen/input/control/broadcast; worker denied agents_list", async () => {
@@ -33,17 +37,17 @@ test("open daemon: register/report folds state; peer agents_list/get/events/list
 		await p.waitFor("welcome");
 
 		const listRes = await p.rpc({ op: "agents_list" });
-		const rows = listRes.data as any[];
-		const w1 = rows.find((r: any) => r.sessionId === "w1");
+		const rows = listRes.data as { sessionId: string; state?: string; stats?: { errors?: number } }[];
+		const w1 = rows.find((r) => r.sessionId === "w1");
 		assert.ok(w1, "w1 in registry");
 		assert.equal(w1.state, "error");
-		assert.equal(w1.stats.errors, 1);
+		assert.equal(w1.stats?.errors, 1);
 
 		const getRes = await p.rpc({ op: "agents_get", sessionId: "w1" });
 		assert.equal(getRes.data.sessionId, "w1");
 
 		const evRes = await p.rpc({ op: "events", sessionId: "w1" });
-		assert.ok((evRes.data.events as any[]).length >= 3);
+		assert.ok((evRes.data.events as unknown[]).length >= 3);
 
 		// listen + relay
 		await p.rpc({ op: "listen", sessionId: "w1", on: true });
@@ -81,6 +85,13 @@ test("open daemon: register/report folds state; peer agents_list/get/events/list
 		const bFrame = await bP;
 		assert.deepEqual(bFrame.body, { type: "input_followup", text: "all" });
 
+		// history + templates doors
+		const hist = await p.rpc({ op: "history" });
+		assert.ok(Array.isArray(hist.data));
+		assert.ok(hist.data.find((r: { sessionId: string }) => r.sessionId === "w1"));
+		const tmpl = await p.rpc({ op: "templates" });
+		assert.ok(Array.isArray(tmpl.data));
+
 		// worker is NOT allowed to list agents
 		const forbidden = await w
 			.rpc({ op: "agents_list" })
@@ -105,7 +116,7 @@ test("spawnId echoes as parent; wild agents list parentless; drop removes from l
 	try {
 		forked = new WsClient(url);
 		await forked.ready();
-		forked.send({ op: "register", sessionId: "f1", agentId: "worker", mode: "worker", spawnId: "proc:web" });
+		forked.send({ op: "register", sessionId: "f1", agentId: "worker", mode: "worker", spawnId: "run:abc" });
 		await forked.waitFor("welcome");
 
 		wild = new WsClient(url);
@@ -119,7 +130,7 @@ test("spawnId echoes as parent; wild agents list parentless; drop removes from l
 		await admin.waitFor("welcome");
 
 		const f = (await admin.rpc({ op: "agents_get", sessionId: "f1" })).data;
-		assert.equal(f.parent, "proc:web");
+		assert.equal(f.parent, "run:abc");
 		const wl = (await admin.rpc({ op: "agents_get", sessionId: "w1" })).data;
 		assert.equal(wl.parent, undefined);
 
@@ -135,7 +146,7 @@ test("spawnId echoes as parent; wild agents list parentless; drop removes from l
 		assert.equal(redrop.data.ok, true);
 
 		// old nouns are dead on the wire
-		for (const dead of ["create", "restart"]) {
+		for (const dead of ["create", "proc_start", "task_fire", "restart"]) {
 			const err = await admin
 				.rpc({ op: dead, sessionId: "x" })
 				.then(() => null)
@@ -190,6 +201,82 @@ test("token gate: correct token welcomed, wrong/missing token rejected + socket 
 		assert.match(err2.error, /token\/mode mismatch/);
 	} finally {
 		for (const c of clients) c.close();
+		rmHome(home);
+		await server.stop();
+	}
+});
+
+test("home lock: a second daemon on the same home refuses", async () => {
+	const home = tmpHome();
+	const server = await startDaemon({ home });
+	try {
+		let threw: string | null = null;
+		try {
+			const second = await startDaemon({ home, port: 0 });
+			await second.stop();
+		} catch (e) {
+			threw = e instanceof Error ? e.message : String(e);
+		}
+		assert.ok(threw, "second daemon refused");
+		assert.match(threw, /already owned/);
+	} finally {
+		rmHome(home);
+		await server.stop();
+	}
+});
+
+test("boot migrates legacy processes.json + tasks.json into programs.json (legacy kept)", async () => {
+	const home = tmpHome();
+	writeFileSync(
+		join(home, "processes.json"),
+		JSON.stringify({
+			v: 1,
+			rows: [
+				{
+					name: "legacy-web",
+					file: "web.ts",
+					status: "stopped",
+					autorestart: false,
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				},
+			],
+		}),
+	);
+	writeFileSync(
+		join(home, "tasks.json"),
+		JSON.stringify({
+			v: 1,
+			rows: [
+				{
+					name: "legacy-poll",
+					from: "poll",
+					fire: "manual",
+					paused: false,
+					runs: 3,
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				},
+			],
+		}),
+	);
+	const server = await startDaemon({ home });
+	try {
+		const url = `ws://127.0.0.1:${server.port}`;
+		const admin = new WsClient(url);
+		await admin.ready();
+		admin.send({ op: "register", sessionId: "a1", agentId: "admin", mode: "admin" });
+		await admin.waitFor("welcome");
+		try {
+			const list = (await admin.rpc({ op: "program_list" })).data as { name: string }[];
+			assert.ok(list.find((p) => p.name === "legacy-web"), "migrated process present");
+			assert.ok(list.find((p) => p.name === "legacy-poll"), "migrated task present");
+			const poll = (await admin.rpc({ op: "program_get", name: "legacy-poll" })).data;
+			assert.equal(poll.def.counters.runs, 3, "task run counter carried over");
+		} finally {
+			admin.close();
+		}
+	} finally {
 		rmHome(home);
 		await server.stop();
 	}

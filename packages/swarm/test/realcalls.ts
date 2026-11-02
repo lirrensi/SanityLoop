@@ -75,9 +75,18 @@ async function main() {
 	await admin.waitFor("welcome");
 
 	console.log("[demo] spawning REAL worker (will call llama.cpp @58080)...");
-	const created = (await admin.rpc({ op: "proc_start", name: "real-worker", from: "real-worker" })).data;
-	const sid = created.sessionId;
-	console.log(`[demo] started process real-worker session=${sid} pid=${created.pid}`);
+	const created = (
+		await admin.rpc({
+			op: "program_define",
+			name: "real-worker",
+			kind: "service",
+			from: "real-worker",
+		})
+	).data;
+	const launched = (await admin.rpc({ op: "program_launch", name: "real-worker" })).data;
+	const sid: string = launched.sessionId;
+	const launchedRunId: string = launched.runId;
+	console.log(`[demo] defined program ${created.name}; launched run=${launchedRunId} session=${sid} pid=${launched.pid}`);
 
 	// wait for the worker to actually join
 	const joinDeadline = Date.now() + 20000;
@@ -125,15 +134,15 @@ async function main() {
 	console.log(`\n[demo] === WORKER REPLY (real llama.cpp @58080) ===`);
 	console.log(reply || "(no streamed text captured)");
 	console.log(`[demo] worker state: ${server.api.agents.get(sid)?.state}, lastEvent: ${server.api.agents.get(sid)?.lastEvent}`);
-	// stop the forked worker BEFORE removing the def — drop only forgets the
-	// agent entry and leaves the process running; stop actually kills it.
+	// kill the forked run BEFORE removing the def — drop only forgets the
+	// agent entry and leaves the process running; run_kill actually kills it.
 	try {
-		await admin.rpc({ op: "proc_stop", name: "real-worker" });
+		await admin.rpc({ op: "run_kill", runId: launchedRunId, force: true });
 	} catch {
 		/* already gone */
 	}
 	try {
-		await admin.rpc({ op: "proc_remove", name: "real-worker" });
+		await admin.rpc({ op: "program_remove", name: "real-worker" });
 	} catch {
 		/* already gone */
 	}

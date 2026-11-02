@@ -13,37 +13,45 @@
 //   GET    /api/v1/history                     every agent ever seen
 //   GET    /api/v1/templates                   spawnable templates (no mode)
 //   DELETE /api/v1/agents/:id                 drop = close socket + forget the agent
-//   GET    /api/v1/processes                   process definitions
-//   POST   /api/v1/processes                   {name, file?|from?, autorestart?, prompt?} = save + fork now
-//   GET    /api/v1/processes/:name
-//   POST   /api/v1/processes/:name/start       {file?, from?, autorestart?, prompt?}
-//   POST   /api/v1/processes/:name/save        {file?, from?, autorestart?}
-//   POST   /api/v1/processes/:name/stop        murder the pid
-//   POST   /api/v1/processes/:name/restart      {prompt?}
-//   POST   /api/v1/processes/:name/autorestart  {autorestart}
-//   DELETE /api/v1/processes/:name             stop + forget
-//   GET    /api/v1/tasks                       task definitions
-//   POST   /api/v1/tasks                       {name, file?|from?, fire, everyMs?, at?}
-//   GET    /api/v1/tasks/:name
-//   POST   /api/v1/tasks/:name/fire            {prompt?}
-//   POST   /api/v1/tasks/:name/trigger         {context?, prompt?} — paused-immune, schedule untouched, at-most-once
-//   POST   /api/v1/tasks/:name/pause           {paused?}
-//   POST   /api/v1/tasks/:name/resume
-//   DELETE /api/v1/tasks/:name                 forget the definition
+//   GET    /api/v1/programs                    program definitions
+//   POST   /api/v1/programs                    {name, kind?, spawn, ...ProgramDefine fields} = define
+//   GET    /api/v1/programs/:name
+//   PATCH  /api/v1/programs/:name              merge + validate (promotion)
+//   DELETE /api/v1/programs/:name              forget the definition
+//   POST   /api/v1/programs/:name/launch       {context?, prompt?, waitMs?, token?}
+//   GET    /api/v1/programs/:name/preview?n=   next-N fire times, no fork
+//   GET    /api/v1/programs/:name/logs?tailBytes=
+//   POST   /api/v1/runs/exec                   {spawn, waitMs?, timeoutMs?, name?, context?} (+?wait= overrides)
+//   GET    /api/v1/runs?program=&state=&limit=
+//   POST   /api/v1/runs/prune                  {olderThanMs?, keep?}
+//   GET    /api/v1/runs/:id                    id-or-name
+//   GET    /api/v1/runs/:id/logs?stream=&tailBytes=&offset=
+//   POST   /api/v1/runs/:id/wait               {match?, timeoutMs?} (timeout → 408 + snapshot)
+//   POST   /api/v1/runs/:id/kill               {graceMs?, force?}
+//   POST   /api/v1/runs/:id/signal             {signal}
+//   POST   /api/v1/runs/:id/save               {name, kind?} = promote orphan run
+//   POST   /api/v1/runs/:id/restart            same spawn, new run
 //   POST   /api/v1/agents/:id/input            <the input object itself>
 //   POST   /api/v1/agents/:id/control          {action: stop|abort|pause|wake}
 //
 // ROOMS: the SAME visibility rule as every other door. The caller presents a
 // mount point — `?room=` or the `X-Swarm-Room` header (default "global" = see
-// everything). Every route filters through the same prefix check: an ancestor
+// everything). Agent routes filter through the same prefix check: an ancestor
 // sees its descendants; sideways and upward: invisible — and an agent you
 // can't see doesn't exist (404), can't be steered, and can't be dropped.
+// Programs/runs routes carry NO room scoping (admin-only ops; the ledger and
+// the definitions are global) — the mount point is ignored there.
 //
 // input/listen stay WS-only where they are about streams; input is here because
 // steering a worker is fleet management too. Auth: `Authorization: Bearer
 // <role-token>` — the token IS the role. No tokens configured (open mode) →
 // full access, same trust the CLI's admin claim gets (the daemon is
-// 127.0.0.1-bound by default).
+// 127.0.0.1-bound by default). Launch honors the watchdog path too: a
+// body.token (or bearer) matching the program's triggerToken authorizes
+// POST /programs/:name/launch without a role token. waitMs on launch/exec is
+// caller patience, never run lifetime: the daemon waits up to waitMs for the
+// settled record and returns the fork either way (always 200 with the exec/
+// launch result; the daemon decides inline vs detached by waitMs).
 // ============================================================================
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
@@ -141,23 +149,24 @@ const ROUTES = [
 	"GET /api/v1/agents/:id",
 	"GET /api/v1/agents/:id/events",
 	"DELETE /api/v1/agents/:id",
-	"GET /api/v1/processes",
-	"POST /api/v1/processes",
-	"GET /api/v1/processes/:name",
-	"POST /api/v1/processes/:name/start",
-	"POST /api/v1/processes/:name/save",
-	"POST /api/v1/processes/:name/stop",
-	"POST /api/v1/processes/:name/restart",
-	"POST /api/v1/processes/:name/autorestart",
-	"DELETE /api/v1/processes/:name",
-	"GET /api/v1/tasks",
-	"POST /api/v1/tasks",
-	"GET /api/v1/tasks/:name",
-	"POST /api/v1/tasks/:name/fire",
-	"POST /api/v1/tasks/:name/trigger {context?, prompt?}",
-	"POST /api/v1/tasks/:name/pause",
-	"POST /api/v1/tasks/:name/resume",
-	"DELETE /api/v1/tasks/:name",
+	"GET /api/v1/programs",
+	"POST /api/v1/programs",
+	"GET /api/v1/programs/:name",
+	"PATCH /api/v1/programs/:name",
+	"DELETE /api/v1/programs/:name",
+	"POST /api/v1/programs/:name/launch {context?, prompt?, waitMs?, token?}",
+	"GET /api/v1/programs/:name/preview",
+	"GET /api/v1/programs/:name/logs",
+	"POST /api/v1/runs/exec",
+	"GET /api/v1/runs",
+	"POST /api/v1/runs/prune",
+	"GET /api/v1/runs/:id",
+	"GET /api/v1/runs/:id/logs",
+	"POST /api/v1/runs/:id/wait",
+	"POST /api/v1/runs/:id/kill",
+	"POST /api/v1/runs/:id/signal",
+	"POST /api/v1/runs/:id/save",
+	"POST /api/v1/runs/:id/restart",
 	"GET /api/v1/templates",
 	"POST /api/v1/agents/:id/input",
 	"POST /api/v1/agents/:id/control",
@@ -285,136 +294,222 @@ export function handleRest(
 			}
 		}
 
-		// ---- processes ----------------------------------------------------
-		if (seg[0] === "processes") {
-			if (!need("admin")) return;
+		// ---- programs (global — no room scoping) ------------------------------
+		if (seg[0] === "programs") {
 			if (seg.length === 1) {
-				if (method === "GET") return json(res, 200, opts.api.processes.list());
+				if (!need("admin")) return;
+				if (method === "GET") return json(res, 200, opts.api.programs.list());
 				if (method === "POST") {
 					const body = await readObject(req);
 					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
 					const name = str(body.name);
 					if (!name) return fail(res, 400, "missing `name`");
-					const r = await opts.api.processes.start(name, {
-						file: str(body.file),
-						from: str(body.from),
-						autorestart: typeof body.autorestart === "boolean" ? body.autorestart : undefined,
-						prompt: str(body.prompt),
-					});
-					if (!r) return fail(res, 404, `unknown template/file: ${str(body.from) ?? str(body.file) ?? "(none)"}`);
+					const fields: Record<string, unknown> = { ...body };
+					delete fields.name;
+					const r = opts.api.programs.define({ name, ...fields });
+					if (r !== null && typeof r === "object" && "error" in r && Array.isArray(r.error)) {
+						return fail(res, 400, r.error.join("; "));
+					}
+					if (r !== null && typeof r === "object" && "error" in r) {
+						return fail(res, 400, "invalid program definition");
+					}
 					return json(res, 200, r);
 				}
 				return fail(res, 405, "method not allowed");
 			}
 			const name = decodeURIComponent(seg[1]!);
-			if (seg.length === 2 && method === "GET") {
-				const p = opts.api.processes.get(name);
-				return p ? json(res, 200, p) : fail(res, 404, `unknown process: ${name}`);
+			if (seg.length === 2) {
+				if (method === "GET") {
+					if (!need("admin")) return;
+					const p = opts.api.programs.get(name);
+					return p ? json(res, 200, p) : fail(res, 404, `unknown program: ${name}`);
+				}
+				if (method === "PATCH") {
+					if (!need("admin")) return;
+					const body = await readObject(req);
+					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
+					const r = opts.api.programs.patch(name, body);
+					if (!r) return fail(res, 404, `unknown program: ${name}`);
+					if (typeof r === "object" && r !== null && "error" in r && Array.isArray(r.error)) {
+						return fail(res, 400, r.error.join("; "));
+					}
+					if (typeof r === "object" && r !== null && "error" in r) {
+						return fail(res, 400, "invalid program patch");
+					}
+					return json(res, 200, r);
+				}
+				if (method === "DELETE") {
+					if (!need("admin")) return;
+					return json(res, 200, opts.api.programs.remove(name));
+				}
+				return fail(res, 405, "method not allowed");
 			}
-			if (seg.length === 2 && method === "DELETE") {
-				return json(res, 200, opts.api.processes.remove(name));
-			}
-			if (seg.length === 3 && method === "POST") {
+			if (seg.length === 3 && seg[2] === "launch" && method === "POST") {
 				const body = await readObject(req);
-				if (!body && seg[2] !== "start" && seg[2] !== "restart" && seg[2] !== "stop") {
-					return fail(res, 400, "body must be a single JSON object with keys");
-				}
 				const b = body ?? {};
-				switch (seg[2]) {
-					case "start": {
-						const r = await opts.api.processes.start(name, {
-							file: str(b.file),
-							from: str(b.from),
-							autorestart: typeof b.autorestart === "boolean" ? b.autorestart : undefined,
-							prompt: str(b.prompt),
-						});
-						if (!r) return fail(res, 404, `unknown process / missing agent file: ${name}`);
-						return json(res, 200, r);
-					}
-					case "save": {
-						const r = opts.api.processes.save(name, {
-							file: str(b.file),
-							from: str(b.from),
-							autorestart: typeof b.autorestart === "boolean" ? b.autorestart : undefined,
-						});
-						return json(res, 200, r);
-					}
-					case "stop":
-						return json(res, 200, opts.api.processes.stop(name));
-					case "restart": {
-						const r = await opts.api.processes.restart(name, { prompt: str(b.prompt) });
-						return r.ok
-							? json(res, 200, r)
-							: fail(res, 409, `unknown process / missing agent file: ${name}`);
-					}
-					case "autorestart": {
-						if (typeof b.autorestart !== "boolean") {
-							return fail(res, 400, "`autorestart` must be a boolean");
-						}
-						return json(res, 200, opts.api.processes.setAutorestart(name, b.autorestart));
-					}
+				const view = opts.api.programs.get(name);
+				if (!view) return fail(res, 404, `unknown program: ${name}`);
+				const presented = str(b.token) ?? bearer(req);
+				const trigger = view.def.triggerToken;
+				if (!(trigger && presented === trigger)) {
+					if (!need("admin")) return;
 				}
+				const waitMs = typeof b.waitMs === "number" ? b.waitMs : undefined;
+				const r = await opts.api.programs.launch(name, {
+					context: str(b.context),
+					prompt: str(b.prompt),
+					waitMs,
+				});
+				if (!r) return fail(res, 404, `unknown program: ${name}`);
+				if (typeof r === "object" && "busy" in r) return fail(res, 409, `program ${name} already launching (at-most-once)`);
+				if (typeof r === "object" && r !== null && "error" in r && Array.isArray(r.error)) {
+					return fail(res, 400, r.error.join("; "));
+				}
+				if (typeof r === "object" && r !== null && "error" in r) return fail(res, 400, "launch failed");
+				return json(res, 200, r);
+			}
+			if (seg.length === 3 && seg[2] === "preview" && method === "GET") {
+				if (!need("admin")) return;
+				const raw = query.get("n");
+				const parsed = raw === null ? undefined : Number(raw);
+				const r = opts.api.programs.preview(name, parsed === undefined || !Number.isFinite(parsed) ? undefined : parsed);
+				return r ? json(res, 200, r) : fail(res, 404, `unknown program: ${name}`);
+			}
+			if (seg.length === 3 && seg[2] === "logs" && method === "GET") {
+				if (!need("admin")) return;
+				const raw = query.get("tailBytes");
+				const parsed = raw === null ? undefined : Number(raw);
+				const r = opts.api.programs.logs(name, parsed === undefined || !Number.isFinite(parsed) ? undefined : parsed);
+				return r ? json(res, 200, r) : fail(res, 404, `unknown program: ${name}`);
 			}
 			return fail(res, 404, "no such route");
 		}
 
-		// ---- tasks --------------------------------------------------------
-		if (seg[0] === "tasks") {
+		// ---- runs (global — no room scoping) ----------------------------------
+		if (seg[0] === "runs") {
 			if (!need("admin")) return;
 			if (seg.length === 1) {
-				if (method === "GET") return json(res, 200, opts.api.tasks.list());
-				if (method === "POST") {
-					const body = await readObject(req);
-					if (!body) return fail(res, 400, "body must be a single JSON object with keys");
-					const name = str(body.name);
-					const fire = str(body.fire);
-					if (!name) return fail(res, 400, "missing `name`");
-					if (fire !== "every" && fire !== "at" && fire !== "manual") {
-						return fail(res, 400, "`fire` must be one of: every, at, manual");
-					}
-					const r = opts.api.tasks.define({
-						name,
-						file: str(body.file),
-						from: str(body.from),
-						fire,
-						everyMs: typeof body.everyMs === "number" ? body.everyMs : undefined,
-						at: typeof body.at === "number" ? body.at : undefined,
-					});
-					if (!r) return fail(res, 400, `bad task definition: ${name}`);
-					return json(res, 200, r);
+				if (method === "GET") {
+					const limitRaw = query.get("limit");
+					const limitParsed = limitRaw === null ? undefined : Number(limitRaw);
+					return json(res, 200, opts.api.runs.list({
+						program: query.get("program") ?? undefined,
+						state: query.get("state") ?? undefined,
+						limit: limitParsed === undefined || !Number.isFinite(limitParsed) ? undefined : limitParsed,
+					}));
 				}
 				return fail(res, 405, "method not allowed");
 			}
-			const name = decodeURIComponent(seg[1]!);
-			if (seg.length === 2 && method === "GET") {
-				const t = opts.api.tasks.get(name);
-				return t ? json(res, 200, t) : fail(res, 404, `unknown task: ${name}`);
+			if (seg.length === 2 && seg[1] === "exec" && method === "POST") {
+				const body = await readObject(req);
+				if (!body) return fail(res, 400, "body must be a single JSON object with keys");
+				const spawn = body.spawn;
+				if (typeof spawn !== "object" || spawn === null || Array.isArray(spawn)) {
+					return fail(res, 400, "missing `spawn` ({file} or {cmd, args?, cwd?})");
+				}
+				const waitRaw = query.get("wait");
+				const waitParsed = waitRaw === null ? undefined : Number(waitRaw);
+				const waitMs = waitParsed !== undefined && Number.isFinite(waitParsed)
+					? waitParsed
+					: typeof body.waitMs === "number" ? body.waitMs : undefined;
+				try {
+					const file = "file" in spawn ? spawn.file : undefined;
+					const cmd = "cmd" in spawn ? spawn.cmd : undefined;
+					const args = "args" in spawn && Array.isArray(spawn.args) && spawn.args.every((a: unknown) => typeof a === "string") ? (spawn.args as string[]) : undefined;
+					const cwd = "cwd" in spawn ? spawn.cwd : undefined;
+					const spawnArg = typeof file === "string"
+						? { file }
+						: typeof cmd === "string"
+							? { cmd, ...(args ? { args } : {}), ...(typeof cwd === "string" ? { cwd } : {}) }
+							: null;
+					if (!spawnArg) {
+						return fail(res, 400, "missing `spawn` ({file} or {cmd, args?, cwd?})");
+					}
+					const r = await opts.api.runs.exec({
+						spawn: spawnArg,
+						waitMs,
+						timeoutMs: typeof body.timeoutMs === "number" ? body.timeoutMs : undefined,
+						name: str(body.name),
+						context: str(body.context),
+					});
+					return json(res, 200, r);
+				} catch (err: unknown) {
+					return fail(res, 400, err instanceof Error ? err.message : String(err));
+				}
 			}
-			if (seg.length === 2 && method === "DELETE") {
-				return json(res, 200, opts.api.tasks.remove(name));
+			if (seg.length === 2 && seg[1] === "prune" && method === "POST") {
+				const body = await readObject(req);
+				const b = body ?? {};
+				return json(res, 200, opts.api.runs.prune(
+					typeof b.olderThanMs === "number" ? b.olderThanMs : undefined,
+					typeof b.keep === "number" ? b.keep : undefined,
+				));
+			}
+			const id = decodeURIComponent(seg[1]!);
+			if (seg.length === 2 && method === "GET") {
+				const r = opts.api.runs.get(id);
+				return r ? json(res, 200, r) : fail(res, 404, `unknown run: ${id}`);
+			}
+			if (seg.length === 3 && seg[2] === "logs" && method === "GET") {
+				const stream = query.get("stream");
+				const tailRaw = query.get("tailBytes");
+				const offRaw = query.get("offset");
+				const tailParsed = tailRaw === null ? undefined : Number(tailRaw);
+				const offParsed = offRaw === null ? undefined : Number(offRaw);
+				const r = opts.api.runs.logs(id, {
+					stream: stream === "stdout" || stream === "stderr" || stream === "both" ? stream : undefined,
+					tailBytes: tailParsed === undefined || !Number.isFinite(tailParsed) ? undefined : tailParsed,
+					offset: offParsed === undefined || !Number.isFinite(offParsed) ? undefined : offParsed,
+				});
+				return r ? json(res, 200, r) : fail(res, 404, `unknown run: ${id}`);
 			}
 			if (seg.length === 3 && method === "POST") {
 				const body = await readObject(req);
 				const b = body ?? {};
 				switch (seg[2]) {
-					case "fire": {
-						const r = await opts.api.tasks.fire(name, { prompt: str(b.prompt) });
-						if (!r) return fail(res, 404, `unknown task / missing agent file / paused (use trigger): ${name}`);
+					case "wait": {
+						try {
+							const r = await opts.api.runs.wait(id, {
+								match: str(b.match),
+								timeoutMs: typeof b.timeoutMs === "number" ? b.timeoutMs : undefined,
+							});
+							return json(res, 200, r);
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							if (typeof err === "object" && err !== null && "snapshot" in err && err.snapshot !== null && err.snapshot !== undefined) {
+								return json(res, 408, { error: msg, snapshot: err.snapshot });
+							}
+							if (/unknown run/i.test(msg)) return fail(res, 404, msg);
+							return fail(res, 409, msg);
+						}
+					}
+					case "kill":
+						return json(res, 200, opts.api.runs.kill(id, {
+							graceMs: typeof b.graceMs === "number" ? b.graceMs : undefined,
+							force: typeof b.force === "boolean" ? b.force : undefined,
+						}));
+					case "signal": {
+						const signal = str(b.signal);
+						if (!signal) return fail(res, 400, "missing `signal`");
+						const r = opts.api.runs.signal(id, signal);
+						return r ? json(res, 200, r) : fail(res, 404, `unknown run: ${id}`);
+					}
+					case "save": {
+						const sname = str(b.name);
+						if (!sname) return fail(res, 400, "missing `name`");
+						const kind = str(b.kind);
+						const r = opts.api.runs.save(id, sname, kind === "service" || kind === "job" ? kind : undefined);
+						if (!r) return fail(res, 404, `unknown run: ${id}`);
+						if (typeof r === "object" && r !== null && "error" in r && Array.isArray(r.error)) {
+							return fail(res, 400, r.error.join("; "));
+						}
+						if (typeof r === "object" && r !== null && "error" in r) return fail(res, 400, "save failed");
 						return json(res, 200, r);
 					}
-					case "trigger": {
-						const r = await opts.api.tasks.trigger(name, { context: str(b.context), prompt: str(b.prompt) });
-						if (!r) return fail(res, 404, `unknown task / missing agent file: ${name}`);
-						if ("busy" in r && r.busy) return fail(res, 409, `task ${name} already firing (at-most-once)`);
-						return json(res, 200, r);
+					case "restart": {
+						const r = await opts.api.runs.restart(id);
+						return r ? json(res, 200, r) : fail(res, 404, `unknown run: ${id}`);
 					}
-					case "pause":
-						return json(res, 200, opts.api.tasks.pause(
-							name,
-							typeof b.paused === "boolean" ? b.paused : true,
-						));
-					case "resume":
-						return json(res, 200, opts.api.tasks.resume(name));
 				}
 			}
 			return fail(res, 404, "no such route");

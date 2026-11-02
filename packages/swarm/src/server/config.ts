@@ -8,8 +8,7 @@
 //   ├── tasks.json                task definitions — named fire-and-die schedules
 //   ├── templates/                templates it can spawn (scanned at boot)
 //   ├── sessions/                 spawned workers' session storage
-//   ├── tasks/                    task working scratch (scaffolded; task working dirs land here)
-//   └── pm2/                      embedded supervisor state (scoped PM2 home — the daemon's muscle)
+//   └── tasks/                    task working scratch (scaffolded; task working dirs land here)
 // Isolation = a different directory: `swarm serve --dir /elsewhere --port 6123`
 // is a completely separate swarm (own config, own templates, own sessions).
 // Resolution order: --dir flag > $SWARM_HOME > the default.
@@ -87,12 +86,11 @@ export function writeConfig(cfg: SwarmConfig): void {
 	);
 }
 
-/** Create the home scaffold (templates/ + sessions/ + tasks/ + pm2/) if missing. */
+/** Create the home scaffold (templates/ + sessions/ + tasks/) if missing. */
 export function ensureScaffold(home: string): void {
 	mkdirSync(join(home, "templates"), { recursive: true });
 	mkdirSync(join(home, "sessions"), { recursive: true });
 	mkdirSync(join(home, "tasks"), { recursive: true });
-	mkdirSync(join(home, "pm2"), { recursive: true });
 }
 
 /**
@@ -137,7 +135,6 @@ export function homeLayout(home: string): {
 	templatesDir: string;
 	sessionsDir: string;
 	tasksDir: string;
-	pm2Dir: string;
 	processesPath: string;
 	tasksPath: string;
 	/** Legacy fleet.json path — read once at boot for migration, then deleted. */
@@ -147,7 +144,6 @@ export function homeLayout(home: string): {
 		templatesDir: join(home, "templates"),
 		sessionsDir: join(home, "sessions"),
 		tasksDir: join(home, "tasks"),
-		pm2Dir: join(home, "pm2"),
 		processesPath: join(home, "processes.json"),
 		tasksPath: join(home, "tasks.json"),
 		manifestPath: join(home, "fleet.json"),

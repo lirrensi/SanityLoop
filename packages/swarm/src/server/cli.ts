@@ -9,23 +9,17 @@
 //   swarm agents [--server ws://...]
 //   swarm agents get <sessionId>               [--server ws://...]
 //   swarm agents drop <sessionId>             [--server ws://...]  (close socket + forget)
-//   swarm procs list                           [--server ws://...]
-//   swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
-//   swarm procs save <name> <template|file> [--autorestart]
-//   swarm procs stop <name> | restart <name> [--prompt TEXT] | remove <name>
-//   swarm procs autorestart <name> <true|false>
-//   swarm procs get <name>
-//   swarm tasks list | define <name> <every|at|manual> [--every-ms N] [--at EPOCH] [--from ...]
-//   swarm tasks fire <name> [--prompt TEXT] | swarm tasks trigger <name> [--context TEXT] [--prompt TEXT]
-//   swarm tasks pause <name> | resume <name> | remove <name> | get <name>
+//   swarm programs list|get|define|patch|launch|remove|preview|logs
+//   swarm runs list|get|logs|wait|kill|signal|save|restart|prune
+//   swarm exec [--wait-ms N] [--detach] -- <cmd> [args...]
 //   swarm send <sessionId> <text>              [--server ws://...]
-//   swarm control <sessionId> <stop|abort|pause|wake> [--server ws://...]
-//   swarm history | templates                  [--server ws://...]
+//   swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset>
+//   swarm history | templates | events <sessionId>
 //   swarm scan [--templates DIR]
 //
 // `serve` runs the daemon in-process (it IS the daemon). The rest are clients
 // that talk to a running daemon over the wire — the same protocol the UI will
-// speak. Boot resubmits every kept process whose desired state is running —
+// speak. Boot resubmits every kept program whose desired state is running —
 // there is no resurrect flag; the definitions ARE the desired state.
 // ============================================================================
 import { createSwarmServer } from "./index.ts";
@@ -41,19 +35,27 @@ const HELP = `usage:
   swarm agents [--server ws://H:P]
   swarm agents get <sessionId> [--server ws://H:P]
   swarm agents drop <sessionId> [--server ws://H:P]
-  swarm procs list [--server ws://H:P]
-  swarm procs start <name> <template|file> [--autorestart] [--prompt TEXT]
-  swarm procs save <name> <template|file> [--autorestart]
-  swarm procs stop <name> | swarm procs restart <name> [--prompt TEXT] | swarm procs remove <name>
-  swarm procs autorestart <name> <true|false>
-  swarm procs get <name>
-  swarm tasks list [--server ws://H:P]
-  swarm tasks define <name> <every|at|manual> [--every-ms N] [--at EPOCH] [--from T] [--file F]
-  swarm tasks fire <name> [--prompt TEXT] | swarm tasks trigger <name> [--context TEXT] [--prompt TEXT]
-  swarm tasks pause <name> | swarm tasks resume <name>
-  swarm tasks remove <name> | swarm tasks get <name>
+  swarm programs list [--server ws://H:P]
+  swarm programs get <name> [--server ws://H:P]
+  swarm programs define <name> [--kind service|job]
+      [--file F | --cmd CMD -- <args...>] [--from T]
+      [--desired running|stopped] [--restart never|always|on-failure]
+      [--schedule-cron EXPR] [--schedule-every-ms N] [--schedule-at ISO|epoch]
+      [--timezone TZ] [--overlap skip|allow|allowN|buffer1|bufferAll|cancel|restart]
+      [--allow-n N] [--timeout-ms N] [--paused] [--notes TEXT]
+  swarm programs patch <name> [--paused true|false] [--desired running|stopped]
+      [--notes TEXT] [--restart never|always|on-failure]
+      [--schedule-cron EXPR] [--schedule-every-ms N] [--schedule-at ISO|epoch]
+  swarm programs launch <name> [--context TEXT] [--prompt TEXT] [--wait-ms N] [--token TOK]
+  swarm programs remove <name> | preview <name> [--n N] | logs <name> [--tail-bytes N]
+  swarm runs list [--program P] [--state S] [--limit N]
+  swarm runs get <id> | logs <id> [--stream stdout|stderr|both] [--tail-bytes N] [--offset N]
+  swarm runs wait <id> [--match PAT] [--timeout-ms N] | kill <id> [--grace-ms N] [--force]
+  swarm runs signal <id> <sig> | save <id> <name> [--kind service|job]
+  swarm runs restart <id> | prune [--older-than-ms N] [--keep N]
+  swarm exec [--wait-ms N] [--timeout-ms N] [--name NAME] [--detach] -- <cmd> [args...]
   swarm send <sessionId> <text> [--server ws://H:P]
-  swarm control <sessionId> <stop|abort|pause|wake> [--server ws://H:P]
+  swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset> [--server ws://H:P]
   swarm history | swarm templates [--server ws://H:P]
   swarm scan [--dir HOME] [--templates DIR]
   swarm help`;
@@ -68,6 +70,11 @@ function parseArgs(argv: string[]): Args {
 	const positionals: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i]!;
+		if (a === "--") {
+			// everything past the separator is a positional (the spawned command)
+			for (i++; i < argv.length; i++) positionals.push(argv[i]!);
+			break;
+		}
 		if (a.startsWith("--")) {
 			const key = a.slice(2);
 			const next = argv[i + 1];
@@ -116,6 +123,15 @@ function opToken(args: Args): string | undefined {
 		if (role === "peer" && peer === undefined) peer = value;
 	}
 	return peer;
+}
+
+/** A bare `--token TOK` (no `role=`) on `programs launch`: the program's
+ *  triggerToken for the watchdog path — NOT an operator role token. */
+function launchToken(args: Args): string | undefined {
+	for (const t of flagValues(args.flags, "token")) {
+		if (!t.includes("=")) return t;
+	}
+	return undefined;
 }
 
 /** A minimal WS client for the operator commands (the join extension needs an agent; this doesn't). */
@@ -333,149 +349,280 @@ async function main(): Promise<void> {
 			c.close();
 			return;
 		}
-		case "procs": {
+		case "programs": {
 			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
+			const num = (key: string): number | undefined => {
+				const v = flag(args, key);
+				if (v === undefined) return undefined;
+				const n = Number(v);
+				if (!Number.isFinite(n)) die(`--${key} must be a number`);
+				return n;
+			};
 			switch (sub) {
 				case "list":
-					printJson(await c.send({ op: "proc_list" }));
+					printJson(await c.send({ op: "program_list" }));
 					break;
 				case "get":
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "proc_get", name: rest[0] }));
+					printJson(await c.send({ op: "program_get", name: rest[0] }));
 					break;
-				case "start": {
-					const [name, src] = rest;
+				case "define": {
+					const name = rest[0];
 					if (!name) die(HELP);
-					// source = template id when it resolves, else an agent file path
-					const looksFile = !!src && (src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js"));
+					// spawn: --file F wins; else --cmd CMD with trailing positionals
+					// after `--` as args (`--` itself never reaches the positionals).
+					const extraArgs = rest.slice(1);
+					const file = flag(args, "file");
+					const cmd = flag(args, "cmd");
+					const from = flag(args, "from");
+					const kind = flag(args, "kind");
+					if (kind !== undefined && kind !== "service" && kind !== "job") die(HELP);
+					const desired = flag(args, "desired");
+					if (desired !== undefined && desired !== "running" && desired !== "stopped") die(HELP);
+					const restartFlag = flag(args, "restart");
+					if (restartFlag !== undefined && restartFlag !== "never" && restartFlag !== "always" && restartFlag !== "on-failure") die(HELP);
+					const cron = flag(args, "schedule-cron");
+					const everyMs = num("schedule-every-ms");
+					const atRaw = flag(args, "schedule-at");
+					const timezone = flag(args, "timezone");
+					let at: number | undefined;
+					if (atRaw !== undefined) {
+						at = /^-?\d+$/.test(atRaw) ? Number(atRaw) : Date.parse(atRaw);
+						if (!Number.isFinite(at)) die(`--schedule-at must be an ISO date or epoch ms`);
+					}
+					const overlap = flag(args, "overlap");
+					if (overlap !== undefined && !["skip", "allow", "allowN", "buffer1", "bufferAll", "cancel", "restart"].includes(overlap)) die(HELP);
 					printJson(
 						await c.send({
-							op: "proc_start",
+							op: "program_define",
 							name,
-							...(src ? (looksFile ? { file: src } : { from: src }) : {}),
-							...(args.flags.has("autorestart") ? { autorestart: true } : {}),
-							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+							...(kind ? { kind } : {}),
+							...(file ? { spawn: { file } } : {}),
+							...(cmd ? { spawn: { cmd, ...(extraArgs.length ? { args: extraArgs } : {}) } } : {}),
+							...(from ? { from } : {}),
+							...(desired ? { desired } : {}),
+							...(restartFlag ? { restart: { policy: restartFlag } } : {}),
+							...(cron !== undefined || everyMs !== undefined || at !== undefined
+								? {
+										schedule: {
+											kind: cron !== undefined ? "cron" : everyMs !== undefined ? "every" : "at",
+											...(cron !== undefined ? { expr: cron } : {}),
+											...(everyMs !== undefined ? { everyMs } : {}),
+											...(at !== undefined ? { at } : {}),
+											...(timezone ? { timezone } : {}),
+										},
+									}
+								: {}),
+							...(overlap ? { overlap } : {}),
+							...(num("allow-n") !== undefined ? { allowN: num("allow-n") } : {}),
+							...(num("timeout-ms") !== undefined ? { timeoutMs: num("timeout-ms") } : {}),
+							...(args.flags.has("paused") ? { paused: true } : {}),
+							...(flag(args, "notes") ? { notes: flag(args, "notes") } : {}),
 						}),
 					);
 					break;
 				}
-				case "save": {
-					const [name, src] = rest;
+				case "patch": {
+					const name = rest[0];
 					if (!name) die(HELP);
-					const looksFile = !!src && (src.includes("/") || src.includes("\\") || src.endsWith(".ts") || src.endsWith(".js"));
-					printJson(
-						await c.send({
-							op: "proc_save",
-							name,
-							...(src ? (looksFile ? { file: src } : { from: src }) : {}),
-							...(args.flags.has("autorestart") ? { autorestart: true } : {}),
-						}),
-					);
+					const patch: Record<string, unknown> = {};
+					const pausedRaw = flag(args, "paused");
+					if (args.flags.has("paused")) {
+						if (pausedRaw === undefined || pausedRaw === "true") patch["paused"] = true;
+						else if (pausedRaw === "false") patch["paused"] = false;
+						else die(HELP);
+					}
+					const desired = flag(args, "desired");
+					if (desired !== undefined) {
+						if (desired !== "running" && desired !== "stopped") die(HELP);
+						patch["desired"] = desired;
+					}
+					const notes = flag(args, "notes");
+					if (notes !== undefined) patch["notes"] = notes;
+					const restartFlag = flag(args, "restart");
+					if (restartFlag !== undefined) {
+						if (restartFlag !== "never" && restartFlag !== "always" && restartFlag !== "on-failure") die(HELP);
+						patch["restart"] = { policy: restartFlag };
+					}
+					const cron = flag(args, "schedule-cron");
+					const everyMsRaw = flag(args, "schedule-every-ms");
+					const atRaw = flag(args, "schedule-at");
+					if (cron !== undefined || everyMsRaw !== undefined || atRaw !== undefined) {
+						if (
+							(cron !== undefined && ["cleared", "clear", "none"].includes(cron)) ||
+							(everyMsRaw !== undefined && ["cleared", "clear", "none"].includes(everyMsRaw)) ||
+							(atRaw !== undefined && ["cleared", "clear", "none"].includes(atRaw))
+						) {
+							patch["schedule"] = { kind: "manual" };
+						} else {
+							const everyMs = everyMsRaw !== undefined ? Number(everyMsRaw) : undefined;
+							if (everyMsRaw !== undefined && !Number.isFinite(everyMs!)) die(`--schedule-every-ms must be a number`);
+							let at: number | undefined;
+							if (atRaw !== undefined) {
+								at = /^-?\d+$/.test(atRaw) ? Number(atRaw) : Date.parse(atRaw);
+								if (!Number.isFinite(at)) die(`--schedule-at must be an ISO date or epoch ms`);
+							}
+							patch["schedule"] = {
+								kind: cron !== undefined ? "cron" : everyMs !== undefined ? "every" : "at",
+								...(cron !== undefined ? { expr: cron } : {}),
+								...(everyMs !== undefined ? { everyMs } : {}),
+								...(at !== undefined ? { at } : {}),
+							};
+						}
+					}
+					if (Object.keys(patch).length === 0) die(HELP);
+					printJson(await c.send({ op: "program_patch", name, patch }));
 					break;
 				}
-				case "stop":
+				case "launch": {
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "proc_stop", name: rest[0] }));
+					printJson(
+						await c.send({
+							op: "program_launch",
+							name: rest[0],
+							...(flag(args, "context") ? { context: flag(args, "context") } : {}),
+							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+							...(flag(args, "wait-ms") ? { waitMs: Number(flag(args, "wait-ms")) } : {}),
+							...(launchToken(args) ? { token: launchToken(args) } : {}),
+						}),
+					);
 					break;
+				}
 				case "remove":
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "proc_remove", name: rest[0] }));
+					printJson(await c.send({ op: "program_remove", name: rest[0] }));
 					break;
-				case "restart": {
+				case "preview":
 					if (!rest[0]) die(HELP);
 					printJson(
 						await c.send({
-							op: "proc_restart",
+							op: "program_preview",
 							name: rest[0],
-							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+							...(flag(args, "n") ? { n: Number(flag(args, "n")) } : {}),
 						}),
 					);
 					break;
-				}
-				case "autorestart": {
-					const [name, val] = rest;
-					if (!name || (val !== "true" && val !== "false")) die(HELP);
+				case "logs":
+					if (!rest[0]) die(HELP);
 					printJson(
-						await c.send({ op: "proc_set_autorestart", name, autorestart: val === "true" }),
+						await c.send({
+							op: "program_logs",
+							name: rest[0],
+							...(flag(args, "tail-bytes") ? { tailBytes: Number(flag(args, "tail-bytes")) } : {}),
+						}),
 					);
 					break;
-				}
 				default:
 					die(HELP);
 			}
 			c.close();
 			return;
 		}
-		case "tasks": {
+		case "runs": {
 			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
 			switch (sub) {
 				case "list":
-					printJson(await c.send({ op: "task_list" }));
+					printJson(
+						await c.send({
+							op: "run_list",
+							...(flag(args, "program") ? { program: flag(args, "program") } : {}),
+							...(flag(args, "state") ? { state: flag(args, "state") } : {}),
+							...(flag(args, "limit") ? { limit: Number(flag(args, "limit")) } : {}),
+						}),
+					);
 					break;
 				case "get":
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "task_get", name: rest[0] }));
+					printJson(await c.send({ op: "run_get", runId: rest[0] }));
 					break;
-				case "define": {
-					const [name, fire] = rest;
-					if (!name || (fire !== "every" && fire !== "at" && fire !== "manual")) die(HELP);
-					const everyMs = flag(args, "every-ms") ?? flag(args, "everyMs");
-					const at = flag(args, "at");
-					const from = flag(args, "from");
-					const file = flag(args, "file");
-					printJson(
-						await c.send({
-							op: "task_define",
-							name,
-							fire,
-							...(everyMs ? { everyMs: Number(everyMs) } : {}),
-							...(at ? { at: Number(at) } : {}),
-							...(from ? { from } : {}),
-							...(file ? { file } : {}),
-						}),
-					);
-					break;
-				}
-				case "fire": {
+				case "logs":
 					if (!rest[0]) die(HELP);
 					printJson(
 						await c.send({
-							op: "task_fire",
-							name: rest[0],
-							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+							op: "run_logs",
+							runId: rest[0],
+							...(flag(args, "stream") ? { stream: flag(args, "stream") } : {}),
+							...(flag(args, "tail-bytes") ? { tailBytes: Number(flag(args, "tail-bytes")) } : {}),
+							...(flag(args, "offset") ? { offset: Number(flag(args, "offset")) } : {}),
 						}),
 					);
 					break;
-				}
-				case "trigger": {
+				case "wait":
 					if (!rest[0]) die(HELP);
 					printJson(
 						await c.send({
-							op: "task_trigger",
-							name: rest[0],
-							...(flag(args, "context") ? { context: flag(args, "context") } : {}),
-							...(flag(args, "prompt") ? { prompt: flag(args, "prompt") } : {}),
+							op: "run_wait",
+							runId: rest[0],
+							...(flag(args, "match") ? { match: flag(args, "match") } : {}),
+							...(flag(args, "timeout-ms") ? { timeoutMs: Number(flag(args, "timeout-ms")) } : {}),
 						}),
 					);
 					break;
-				}
-				case "pause":
+				case "kill":
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "task_pause", name: rest[0], paused: true }));
+					printJson(
+						await c.send({
+							op: "run_kill",
+							runId: rest[0],
+							...(flag(args, "grace-ms") ? { graceMs: Number(flag(args, "grace-ms")) } : {}),
+							...(args.flags.has("force") ? { force: true } : {}),
+						}),
+					);
 					break;
-				case "resume":
-					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "task_resume", name: rest[0] }));
+				case "signal":
+					if (!rest[0] || !rest[1]) die(HELP);
+					printJson(await c.send({ op: "run_signal", runId: rest[0], signal: rest[1] }));
 					break;
-				case "remove":
+				case "save":
+					if (!rest[0] || !rest[1]) die(HELP);
+					printJson(
+						await c.send({
+							op: "run_save",
+							runId: rest[0],
+							name: rest[1],
+							...(flag(args, "kind") ? { kind: flag(args, "kind") } : {}),
+						}),
+					);
+					break;
+				case "restart":
 					if (!rest[0]) die(HELP);
-					printJson(await c.send({ op: "task_remove", name: rest[0] }));
+					printJson(await c.send({ op: "run_restart", runId: rest[0] }));
+					break;
+				case "prune":
+					printJson(
+						await c.send({
+							op: "run_prune",
+							...(flag(args, "older-than-ms") ? { olderThanMs: Number(flag(args, "older-than-ms")) } : {}),
+							...(flag(args, "keep") ? { keep: Number(flag(args, "keep")) } : {}),
+						}),
+					);
 					break;
 				default:
 					die(HELP);
 			}
+			c.close();
+			return;
+		}
+		case "exec": {
+			// everything after `exec` (past the `--` separator) is the command:
+			// `swarm exec -- echo hi` → positionals [exec echo hi].
+			const cmdParts = [a1, ...rest].filter((x): x is string => !!x);
+			if (cmdParts.length === 0) die(HELP);
+			const c = client(targetServer(args).url, opToken(args));
+			const detached = args.flags.has("detach");
+			const waitMs = detached ? 0 : Number(flag(args, "wait-ms") ?? "30000");
+			if (!Number.isFinite(waitMs)) die(`--wait-ms must be a number`);
+			printJson(
+				await c.send({
+					op: "run_exec",
+					spawn: { cmd: cmdParts[0]!, ...(cmdParts.length > 1 ? { args: cmdParts.slice(1) } : {}) },
+					waitMs,
+					...(flag(args, "timeout-ms") ? { timeoutMs: Number(flag(args, "timeout-ms")) } : {}),
+					...(flag(args, "name") ? { name: flag(args, "name") } : {}),
+				}),
+			);
 			c.close();
 			return;
 		}

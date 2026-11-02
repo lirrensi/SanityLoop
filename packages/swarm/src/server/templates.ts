@@ -1,8 +1,8 @@
 // ============================================================================
 // sanity/src/packages/swarm/src/server/templates.ts — the menu, no muscle.
 // Template scan + resolution as a pure module: JSON manifests declaring where
-// the agent file lives. No child_process, no PM2 — the supervisor (pm2.ts)
-// owns every fork; this file only answers "what can we spawn?"
+// the agent file lives. No child_process, no supervisor details — the supervisor
+// (supervisor.ts) owns every fork; this file only answers "what can we spawn?"
 // ============================================================================
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";

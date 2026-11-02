@@ -1,12 +1,11 @@
 // ============================================================================
 // join.test.ts — the COUPLING: createSwarmJoin plugin driven by a fake agent
-// (no real Agent/Loop needed). Verifies mode hats, report filters, tool RPC
-// against a live daemon, the relayed-event emit, and token rejection.
+// (no real Agent/Loop needed). Verifies mode hats, report filters, admin tool
+// RPC against a live daemon (program_define/launch/exec + agents/send/control/
+// broadcast/listen/drop), the relayed-event emit, and token rejection.
 // ============================================================================
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { createSwarmJoin } from "../src/join/index.ts";
 import type { GodObject, Plugin } from "@sanityloop/core";
 import { startDaemon, WsClient, tmpHome, rmHome } from "./harness.ts";
@@ -17,13 +16,13 @@ class FakeAgent {
 	id: string;
 	agentId: string;
 	description: string;
-	filters: any[] = [];
-	tools: any[] = [];
-	caps: any[] = [];
-	emitted: any[] = [];
-	inputs: any[] = [];
+	filters: unknown[] = [];
+	tools: { name: string; execute: (p: Record<string, unknown>) => Promise<{ answer: string }> }[] = [];
+	caps: { id: string }[] = [];
+	emitted: { type: string; payload?: unknown }[] = [];
+	inputs: unknown[] = [];
 	stopped = false;
-	aborted: any = null;
+	aborted: unknown = null;
 	paused = false;
 	woke = false;
 	constructor(id: string, agentId = id, description = "fake") {
@@ -31,28 +30,28 @@ class FakeAgent {
 		this.agentId = agentId;
 		this.description = description;
 	}
-	addFilter(f: any) {
+	addFilter(f: unknown) {
 		this.filters.push(f);
 	}
-	addTool(t: any) {
+	addTool(t: { name: string; execute: (p: Record<string, unknown>) => Promise<{ answer: string }> }) {
 		this.tools.push(t);
 	}
-	addDeclaredCapability(c: any) {
+	addDeclaredCapability(c: { id: string }) {
 		this.caps.push(c);
 	}
 	removeDeclaredCapability(id: string) {
 		this.caps = this.caps.filter((c) => c.id !== id);
 	}
-	emit(type: string, payload: any) {
+	emit(type: string, payload: unknown) {
 		this.emitted.push({ type, payload });
 	}
-	input(body: any) {
+	input(body: unknown) {
 		this.inputs.push(body);
 	}
 	stop() {
 		this.stopped = true;
 	}
-	abort(r: any) {
+	abort(r: unknown) {
 		this.aborted = r;
 	}
 	pause() {
@@ -99,20 +98,15 @@ test("worker-mode join: registers, adds report filters, exposes NO tools", async
 		);
 		assert.ok(agent.caps.find((c) => c.id === "swarm"));
 	} finally {
-		if (plugin) plugin.uninstall(agent as unknown as GodObject);
+		if (plugin) plugin.uninstall(agent! as unknown as GodObject);
 		rmHome(home);
 		await server.stop();
 	}
 });
 
-test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_start/drop/send/control/broadcast/listen)", async () => {
+test("admin-mode join: tools RPC against daemon (agents + program_define/launch + run_exec/get + send/control/broadcast/listen/drop)", async () => {
 	const home = tmpHome();
-	const tdir = join(home, "templates");
-	mkdirSync(tdir, { recursive: true });
-	writeFileSync(join(tdir, "idle.ts"), `setTimeout(() => process.exit(0), 400);\n`);
-	writeFileSync(join(tdir, "w1.json"), JSON.stringify({ id: "w1", file: "idle.ts" }));
-
-	const server = await startDaemon({ home, templatesDir: tdir });
+	const server = await startDaemon({ home });
 	const url = `ws://127.0.0.1:${server.port}`;
 	let target: WsClient | undefined;
 	let agent: FakeAgent;
@@ -139,11 +133,43 @@ test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_sta
 		);
 		assert.equal(got.sessionId, "target1");
 
-		// proc_start (forks idle fixture)
-		const started = JSON.parse(
-			(await findTool(agent, "swarm_proc_start")!.execute({ name: "p1", from: "w1" })).answer,
+		// program_define (absolute cmd spawn — no template resolution needed)
+		const defined = JSON.parse(
+			(await findTool(agent, "swarm_program_define")!.execute({
+				name: "jt-prog",
+				spawnJson: JSON.stringify({ cmd: process.execPath, args: ["--version"] }),
+			})).answer,
 		);
-		assert.ok(started.name === "p1" && typeof started.pid === "number");
+		assert.equal(defined.name, "jt-prog");
+
+		// program_list shows it
+		const plist = JSON.parse((await findTool(agent, "swarm_program_list")!.execute({})).answer);
+		assert.ok(plist.find((p: { name: string }) => p.name === "jt-prog"));
+
+		// program_launch forks it now
+		const launched = JSON.parse(
+			(await findTool(agent, "swarm_program_launch")!.execute({ name: "jt-prog" })).answer,
+		);
+		assert.ok(launched.runId, "launch returns a run id");
+
+		// run_exec: ad-hoc fork via tools
+		const execed = JSON.parse(
+			(await findTool(agent, "swarm_run_exec")!.execute({
+				spawnJson: JSON.stringify({ cmd: process.execPath, args: ["--version"] }),
+				waitMs: 15000,
+			})).answer,
+		);
+		assert.ok(execed.runId, "exec returns a run id");
+
+		// run_get by id
+		const rgot = JSON.parse(
+			(await findTool(agent, "swarm_run_get")!.execute({ id: execed.runId })).answer,
+		);
+		assert.equal(rgot.id, execed.runId);
+
+		// run_list shows both runs
+		const rlist = JSON.parse((await findTool(agent, "swarm_run_list")!.execute({})).answer);
+		assert.ok(rlist.find((r: { id: string }) => r.id === execed.runId));
 
 		// send → target receives input
 		const inP = target.waitFor("input");
@@ -171,13 +197,19 @@ test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_sta
 		let got2 = false;
 		const dl = Date.now() + 4000;
 		while (Date.now() < dl) {
-			if (agent.emitted.find((e) => e.type === "swarm/event" && e.payload?.target === "target1")) {
+			if (agent.emitted.find((e) => e.type === "swarm/event" && (e.payload as { target?: string })?.target === "target1")) {
 				got2 = true;
 				break;
 			}
 			await new Promise((r) => setTimeout(r, 30));
 		}
 		assert.ok(got2, "admin received relayed swarm/event");
+
+		// program_remove forgets the definition
+		const removed = JSON.parse(
+			(await findTool(agent, "swarm_program_remove")!.execute({ name: "jt-prog" })).answer,
+		);
+		assert.equal(removed.ok, true);
 
 		// drop = server-side removal: the target gets a drop frame, the entry is gone
 		const dropP = target.waitFor("drop");
@@ -187,12 +219,6 @@ test("admin-mode join: tools RPC against daemon (agents_list/agents_get/proc_sta
 		assert.equal(dropped.ok, true);
 		assert.equal((await dropP).op, "drop");
 		assert.equal(server.api.agents.get("target1"), null);
-
-		// stop the forked process
-		const stopped = JSON.parse(
-			(await findTool(agent, "swarm_proc_stop")!.execute({ name: "p1" })).answer,
-		);
-		assert.equal(stopped.ok, true);
 	} finally {
 		if (plugin) plugin.uninstall(agent! as unknown as GodObject);
 		target?.close();

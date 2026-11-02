@@ -119,8 +119,8 @@ de-facto gates for the architecture.
 | The inheritance promise: subclass can override protected seams (`/reference/api.md`) | `V-SUBCLASS-001` | component | `packages/core/test/subclass.test.ts` (override `land` + `deriveLoopState`) | local | assertions | verified (2026-08-23) |
 | Recipes run (`/guides/cookbook.md`) | `V-RCP-001` | component | cookbook exam via `npm test` | local | assertions | verified (11/11 at last full run; recipes edited 2026-08-23 — re-run pending) |
 | Filter throw → `handlerError`, loop survives | `V-FIL-001` | component | `packages/core/test/filter-bus.test.ts` (throw → skip + handlerError) | local | assertions | verified (2026-08-23) |
-| Swarm join/server handshake + protocol + room lifecycle | `V-SWRM-001` | component | `npm test` (`packages/swarm/test/*`: join, protocol, rooms, rest, server, processes, real child-worker e2e) | local + CI | assertions | verified (2026-10-19) |
-| Swarm TASK clock — durable exactly-once fires (pre-dispatch claim, grace/catch-up, logged skips) + paused-immune `trigger` (WS+REST+CLI, transient context, at-most-once) + kill -9 drill | `V-SWRM-002` | component | `packages/swarm/test/tasks.test.ts` (6 durability cases, incl. the boot-reconciliation test simulating kill -9 between claim and fork) | local | assertions | verified (2026-10-19) |
+| Swarm join/server handshake + protocol + room lifecycle | `V-SWRM-001` | component | `npm test` (`packages/swarm/test/*`: join, protocol, rooms, rest, cli, server, supervisor, runs, programs, real child-worker e2e) | local + CI | assertions | verified (2026-11-03) |
+| Swarm PROGRAM clock — durable exactly-once fires (pre-dispatch claim, overlap policies, catchupWindow + missPolicy, logged skips) + paused-immune `launch` (WS+REST+CLI, transient context, at-most-once) + `triggerToken` watchdog + boot `interrupted` + kill -9 drill | `V-SWRM-002` | component | `packages/swarm/test/programs.test.ts` + `supervisor.test.ts` + `runs.test.ts` + `rest.test.ts` + `cli.test.ts` (the programs clock, incl. the boot-reconciliation test simulating kill -9 between claim and fork) | local | assertions | verified (2026-11-03) |
 
 ## Environments and Test Data
 
@@ -153,7 +153,7 @@ de-facto gates for the architecture.
 | --- | --- | --- | --- | --- |
 | No CI | everything | nothing runs on commit | ~~wire `typecheck` + `npm test` into a workflow~~ DONE 2026-10-18: `.github/workflows/ci.yml` runs `npm run verify` (type→unit→e2e→templates→live) on every push/PR | closed |
 | Swarm fleet-scale chaos (multi-worker failure injection) | V-SWRM-001 | fleet regressions under failure silent | a chaos e2e (kill -9 a worker mid-turn) | open |
-| Swarm TASK kill -9 mid-fire | V-SWRM-002 | slot lost silently or refired after reboot | DONE 2026-10-19: kill -9 drill (claim persisted → SIGKILL → reboot → logged skip, no refire, `tickTasks` quiet) + boot-reconciliation test in `tasks.test.ts` | closed |
+| Swarm PROGRAM kill -9 mid-fire | V-SWRM-002 | slot lost silently or refired after reboot | DONE 2026-11-03: kill -9 drill (claim persisted → SIGKILL → reboot → logged skip, no refire, `tickPrograms` quiet) + boot-reconciliation test in `programs.test.ts` | closed |
 | Crash-heal tested at component scale, not process-kill scale | V-CRASH-HEAL | OS-level kill mid-batch unproven | a subprocess-kill e2e test | open |
 | W2 recoverable-error seam not built | `/architecture/core.md` error path | errors are terminal-only | W2 remains the known next core change | open |
 | `npm run verify` is green on Linux (CI) but red on Windows | the gate's "run it locally" claim | a Windows contributor sees environmental red: swarm worker e2e (daemon spawn), fake-docker shim (ENOENT without `.cmd`), REPL tmux banner | CI stays authoritative; per-test Windows fixes outstanding (core unit tier is 110/110 on Windows) | open |

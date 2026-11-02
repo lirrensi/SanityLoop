@@ -1,20 +1,20 @@
 ---
 node_type: architecture
-title: The Swarm — PROCESS, TASK, AGENT, TEMPLATE and the honest mirror
+title: The Swarm — PROGRAM, RUN, AGENT, TEMPLATE and the honest mirror
 status: active
-updated: 2026-10-19
-tags: [swarm, rooms, federation, daemon, protocol, visibility, mirror, process, task, agent, template]
+updated: 2026-11-03
+tags: [swarm, rooms, federation, daemon, protocol, visibility, mirror, program, run, agent, template]
 confidence: decided
 links:
   depends_on: [/reference/events.md]
   documents: [/packages/swarm/src/]
-  implemented_by: [/packages/swarm/src/protocol.ts, /packages/swarm/src/join/index.ts, /packages/swarm/src/server/index.ts, /packages/swarm/src/server/federate.ts, /packages/swarm/src/server/rest.ts, /packages/swarm/src/server/config.ts, /packages/swarm/src/server/stores.ts, /packages/swarm/src/server/templates.ts, /packages/swarm/src/server/pm2.ts]
-  verified_by: [/packages/swarm/test/rooms.test.ts, /packages/swarm/test/join.test.ts, /packages/swarm/test/e2e.test.ts, /packages/swarm/test/tasks.test.ts, /packages/swarm/test/processes.test.ts]
+  implemented_by: [/packages/swarm/src/protocol.ts, /packages/swarm/src/join/index.ts, /packages/swarm/src/server/index.ts, /packages/swarm/src/server/federate.ts, /packages/swarm/src/server/rest.ts, /packages/swarm/src/server/config.ts, /packages/swarm/src/server/stores.ts, /packages/swarm/src/server/templates.ts, /packages/swarm/src/server/supervisor.ts, /packages/swarm/src/server/runs.ts]
+  verified_by: [/packages/swarm/test/rooms.test.ts, /packages/swarm/test/join.test.ts, /packages/swarm/test/e2e.test.ts, /packages/swarm/test/supervisor.test.ts, /packages/swarm/test/runs.test.ts, /packages/swarm/test/programs.test.ts, /packages/swarm/test/rest.test.ts, /packages/swarm/test/cli.test.ts, /packages/swarm/test/processes.test.ts]
 sync_status: verified
-last_synced: 2026-10-19
+last_synced: 2026-11-03
 ---
 
-# The Swarm — PROCESS, TASK, AGENT, TEMPLATE and the honest mirror
+# The Swarm — PROGRAM, RUN, AGENT, TEMPLATE and the honest mirror
 
 `packages/swarm` is a fleet hypervisor. The **daemon** is a dumb router that
 never thinks: it routes frames by address, folds lifecycle reports into derived
@@ -34,53 +34,69 @@ The whole machine is four definitions plus whoever showed up:
 
 | Noun | What it is | Where it lives | Lifecycle |
 | --- | --- | --- | --- |
-| **PROCESS** | a named remembered fork — long-lived, PM2-supervised, `autorestart` decides whether a crash reforks | `processes.json` (the only memory) | `start` forks now; `stop` murders the pid (desired → stopped); `restart` kills then reforks; boot reforks every `running` def |
-| **TASK** | a named fire-and-die definition — `every` (interval), `at` (one-shot epoch), `manual` (only by hand) | `tasks.json` (the only memory) | `define` remembers; the 60s clock `fire`s due slots; `trigger` fires a manual run on the paused-immune path; `at` is consumed by its fire |
-| **AGENT** | whoever joined — wild (no parent) or forked (parent = the bare process name or `task:<name>#<n>`, echoed from `SWARM_SPAWN_ID`) | registry (live only) + history (every agent ever seen) | joins via `register`, reports voices, takes `input`/`control`, dies into `lastExit`/`lastResult` facts |
+| **PROGRAM** | one saved table — a named remembered fork. `kind` is a preset: `service` (long-lived, respawn on crash) or `job` (scheduled/manual, overlap + catch-up + retries). Changing what a program means is a merge = PATCH (promotion, never a new verb). | `programs.json` (the only memory) | `define` remembers; `launch` forks now; `patch` merges fields (incl. `desired`/`paused`); `remove` forgets the def (in-flight runs finish, then settle as orphans) |
+| **RUN** | every life — one fork, one ledger entry, uniform logs/kill/status whether it came from a service, a schedule, a manual launch, or a bare `exec`. Runs whose program was removed finish as **orphans** (settled, still readable). | `runs/<id>/` (`meta.json` + `stdout.log` + `stderr.log` + `exit.json`) | `exec` always creates one; `get`/`list`/`logs`/`wait`/`kill`/`signal` observe and stop; `save` promotes an orphan into a remembered program; `restart` reforks the same spawn; `prune` forgets old ones |
+| **AGENT** | whoever joined — wild (no parent) or forked (parent = the run id echoed from `SWARM_SPAWN_ID`, carried as `AgentInfo.parent` / `spawnId=runId` backlink) | registry (live only) + history (every agent ever seen) | joins via `register`, reports voices, takes `input`/`control`, dies into `lastExit`/`lastResult` facts |
 | **TEMPLATE** | a JSON manifest pointing at an agent file — the menu of what the daemon may spawn | `templates/` scanned at boot | `scanTemplates`/`findTemplate` resolve `from` → file; never executed by the scan itself |
 
-Asking an agent for a pid is a category error (ask `processes`/`tasks`).
-Asking a process for its voices is a category error (ask `agents`). A room is
+Asking an agent for a pid is a category error (ask `programs`/`runs`).
+Asking a program for its voices is a category error (ask `agents`). A room is
 NOT a noun — it is a path prefix on registry entries (see below).
 
-The daemon's home holds it all: `config.json` (declared identity), the two
-definition files, `templates/`, `sessions/`, `tasks/` scratch, and the scoped
-PM2 state. Inner PM2 holds no recipes: no `pm2 save`, no dump resurrect — it
-boots clean and the daemon submits desired state. Declarative, no ghosts.
+`programs.json` (the only memory — the two legacy definition files migrate into
+it once at boot and are kept, never deleted silently), `templates/`,
+`sessions/`, `runs/` ledger dirs, and `daemon.lock` (the home lock — a second
+daemon on the same home refuses). The supervisor is `node:child_process`
+directly (`supervisor.ts`) — one in-process supervisor, no external
+supervision, no scoped state dir. Declarative, no ghosts.
 
-## The TASK clock — every slot accounted for, exactly once
+## The PROGRAM clock — every slot accounted for, exactly once
 
-`fire` forks once through the same fork path as `start`, stamping
-`task:<name>#<n>` as the parent. The clock's durability contract:
+The 1s clock calls `tickPrograms(now)`; tests drive `tickPrograms` directly
+(no fake timers — the fire path forks real children). Cron schedules come from
+croner v11 (`expr` + optional `tz`); `every` (interval, `delay`/`anchor`
+variants), `at` (one-shot epoch), `manual` (launch-only) round out the kinds.
+The clock's durability contract:
 
-- **Fire identity.** `runs` + `lastSlot` (the due timestamp) identify the slot.
-- **Pre-dispatch advance.** The claim — `runs++`, `nextFire` advanced (or the
-  one-shot consumed), `pendingFire` stamped — is **persisted BEFORE the fork**.
-  A crash after the claim leaves `pendingFire`, which boot converts into a
-  **logged skip** (`lastSkipped`): never silent, never refired.
-- **Grace.** Late beats stay graceful: half the period, clamped to
-  `[120s, 2h]`. Inside grace a missed `every` slot fires late.
-- **Catch-up.** Past grace, missed `every` slots collapse into **ONE**
-  catch-up fire with the miss logged on the def (`lastCatchup`: slot, miss
-  count, reason) — never a fork storm. Past-grace `at` one-shots log a skip
-  instead of forking a stale moment.
-- **Paused tasks never fire** — the clock skips them; `fire` on a paused task
-  is refused. The manual path is `trigger`.
-- **`trigger`** fires any task on the **paused-immune path** with **transient
-  context** (delivered as the fork's prompt, never stored — the definition is
-  untouched, schedule included). **At-most-once**: a second concurrent trigger
-  while a claim is in flight is refused `busy` (WS: error frame; REST: 409)
-  instead of double-firing.
+- **Fire identity.** `counters.runs` + `lastSlot` (the due timestamp) identify
+  the slot.
+- **Pre-dispatch advance.** The claim — `counters.runs++`, `lastSlot`,
+  `nextFire` advanced (or the one-shot consumed), `pendingClaim` stamped — is
+  **persisted BEFORE the fork**. A crash after the claim leaves
+  `pendingClaim`, which boot converts into a **logged skip**: never silent,
+  never refired.
+- **Overlap policies.** A due slot while the program is still running resolves
+  per `overlap`: `skip` (count `overlapSkipped`), `allow`, `allowN` (cap),
+  `buffer1`/`bufferAll` (one queued slot / unbounded), `cancel` (kill the live
+  run, start fresh), `restart` (kill + refork the same run law).
+- **Catch-up.** Missed slots inside `catchupWindowMs` (explicit, else derived
+  from the schedule gap) collapse into **ONE** catch-up fire per `missPolicy`
+  (`fireOnce` fires once, `skip` logs and moves on) — never a fork storm.
+  Past-window one-shots log a skip instead of forking a stale moment.
+- **Retries.** A nonzero exit/signal on a job with `retries` forks a NEW run
+  (`attempt+1`, `backoffMs` delay); `pauseOnFail` pauses the program instead of
+  retrying forever.
+- **Paused programs never fire** — the clock skips them. The manual path is
+  **launch**: `program_launch` forks on the **paused-immune path** with
+  **transient context** (delivered as the fork's prompt, never stored — the
+  definition is untouched, schedule included). A concurrent claim in flight is
+  refused `busy` (WS: error frame; REST: 409) instead of double-firing.
+- **`triggerToken` watchdog.** When set, only a launch carrying the matching
+  token fires on the watchdog path — automation proves it holds the token,
+  strangers get refused.
+- **`waitMs` vs `timeoutMs`.** `waitMs` is caller patience (how long
+  launch/exec waits for the run before returning); `timeoutMs` is run lifetime
+  (overrun → killed, settled `timedOut`).
+- **Boot reconciliation.** Live runs found at boot (the daemon died mid-run)
+  are marked `interrupted` + logged — never silently adopted, never refired.
 
 ```
-tick: due? → claim (runs++, nextFire→, pendingFire, persist) → fork
-crash between claim and fork → boot: pendingFire → lastSkipped (logged, no refire)
-late ≤ grace → fire late       late > grace → ONE catch-up (every) / logged skip (at)
-trigger → claim (runs++, schedule untouched, persist) → fork with context
+tick: due? → claim (runs++, lastSlot, nextFire→, pendingClaim, persist) → fork
+crash between claim and fork → boot: pendingClaim → logged skip (no refire)
+live at boot → interrupted (logged)      overlap → skip|allow|allowN|buffer|cancel|restart
+missed ≤ window → ONE catch-up (fireOnce) / logged skip (skip policy)
+launch → claim (runs++, schedule untouched, persist) → fork with context
 ```
-
-The clock ticks every 60s; tests drive `tickTasks(now)` deterministically (no
-fake timers — the fire path forks real processes).
 
 ## The address — a room is NOT an object
 
@@ -214,8 +230,9 @@ until the single-server story is fully proven.
 | `register` | `room?` | worker: where I live. peer/admin: my mount point. Default `global`. |
 | `broadcast` | `room?` | Optional blast-radius scope (subtree). |
 | `welcome` | `swarm?` | The daemon's declared name — the handshake answer to "who are you?". Undefined = hermit. |
-| `AgentInfo` | `room?`, `address?`, `origin?`, `parent?` | Where it lives, its full address, `local` \| `mirrored`, fork backlink (bare process name / `task:<name>#<n>` / unset = wild). |
-| `task_trigger` | `context?`, `prompt?` | Paused-immune manual run; transient context rides the fork prompt, never stored; concurrent claims refuse `busy`. |
+| `AgentInfo` | `room?`, `address?`, `origin?`, `parent?` | Where it lives, its full address, `local` \| `mirrored`, fork backlink (the run id / unset = wild). |
+| `program_launch` | `context?`, `prompt?`, `waitMs?`, `token?` | Paused-immune manual run; transient context rides the fork prompt, never stored; concurrent claims refuse `busy`; token must match `triggerToken` on the watchdog path. |
+| `run_exec` | `spawn`, `waitMs?`, `timeoutMs?`, `name?`, `context?` | Bare fork — always creates an orphan run, no program touched. |
 | `list` | — | Compat alias of `agents_list` — the federation mount's wire, never advertised. |
 
 ## REST — the same law, no x-ray
@@ -226,11 +243,22 @@ every route — including writes — filters through the same prefix check. One
 visibility rule, four doors (WS worker, WS peer/admin, REST, CLI), zero
 special cases.
 
-Task routes: `GET /api/v1/tasks`, `POST /api/v1/tasks`,
-`GET /api/v1/tasks/:name`, `POST /api/v1/tasks/:name/fire`,
-`POST /api/v1/tasks/:name/trigger {context?, prompt?}` (paused-immune,
-409 when a claim is already in flight), `POST .../pause`, `POST .../resume`,
-`DELETE /api/v1/tasks/:name`.
+Program routes: `GET /api/v1/programs`, `POST /api/v1/programs` (define),
+`GET /api/v1/programs/:name`, `PATCH /api/v1/programs/:name` (merge +
+validate = promotion), `DELETE /api/v1/programs/:name` (forget the def),
+`POST /api/v1/programs/:name/launch {context?, prompt?, waitMs?, token?}`
+(paused-immune, 409 when a claim is already in flight),
+`GET .../preview?n=`, `GET .../logs?tailBytes=`.
+
+Run routes: `POST /api/v1/runs/exec {spawn, waitMs?, timeoutMs?, name?,
+context?}`, `GET /api/v1/runs?program=&state=&limit=`,
+`GET /api/v1/runs/:id`, `GET /api/v1/runs/:id/logs?stream=&tailBytes=&offset=`,
+`POST /api/v1/runs/:id/wait {match?, timeoutMs?}` (timeout → 408 + snapshot),
+`POST /api/v1/runs/:id/kill {graceMs?, force?}`,
+`POST /api/v1/runs/:id/signal {signal}`,
+`POST /api/v1/runs/:id/save {name, kind?}` (promote an orphan),
+`POST /api/v1/runs/:id/restart` (same spawn, new run),
+`POST /api/v1/runs/prune {olderThanMs?, keep?}`.
 
 ## Agents: what changed for a worker
 
@@ -245,16 +273,20 @@ wireSwarm(agent, { mode: "admin", room: "global" });
 wireSwarm(agent, { mode: "peer", room: "global/roomMeow/room2" });
 ```
 
-Admin tools: `swarm_task_define` / `swarm_task_fire` / `swarm_task_trigger` /
-`swarm_task_list` alongside the proc tools; `swarm_send`/`swarm_control`
-accept a bare sessionId (local) or a full address (mirrored) through the same
-`resolve()`. `swarm/welcome` carries the daemon's declared name, so an agent
-knows which swarm it landed in.
+Admin tools: `swarm_program_define` / `swarm_program_patch` /
+`swarm_program_launch` / `swarm_program_remove` / `swarm_program_list` /
+`swarm_program_get` / `swarm_program_preview` alongside `swarm_run_exec` /
+`swarm_run_get` / `swarm_run_list` / `swarm_run_logs` / `swarm_run_wait` /
+`swarm_run_kill` / `swarm_run_save` / `swarm_run_restart`;
+`swarm_send`/`swarm_control` accept a bare sessionId (local) or a full address
+(mirrored) through the same `resolve()`. `swarm/welcome` carries the daemon's
+declared name, so an agent knows which swarm it landed in.
 
-Operator doors: `swarm tasks define <name> <every|at|manual> [--every-ms N]
-[--at EPOCH] [--from T] [--file F]`, `swarm tasks fire <name> [--prompt TEXT]`,
-`swarm tasks trigger <name> [--context TEXT] [--prompt TEXT]`,
-`swarm tasks pause|resume|remove|get|list`.
+Operator doors: `swarm programs list|get|define|patch|launch|remove|preview|logs`
+(`define <name> [--kind service|job]`, `launch <name> [--context TEXT]
+[--prompt TEXT] [--wait-ms N] [--token TOK]`), `swarm runs
+list|get|logs|wait|kill|signal|save|restart|prune`, `swarm exec [--wait-ms N]
+[--timeout-ms N] [--name NAME] [--detach] -- <cmd> [args...]`.
 
 ## Verification
 
@@ -265,12 +297,19 @@ Operator doors: `swarm tasks define <name> <every|at|manual> [--every-ms N]
   collision refusal).
 - `/packages/swarm/test/join.test.ts`, `/packages/swarm/test/e2e.test.ts` —
   the pre-rooms behavior, still green unchanged (the default path keeps the
-  same wire semantics; the fork layer is now the embedded PM2 supervisor,
-  not the pre-rooms spawner).
-- `/packages/swarm/test/tasks.test.ts` — durable fires: pre-dispatch advance,
-  grace/catch-up, past-grace `at` skips, trigger paused-immune/transient/
-  at-most-once (WS+REST), boot reconciliation of the crash window,
-  kill -9 drill transcript in the phase-3 report.
-- `/packages/swarm/test/processes.test.ts` — templates module, processes.json
-  CRUD, atomic write-through, torn-file behavior, autorestart policy, boot
-  resubmit, fleet.json migration.
+  same wire semantics; the fork layer is now the `node:child_process`
+  supervisor, not the pre-rooms spawner).
+- `/packages/swarm/test/supervisor.test.ts` — fork/kill/backoff over
+  `node:child_process`, crash-loop guard, home lock (`daemon.lock`).
+- `/packages/swarm/test/runs.test.ts` — the run ledger: `runs/<id>/`
+  layout, uniform logs/kill/status, orphans, save-promotion, restart, prune,
+  `waitMs` vs `timeoutMs`.
+- `/packages/swarm/test/programs.test.ts` — the program clock: pre-dispatch
+  claim, overlap policies, catch-up windows + miss policies, retries /
+  `pauseOnFail`, `triggerToken` watchdog, boot reconciliation (live →
+  interrupted, pendingClaim → logged skip), kill -9 drill transcript.
+- `/packages/swarm/test/rest.test.ts`, `/packages/swarm/test/cli.test.ts` —
+  FleetApi v2 surfaces: programs + runs routes and commands over the same ops.
+- `/packages/swarm/test/processes.test.ts` — templates module, definition
+  CRUD, atomic write-through, torn-file behavior, migration of legacy
+  definitions into `programs.json`.

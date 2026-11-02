@@ -1,7 +1,7 @@
 // ============================================================================
 // admin.ts — the COMMANDER. A swarm template that wears the admin hat: it can
 // list, query, talk to, create, kill, restart, and broadcast to every worker.
-// Command the daemon to spawn it: `swarm create admin`.
+// Command the daemon to spawn it: `swarm programs define admin --file ./admin.ts` (+ `swarm programs launch admin`).
 //
 //   node --experimental-strip-types admin.ts
 //   env: SWARM_SERVER, SWARM_SESSION_ID, SWARM_TOKEN?, SWARM_SESSIONS_DIR?, SWARM_MODEL?

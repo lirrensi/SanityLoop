@@ -8,20 +8,14 @@
 //   server → worker:  input, control (the same doors a human REPL would use),
 //                     drop (you are gone — teardown, never reconnect)
 //   peer   → server:  agents_list, agents_get, listen, input, control
-//   admin  → server:  everything above + proc_*/task_* ops, drop (agent removal),
+//   admin  → server:  everything above + program_*/run_* ops, drop (agent removal),
 //                     broadcast
 // server → anyone:  welcome, event (relayed streams), result, error, pong, closed
 //
 // ONE API, MANY SURFACES: the daemon's ops are exposed verbatim over WS frames
 // (here), REST routes (server/rest.ts) and the CLI (a WS client). input/listen
-// stay wire-only where they belong to streams; everything else is entity CRUD.
-//
-// patched (the god-object delta) is NEVER on the wire — it is the job of the
-// worker's own storage. The swarm carries voices, not memories.
-//
-// ONE API, MANY SURFACES: the daemon's ops are exposed verbatim over WS frames
-// (here), REST routes (server/rest.ts) and the CLI (a WS client). input/listen
-// stay wire-only where they belong to streams; everything else is fleet CRUD.
+// stay wire-only where they belong to streams; everything else is entity CRUD:
+// agents (who joined), programs (remembered forks + schedules), runs (ledger).
 //
 // patched (the god-object delta) is NEVER on the wire — it is the job of the
 // worker's own storage. The swarm carries voices, not memories.
@@ -162,116 +156,204 @@ export interface DropFrame {
 	sessionId: string;
 }
 
-export interface ProcStartFrame {
-	op: "proc_start";
-	id?: string;
-	name: string;
-	file?: string;
-	from?: string;
-	prompt?: string;
-	autorestart?: boolean;
+/** A program spawn: an agent file, or an arbitrary command. */
+export type ProgramSpawnFrame = { file: string } | { cmd: string; args?: string[]; cwd?: string };
+
+/** Restart policy for services (jobs retry via `retries`). */
+export interface ProgramRestartFrame {
+	policy: "never" | "always" | "on-failure";
+	backoffMs?: number;
+	maxRestarts?: number;
 }
 
-export interface ProcSaveFrame {
-	op: "proc_save";
-	id?: string;
-	name: string;
-	file?: string;
-	from?: string;
-	autorestart?: boolean;
-}
-
-export interface ProcStopFrame {
-	op: "proc_stop";
-	id?: string;
-	name: string;
-}
-
-export interface ProcRemoveFrame {
-	op: "proc_remove";
-	id?: string;
-	name: string;
-}
-
-export interface ProcSetAutorestartFrame {
-	op: "proc_set_autorestart";
-	id?: string;
-	name: string;
-	autorestart: boolean;
-}
-
-export interface ProcRestartFrame {
-	op: "proc_restart";
-	id?: string;
-	name: string;
-	prompt?: string;
-}
-
-export interface ProcListFrame {
-	op: "proc_list";
-	id?: string;
-}
-
-export interface ProcGetFrame {
-	op: "proc_get";
-	id?: string;
-	name: string;
-}
-
-export interface TaskDefineFrame {
-	op: "task_define";
-	id?: string;
-	name: string;
-	file?: string;
-	from?: string;
-	fire: "every" | "at" | "manual";
+/** When a job fires: `every` interval, `cron` expression, `at` one-shot, `manual` trigger-only. */
+export interface ProgramScheduleFrame {
+	kind: "every" | "cron" | "at" | "manual";
 	everyMs?: number;
+	everyMode?: "rate" | "delay";
+	anchor?: number;
+	expr?: string;
+	timezone?: string;
 	at?: number;
+	startAt?: number;
+	stopAt?: number;
+	maxRuns?: number;
 }
 
-export interface TaskFireFrame {
-	op: "task_fire";
-	id?: string;
-	name: string;
-	prompt?: string;
+export interface ProgramRetryFrame {
+	attempts: number;
+	backoffMs: number;
 }
-export interface TaskTriggerFrame {
-	op: "task_trigger";
+
+/** Shared program fields — program_define sets them, program_patch patches them. */
+export interface ProgramFields {
+	kind?: "service" | "job";
+	spawn?: ProgramSpawnFrame;
+	from?: string;
+	desired?: "running" | "stopped";
+	restart?: ProgramRestartFrame;
+	schedule?: ProgramScheduleFrame;
+	paused?: boolean;
+	overlap?: "skip" | "allow" | "allowN" | "buffer1" | "bufferAll" | "cancel" | "restart";
+	allowN?: number;
+	timeoutMs?: number;
+	catchupWindowMs?: number;
+	missPolicy?: "fireOnce" | "skip";
+	retries?: ProgramRetryFrame;
+	pauseOnFail?: boolean;
+	jitterMs?: number;
+	stableJitter?: boolean;
+	minGapMs?: number;
+	onFailTrigger?: string;
+	onSuccessTrigger?: string;
+	triggerToken?: string;
+	promptTimeoutMs?: number;
+	killGraceMs?: number;
+	keepRuns?: number;
+	notes?: string;
+}
+
+export interface ProgramDefineFrame extends ProgramFields {
+	op: "program_define";
 	id?: string;
 	name: string;
-	/** Transient context — delivered as the fork's prompt, never stored on the definition. */
+}
+
+/** Promotion = patch: merge the patch over the def, validate the merged def. */
+export interface ProgramPatchFrame {
+	op: "program_patch";
+	id?: string;
+	name: string;
+	patch: Partial<ProgramFields>;
+}
+
+/** Manual run — forks now, schedule untouched (nextFire/lastSlot never move). */
+export interface ProgramLaunchFrame {
+	op: "program_launch";
+	id?: string;
+	name: string;
 	context?: string;
 	prompt?: string;
+	waitMs?: number;
+	/** Watchdog path: when it matches the program's triggerToken, program_launch
+	 *  is honored without the admin role. REST/CLI honor the same convention. */
+	token?: string;
 }
 
-export interface TaskPauseFrame {
-	op: "task_pause";
-	id?: string;
-	name: string;
-	paused: boolean;
-}
-
-export interface TaskResumeFrame {
-	op: "task_resume";
-	id?: string;
-	name: string;
-}
-
-export interface TaskRemoveFrame {
-	op: "task_remove";
+/** Forget the definition — in-flight runs finish, labels settle as orphans. */
+export interface ProgramRemoveFrame {
+	op: "program_remove";
 	id?: string;
 	name: string;
 }
 
-export interface TaskListFrame {
-	op: "task_list";
+export interface ProgramListFrame {
+	op: "program_list";
 	id?: string;
+	name?: string;
 }
 
-export interface TaskGetFrame {
-	op: "task_get";
+export interface ProgramGetFrame {
+	op: "program_get";
 	id?: string;
 	name: string;
+}
+
+/** Next-N fire times for a program, without forking. */
+export interface ProgramPreviewFrame {
+	op: "program_preview";
+	id?: string;
+	name: string;
+	n?: number;
+}
+
+/** Concatenated stdout tails across a program's history (newest last). */
+export interface ProgramLogsFrame {
+	op: "program_logs";
+	id?: string;
+	name: string;
+	tailBytes?: number;
+}
+
+/** Always creates a run; waitMs is caller patience, never run lifetime. */
+export interface RunExecFrame {
+	op: "run_exec";
+	id?: string;
+	spawn: ProgramSpawnFrame;
+	waitMs?: number;
+	timeoutMs?: number;
+	name?: string;
+	context?: string;
+}
+
+export interface RunGetFrame {
+	op: "run_get";
+	id?: string;
+	runId: string;
+}
+
+export interface RunListFrame {
+	op: "run_list";
+	id?: string;
+	program?: string;
+	state?: string;
+	limit?: number;
+}
+
+export interface RunLogsFrame {
+	op: "run_logs";
+	id?: string;
+	runId: string;
+	stream?: "stdout" | "stderr" | "both";
+	tailBytes?: number;
+	offset?: number;
+}
+
+export interface RunWaitFrame {
+	op: "run_wait";
+	id?: string;
+	runId: string;
+	match?: string;
+	timeoutMs?: number;
+}
+
+/** force = SIGKILL now (skip the grace). */
+export interface RunKillFrame {
+	op: "run_kill";
+	id?: string;
+	runId: string;
+	graceMs?: number;
+	force?: boolean;
+}
+
+export interface RunSignalFrame {
+	op: "run_signal";
+	id?: string;
+	runId: string;
+	signal: string;
+}
+
+/** Promote an orphan run into a remembered program. */
+export interface RunSaveFrame {
+	op: "run_save";
+	id?: string;
+	runId: string;
+	name: string;
+	kind?: "service" | "job";
+}
+
+export interface RunPruneFrame {
+	op: "run_prune";
+	id?: string;
+	olderThanMs?: number;
+	keep?: number;
+}
+
+/** Same spawn, new run. */
+export interface RunRestartFrame {
+	op: "run_restart";
+	id?: string;
+	runId: string;
 }
 
 
@@ -299,22 +381,24 @@ export type ClientFrame =
 	| InputFrame
 	| ControlFrame
 	| DropFrame
-	| ProcStartFrame
-	| ProcSaveFrame
-	| ProcStopFrame
-	| ProcRemoveFrame
-	| ProcSetAutorestartFrame
-	| ProcRestartFrame
-	| ProcListFrame
-	| ProcGetFrame
-	| TaskDefineFrame
-	| TaskFireFrame
-	| TaskTriggerFrame
-	| TaskPauseFrame
-	| TaskResumeFrame
-	| TaskRemoveFrame
-	| TaskListFrame
-	| TaskGetFrame
+	| ProgramDefineFrame
+	| ProgramPatchFrame
+	| ProgramLaunchFrame
+	| ProgramRemoveFrame
+	| ProgramListFrame
+	| ProgramGetFrame
+	| ProgramPreviewFrame
+	| ProgramLogsFrame
+	| RunExecFrame
+	| RunGetFrame
+	| RunListFrame
+	| RunLogsFrame
+	| RunWaitFrame
+	| RunKillFrame
+	| RunSignalFrame
+	| RunSaveFrame
+	| RunPruneFrame
+	| RunRestartFrame
 	| BroadcastFrame;
 
 // server → client

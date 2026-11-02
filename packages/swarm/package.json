@@ -1,6 +1,6 @@
 {
   "name": "@sanityloop/swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
   "description": "the swarm — a dumb daemon hub + the join extension agents import. One package: without the join there's no hub to talk to, without the hub there's nothing to join.",
@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@sanityloop/core": "^0.3.0",
-    "pm2": "^7.0.1",
+    "croner": "^11.0.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {

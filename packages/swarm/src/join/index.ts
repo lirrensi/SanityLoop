@@ -13,7 +13,7 @@
 //       reset = wipe to identity (loop alive). No destroy on the wire, ever.
 //     · reconnect + heartbeat (the daemon dies? we come back)
 //     · tools per mode: peer (agents_list/agents_get/send/listen/control),
-//       admin (+proc/task/drop/broadcast). worker gets none — it just reports.
+//       admin (+program_*/run_*/drop/broadcast). worker gets none — it just reports.
 //
 //   wireSwarm(agent, opts) — the BOOT flow, verified: restore → install storage →
 //   re-key → join. One call instead of a paragraph.
@@ -436,29 +436,39 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					}),
 				},
 				{
-					name: "swarm_proc_start",
+					name: "swarm_program_define",
 					description:
-						"Remember (creating when missing) + fork a process now. Source: from (template id) or file (agent path). Returns { name, sessionId, pid }.",
+						"Define (create or replace) a program: kind service|job, spawnJson (stringified spawn), from, desired, restart (stringified), scheduleJson (stringified), overlap, timeoutMs, notes.",
 					inputSchema: {
 						type: "object",
 						properties: {
 							name: { type: "string" },
+							kind: { type: "string", enum: ["service", "job"] },
+							spawnJson: { type: "string" },
 							from: { type: "string" },
-							file: { type: "string" },
-							autorestart: { type: "boolean" },
-							prompt: { type: "string" },
+							desired: { type: "string", enum: ["running", "stopped"] },
+							restart: { type: "string" },
+							scheduleJson: { type: "string" },
+							overlap: { type: "string" },
+							timeoutMs: { type: "number" },
+							notes: { type: "string" },
 						},
 						required: ["name"],
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
 							await rpc({
-								op: "proc_start",
+								op: "program_define",
 								name: String(p.name),
+								kind: p.kind !== undefined ? (String(p.kind) as never) : undefined,
+								spawn: p.spawnJson !== undefined ? (JSON.parse(String(p.spawnJson)) as never) : undefined,
 								from: p.from !== undefined ? String(p.from) : undefined,
-								file: p.file !== undefined ? String(p.file) : undefined,
-								autorestart: typeof p.autorestart === "boolean" ? p.autorestart : undefined,
-								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+								desired: p.desired !== undefined ? (String(p.desired) as never) : undefined,
+								restart: p.restart !== undefined ? (typeof p.restart === "string" ? (JSON.parse(p.restart) as never) : (p.restart as never)) : undefined,
+								schedule: p.scheduleJson !== undefined ? (JSON.parse(String(p.scheduleJson)) as never) : undefined,
+								overlap: p.overlap !== undefined ? (String(p.overlap) as never) : undefined,
+								timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : undefined,
+								notes: p.notes !== undefined ? String(p.notes) : undefined,
 							}),
 							null,
 							2,
@@ -466,8 +476,58 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					}),
 				},
 				{
-					name: "swarm_proc_stop",
-					description: "Murder a process's pid. Desired state → stopped.",
+					name: "swarm_program_patch",
+					description: "Patch a program definition: patchJson (stringified partial fields) merges over the def.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							patchJson: { type: "string" },
+						},
+						required: ["name", "patchJson"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "program_patch",
+								name: String(p.name),
+								patch: JSON.parse(String(p.patchJson)) as never,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_program_launch",
+					description: "Fork a program once now (schedule untouched). token = the program's triggerToken (watchdog path).",
+					inputSchema: {
+						type: "object",
+						properties: {
+							name: { type: "string" },
+							context: { type: "string" },
+							prompt: { type: "string" },
+							token: { type: "string" },
+						},
+						required: ["name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "program_launch",
+								name: String(p.name),
+								context: p.context !== undefined ? String(p.context) : undefined,
+								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+								token: p.token !== undefined ? String(p.token) : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_program_remove",
+					description: "Forget a program definition — in-flight runs finish, labels settle as orphans.",
 					inputSchema: {
 						type: "object",
 						properties: { name: { type: "string" } },
@@ -475,92 +535,53 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
-							await rpc({ op: "proc_stop", name: String(p.name) }),
+							await rpc({ op: "program_remove", name: String(p.name) }),
 							null,
 							2,
 						),
 					}),
 				},
 				{
-					name: "swarm_proc_restart",
-					description: "Fresh fork under the same process name.",
-					inputSchema: {
-						type: "object",
-						properties: {
-							name: { type: "string" },
-							prompt: { type: "string" },
-						},
-						required: ["name"],
-					},
-					execute: async (p) => ({
-						answer: JSON.stringify(
-							await rpc({
-								op: "proc_restart",
-								name: String(p.name),
-								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
-							}),
-							null,
-							2,
-						),
-					}),
-				},
-				{
-					name: "swarm_proc_list",
-					description: "List process definitions.",
+					name: "swarm_program_list",
+					description: "List program definitions.",
 					inputSchema: { type: "object", properties: {} },
 					execute: async () => ({
-						answer: JSON.stringify(await rpc({ op: "proc_list" }), null, 2),
+						answer: JSON.stringify(await rpc({ op: "program_list" }), null, 2),
 					}),
 				},
 				{
-					name: "swarm_task_define",
-					description:
-						"Create or replace a task definition. fire: every (needs everyMs) | at (needs at epoch ms) | manual.",
+					name: "swarm_program_get",
+					description: "Get one program definition by name.",
 					inputSchema: {
 						type: "object",
-						properties: {
-							name: { type: "string" },
-							from: { type: "string" },
-							file: { type: "string" },
-							fire: { type: "string", enum: ["every", "at", "manual"] },
-							everyMs: { type: "number" },
-							at: { type: "number" },
-						},
-						required: ["name", "fire"],
+						properties: { name: { type: "string" } },
+						required: ["name"],
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
-							await rpc({
-								op: "task_define",
-								name: String(p.name),
-								from: p.from !== undefined ? String(p.from) : undefined,
-								file: p.file !== undefined ? String(p.file) : undefined,
-								fire: p.fire as never,
-								everyMs: typeof p.everyMs === "number" ? p.everyMs : undefined,
-								at: typeof p.at === "number" ? p.at : undefined,
-							}),
+							await rpc({ op: "program_get", name: String(p.name) }),
 							null,
 							2,
 						),
 					}),
 				},
 				{
-					name: "swarm_task_fire",
-					description: "Fork a task once through the same fork path. Returns { name, run, sessionId, pid }.",
+					name: "swarm_program_preview",
+					description: "Next-N fire times for a program, without forking.",
 					inputSchema: {
 						type: "object",
 						properties: {
 							name: { type: "string" },
-							prompt: { type: "string" },
+							n: { type: "number" },
 						},
 						required: ["name"],
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
 							await rpc({
-								op: "task_fire",
+								op: "program_preview",
 								name: String(p.name),
-								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+								n: typeof p.n === "number" ? p.n : undefined,
 							}),
 							null,
 							2,
@@ -568,25 +589,26 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					}),
 				},
 				{
-					name: "swarm_task_trigger",
-					description:
-						"Manual run on the paused-immune path: forks even when paused, schedule untouched, transient context delivered as the prompt, at-most-once (busy when a claim is in flight).",
+					name: "swarm_run_exec",
+					description: "Fork an ad-hoc run now: spawnJson (stringified spawn). waitMs is caller patience, never run lifetime.",
 					inputSchema: {
 						type: "object",
 						properties: {
+							spawnJson: { type: "string" },
+							waitMs: { type: "number" },
+							timeoutMs: { type: "number" },
 							name: { type: "string" },
-							context: { type: "string" },
-							prompt: { type: "string" },
 						},
-						required: ["name"],
+						required: ["spawnJson"],
 					},
 					execute: async (p) => ({
 						answer: JSON.stringify(
 							await rpc({
-								op: "task_trigger",
-								name: String(p.name),
-								context: p.context !== undefined ? String(p.context) : undefined,
-								prompt: p.prompt !== undefined ? String(p.prompt) : undefined,
+								op: "run_exec",
+								spawn: JSON.parse(String(p.spawnJson)) as never,
+								waitMs: typeof p.waitMs === "number" ? p.waitMs : undefined,
+								timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : undefined,
+								name: p.name !== undefined ? String(p.name) : undefined,
 							}),
 							null,
 							2,
@@ -594,11 +616,159 @@ export function createSwarmJoin(opts: SwarmJoinOptions = {}): Plugin {
 					}),
 				},
 				{
-					name: "swarm_task_list",
-					description: "List task definitions.",
-					inputSchema: { type: "object", properties: {} },
-					execute: async () => ({
-						answer: JSON.stringify(await rpc({ op: "task_list" }), null, 2),
+					name: "swarm_run_get",
+					description: "Get one run by id.",
+					inputSchema: {
+						type: "object",
+						properties: { id: { type: "string" } },
+						required: ["id"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({ op: "run_get", runId: String(p.id) }),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_list",
+					description: "List runs, optionally filtered by program and/or state.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							program: { type: "string" },
+							state: { type: "string" },
+							limit: { type: "number" },
+						},
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "run_list",
+								program: p.program !== undefined ? String(p.program) : undefined,
+								state: p.state !== undefined ? String(p.state) : undefined,
+								limit: typeof p.limit === "number" ? p.limit : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_logs",
+					description: "Tail a run's stdout/stderr streams.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							id: { type: "string" },
+							stream: { type: "string", enum: ["stdout", "stderr", "both"] },
+							tailBytes: { type: "number" },
+						},
+						required: ["id"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "run_logs",
+								runId: String(p.id),
+								stream: p.stream !== undefined ? (String(p.stream) as never) : undefined,
+								tailBytes: typeof p.tailBytes === "number" ? p.tailBytes : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_wait",
+					description: "Wait for a run to settle (optionally matching output), up to timeoutMs.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							id: { type: "string" },
+							match: { type: "string" },
+							timeoutMs: { type: "number" },
+						},
+						required: ["id"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "run_wait",
+								runId: String(p.id),
+								match: p.match !== undefined ? String(p.match) : undefined,
+								timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_kill",
+					description: "Kill a run (force = SIGKILL now, skip the grace).",
+					inputSchema: {
+						type: "object",
+						properties: {
+							id: { type: "string" },
+							graceMs: { type: "number" },
+							force: { type: "boolean" },
+						},
+						required: ["id"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "run_kill",
+								runId: String(p.id),
+								graceMs: typeof p.graceMs === "number" ? p.graceMs : undefined,
+								force: typeof p.force === "boolean" ? p.force : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_save",
+					description: "Promote an orphan run into a remembered program.",
+					inputSchema: {
+						type: "object",
+						properties: {
+							id: { type: "string" },
+							name: { type: "string" },
+							kind: { type: "string", enum: ["service", "job"] },
+						},
+						required: ["id", "name"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({
+								op: "run_save",
+								runId: String(p.id),
+								name: String(p.name),
+								kind: p.kind !== undefined ? (String(p.kind) as never) : undefined,
+							}),
+							null,
+							2,
+						),
+					}),
+				},
+				{
+					name: "swarm_run_restart",
+					description: "Restart a run: same spawn, new run.",
+					inputSchema: {
+						type: "object",
+						properties: { id: { type: "string" } },
+						required: ["id"],
+					},
+					execute: async (p) => ({
+						answer: JSON.stringify(
+							await rpc({ op: "run_restart", runId: String(p.id) }),
+							null,
+							2,
+						),
 					}),
 				},
 				{

@@ -3,17 +3,23 @@
 //   · WS hub — routes frames by address, fan-outs streams to subscribers. It
 //     never interprets a payload, only its shape (the core is type-blind, so is
 //     the hub).
-//   · ONE API, MANY SURFACES — the ops live in FleetApi (agents/processes/tasks
+//   · ONE API, MANY SURFACES — the ops live in FleetApi (agents/programs/runs
 //     namespaces); WS frames, REST routes (rest.ts) and the CLI (a WS client)
 //     are thin adapters over the same core.
 //   · registry (live agents only) + history (every agent ever seen). Agents are
-//     whoever joined — wild (no parent) or forked (parent = process name or
-//     task fire id, echoed from SWARM_SPAWN_ID).
-//   · PROCESSES = named remembered forks (stores.ts is the only memory).
-//     `start` forks now; `autorestart=true` reforks on crash; boot reforks
-//     every process whose desired status is running.
-//   · TASKS = named fire-and-die definitions. `fire` forks once through the
-//     SAME fork path; a 60s clock fires due `every`/`at` tasks unless paused.
+//     whoever joined — wild (no parent) or forked (parent = run id echoed from
+//     SWARM_SPAWN_ID).
+//   · PROGRAMS = named remembered definitions (stores.ts is the only memory).
+//     Services are remembered forks (desired=running reforks at boot);
+//     jobs are fire-and-die schedules (every/cron/at/manual).
+//   · RUNS = the ledger (runs.ts). Every fork leaves exactly one run:
+//     <home>/runs/<id>/ (meta.json + stdout.log + stderr.log + exit.json).
+//   · The supervisor (supervisor.ts) owns fork/kill mechanics ONLY —
+//     autorestart is ALWAYS false at its level. The daemon owns restart policy
+//     (kill run + new run law): service respawn, job retries, crash-loop guard.
+//   · A 1s clock fires due schedules unless paused. Every slot is claimed
+//     (counters.runs++ + lastSlot + nextFire + pendingClaim, persisted BEFORE
+//     the fork) so a crash can't refire and never silently loses a slot.
 //   · ROOMS — a room is NOT an object, it is a "/"-path prefix on registry
 //     entries. ONE visibility rule: an ancestor sees its descendants
 //     (startsWith); sideways and upward: invisible. Workers claim where they
@@ -26,18 +32,15 @@
 //     not transit (mirrors of mirrors are never mirrored).
 //   · the daemon FOLDS what it hears: lifecycle reports become per-agent state
 //     (idle/busy/paused/error), counters, and a recent-events ring. State is truth.
-//   · prompts on process (re)start / task fire are queued and delivered the
+//   · prompts on (re)start / manual launch are queued and delivered the
 //     instant the worker (re)registers — the daemon owns the register moment,
 //     so it orchestrates.
-//   · processes = named remembered forks (stores.ts is the only memory).
-//     `start` forks now (PM2 supervises, autorestart=true restarts with
-//     backoff); boot clears stale PM2 state then submits kept processes.
-//     The supervisor holds NO recipes — just live children and their death
-//     facts. Definitions live in stores.ts.
 // The daemon is NOT an agent. It manages agents; it never thinks.
 // ============================================================================
 import { createServer, type IncomingMessage, type Server } from "node:http";
-import { existsSync } from "node:fs";
+import { closeSync, createWriteStream, existsSync, openSync, readSync, statSync } from "node:fs";
+import { join } from "node:path";
+import type { Writable } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
 import {
 	ROOT_ROOM,
@@ -50,6 +53,8 @@ import type {
 	AgentInfo,
 	ClientFrame,
 	ControlAction,
+	ProgramFields,
+	ProgramSpawnFrame,
 	RecentEvent,
 	RegisterFrame,
 	SwarmEvent,
@@ -57,7 +62,13 @@ import type {
 	WorkerState,
 	WorkerStats,
 } from "../protocol.ts";
-import { Supervisor, type ExitFacts } from "./pm2.ts";
+import {
+	Supervisor,
+	acquireHomeLock,
+	releaseHomeLock,
+	type ExitFacts,
+	type SpawnSpec,
+} from "./supervisor.ts";
 import { findTemplate, scanTemplates, type TemplateInfo } from "./templates.ts";
 import {
 	ensureNodeModulesLink,
@@ -67,24 +78,25 @@ import {
 	writeConfig,
 } from "./config.ts";
 import {
-	TASK_GRACE_MIN_MS,
+	catchupWindowFor,
 	computeNextFire,
-	loadLegacyRecipes,
 	loadProcesses,
+	loadPrograms,
 	loadTasks,
-	removeLegacyFile,
-	saveProcesses,
-	saveTasks,
-	taskGraceFor,
-	type ProcessDef,
-	type TaskDef,
+	migrateLegacy,
+	previewRuns,
+	savePrograms,
+	validateProgram,
+	type ProgramDef,
+	type ProgramSpawn,
 } from "./stores.ts";
+import { RunStore, deriveStatus, type RunRecord, type RunState } from "./runs.ts";
 import { handleRest } from "./rest.ts";
 import { createMount } from "./federate.ts";
 import type { FederationHost } from "./federate.ts";
 
 export interface SwarmServerOptions {
-	/** The daemon's home — where config.json, processes.json, tasks.json,
+	/** The daemon's home — where config.json, programs.json, runs/,
 	 *  templates/ and sessions/ live. Default: $SWARM_HOME or ~/.sanity/swarm. */
 	home?: string;
 	addr?: string;
@@ -99,11 +111,14 @@ export interface SwarmServerOptions {
 	/** Where the daemon scans for templates (spawnable workers). */
 	templatesDir?: string;
 	/** Legacy fleet.json path — read ONCE at boot for migration, then deleted.
-	 *  processes.json + tasks.json are the only memory after that. */
+	 *  programs.json is the only memory after that. */
 	manifestPath?: string;
-	/** Override the processes.json path (tests). */
+	/** Override the programs.json path (tests). */
+	programsPath?: string;
+	/** Legacy overrides for migration: processes.json/tasks.json are read at
+	 *  boot ONLY when programs.json is absent. Kept, never deleted silently. */
 	processesPath?: string;
-	/** Override the tasks.json path (tests). */
+	/** Legacy override for migration (see processesPath). */
 	tasksPath?: string;
 	onPort?: (port: number) => void;
 }
@@ -124,15 +139,15 @@ interface Connection {
  *  input/control/drop through this — the remote's tokens decide. */
 export type MirrorForward = (frame: Record<string, unknown>) => void;
 
-/** Agents only: whoever joined. No pid, no spawn flag — a process/task
- *  question is a category error here (ask processes/tasks, not agents). */
+/** Agents only: whoever joined. No pid, no spawn flag — a program/run
+ *  question is a category error here (ask programs/runs, not agents). */
 interface RegistryEntry {
 	sessionId: string;
 	agentId: string;
 	description?: string;
 	mode: SwarmRole;
 	persistent: boolean;
-	/** Backlink: process name / task fire id / spawn label (absent = wild). */
+	/** Backlink: run id echoed from SWARM_SPAWN_ID (absent = wild). */
 	parent?: string;
 	/** Always set — the room this agent lives in (default "global"). */
 	room: string;
@@ -170,8 +185,21 @@ const RECENT_LIMIT = 100;
 /** A queued prompt dies of loneliness after this long (worker never came back). */
 const PROMPT_TIMEOUT_MS = 60_000;
 
-/** The task clock period — due `every`/`at` tasks fire on this beat. */
-const TASK_TICK_MS = 60_000;
+/** The program clock period — due schedules fire on this beat. Sub-minute
+ *  precision: 1s. NOTE: setInterval drifts under load — the clock is a
+ *  courtesy, never a contract; every slot is claimed before the fork so a
+ *  late beat fires late (inside the catch-up window) instead of twice. */
+const TICK_MS = 1_000;
+
+/** Crash-loop guard: this many dirty deaths inside the window stops the program. */
+const CRASH_LOOP_DEATHS = 5;
+const CRASH_LOOP_WINDOW_MS = 60_000;
+
+/** Cap for program_logs concatenation — enough to diagnose, too small to matter. */
+const PROGRAM_LOGS_MAX = 64 * 1024;
+
+/** Default SIGTERM grace before SIGKILL (when the program sets no killGraceMs). */
+const DEFAULT_KILL_GRACE_MS = 5_000;
 
 /** What each role may do. The daemon enforces; the client's tools are convenience. */
 const PERMS: Record<SwarmRole, Set<string>> = {
@@ -207,29 +235,31 @@ const PERMS: Record<SwarmRole, Set<string>> = {
 		"control",
 	// drop = server-side removal of ONE agent (close socket + delete entry)
 	"drop",
-		"proc_start",
-		"proc_save",
-		"proc_stop",
-		"proc_remove",
-		"proc_set_autorestart",
-		"proc_restart",
-		"proc_list",
-		"proc_get",
-		"task_define",
-		"task_fire",
-		"task_trigger",
-		"task_pause",
-		"task_resume",
-		"task_remove",
-		"task_list",
-		"task_get",
+		"program_define",
+		"program_patch",
+		"program_launch",
+		"program_remove",
+		"program_list",
+		"program_get",
+		"program_preview",
+		"program_logs",
+		"run_exec",
+		"run_get",
+		"run_list",
+		"run_logs",
+		"run_wait",
+		"run_kill",
+		"run_signal",
+		"run_save",
+		"run_prune",
+		"run_restart",
 		"broadcast",
 	]),
 };
 
 // ---------------------------------------------------------------------------
 // THE API — one core, many surfaces. WS frames, REST routes and the CLI all
-// speak exactly this. Sync by design: prompts for (re)starts and fires are
+// speak exactly this. Sync by design: prompts for launches and fires are
 // QUEUED and delivered on register, never awaited mid-frame. The daemon is
 // the only one who knows when a worker (re)registers — so prompt orchestration
 // lives here.
@@ -250,57 +280,100 @@ export interface AgentApi {
 	drop(sessionId: string, under?: string): { ok: boolean; sessionId: string };
 }
 
-export interface ProcessApi {
-	list(): ProcessDef[];
-	get(name: string): ProcessDef | null;
-	/** Remember (creating when missing) + fork NOW. Async: connects first, then forks. */
-	start(
-		name: string,
-		opts?: { file?: string; from?: string; autorestart?: boolean; prompt?: string },
-	): Promise<{ name: string; sessionId: string; pid?: number } | null>;
-	/** Remember without forking (create or update the definition). */
-	save(
-		name: string,
-		opts?: { file?: string; from?: string; autorestart?: boolean },
-	): ProcessDef | null;
-	/** Murder the pid. Desired state → stopped. The agent socket is untouched. */
-	stop(name: string): { ok: boolean; name: string };
-	/** Stop + forget the definition. */
-	remove(name: string): { ok: boolean; name: string };
-	/** Flip the autorestart policy (PM2 owns enforcement). */
-	setAutorestart(name: string, autorestart: boolean): { ok: boolean; name: string };
-	/** Fresh fork under the same name; optional prompt delivered on re-register. Async: stop, then refork. */
-	restart(name: string, opts?: { prompt?: string }): Promise<{ ok: boolean; name: string; sessionId?: string; pid?: number }>;
+/** One fork's observable truth. No tree/rss/cpu: liveness is best-effort
+ *  (process.kill(pid, 0)) and child-process tracking without ps is refused —
+ *  deferred, documented, never faked. */
+export interface RunView {
+	id: string;
+	name: string;
+	program?: string;
+	kind: "service" | "job";
+	state: RunState;
+	pid?: number;
+	cwd?: string;
+	spawn: ProgramSpawn;
+	trigger: RunRecord["trigger"];
+	startedAt: number;
+	endedAt?: number;
+	uptimeMs: number;
+	exit?: RunRecord["exit"];
+	logPath: string;
+	agents: string[];
+	lastEvent?: string;
 }
 
-export interface TaskApi {
-	list(): TaskDef[];
-	get(name: string): TaskDef | null;
-	/** Create or replace a definition (schedule recomputed, history preserved). */
-	define(opts: {
-		name: string;
-		file?: string;
-		from?: string;
-		fire: "every" | "at" | "manual";
-		everyMs?: number;
-		at?: number;
-	}): TaskDef | null;
-	/** Fork once through the same fork path; stamps `task:<name>#<n>` parent. Async: connects first, then forks. */
-	fire(name: string, opts?: { prompt?: string }): Promise<{ name: string; run: number; sessionId: string; pid?: number } | null>;
-	/** Manual run on the paused-immune path: forks even when paused, schedule
-	 *  untouched (definition's nextFire/at never move). Transient context is
-	 *  delivered as the fork's prompt, never stored. At-most-once: a second
-	 *  concurrent trigger while a claim is in flight returns busy instead of firing. */
-	trigger(name: string, opts?: { context?: string; prompt?: string }): Promise<{ name: string; run: number; sessionId: string; pid?: number } | { busy: true; name: string } | null>;
-	pause(name: string, paused?: boolean): { ok: boolean; name: string };
-	resume(name: string): { ok: boolean; name: string };
+/** A program definition plus its live runs, recent history, and next fires. */
+export interface ProgramView {
+	def: ProgramDef;
+	live: RunView[];
+	history: RunRecord[];
+	preview: number[];
+}
+
+/** A fresh fork: ledger entry + supervisor child. waitMs callers may also get
+ *  the settled record (caller patience, never run lifetime). */
+export interface LaunchResult {
+	runId: string;
+	name: string;
+	sessionId: string;
+	pid?: number;
+	settled?: RunRecord;
+}
+
+export interface ProgramApi {
+	list(): ProgramDef[];
+	get(name: string): ProgramView | null;
+	/** Create or replace a definition (fire identity recomputed, counters and
+	 *  history preserved). Rejects with {error} reasons — never bare null. */
+	define(opts: { name: string } & Partial<ProgramFields>): ProgramDef | { error: string[] };
+	/** Promotion = patch: merge over the def, validate the merged def. */
+	patch(name: string, patch: Partial<ProgramFields>): ProgramDef | { error: string[] } | null;
+	/** Manual run — forks now, schedule untouched (nextFire/lastSlot never
+	 *  move). At-most-once while a claim for the program is in flight (busy). */
+	launch(
+		name: string,
+		opts?: { context?: string; prompt?: string; waitMs?: number },
+	): Promise<LaunchResult | { busy: true; name: string } | { error: string[] } | null>;
+	/** Forget the definition — in-flight runs finish, then settle as orphans. */
 	remove(name: string): { ok: boolean; name: string };
+	/** Next-N fire times without forking. */
+	preview(name: string, n?: number): { name: string; fires: number[] } | null;
+	/** Concatenated stdout tails across history (newest last, capped). */
+	logs(name: string, tailBytes?: number): { name: string; text: string } | null;
+}
+
+export interface RunApi {
+	/** Always creates a run (orphan — no program). waitMs is caller patience. */
+	exec(opts: {
+		spawn: ProgramSpawnFrame;
+		waitMs?: number;
+		timeoutMs?: number;
+		name?: string;
+		context?: string;
+	}): Promise<LaunchResult>;
+	get(id: string): RunView | null;
+	list(filter?: { program?: string; state?: string; limit?: number }): RunView[];
+	logs(
+		id: string,
+		opts?: { stream?: "stdout" | "stderr" | "both"; tailBytes?: number; offset?: number },
+	): { text: string; nextOffset: number } | null;
+	/** Resolve when the run turns terminal (or `match` appears). Rejects on timeout. */
+	wait(id: string, opts?: { match?: string; timeoutMs?: number }): Promise<RunRecord>;
+	/** Graceful stop (SIGTERM, wait grace, SIGKILL). force = SIGKILL now. */
+	kill(id: string, opts?: { graceMs?: number; force?: boolean }): { ok: boolean; id: string };
+	/** Best-effort signal to the run's pid. Null = unknown run. */
+	signal(id: string, signal: string): { ok: boolean; id: string } | null;
+	/** Promote an orphan run into a remembered program. */
+	save(runId: string, name: string, kind?: "service" | "job"): ProgramDef | { error: string[] } | null;
+	prune(olderThanMs?: number, keep?: number): string[];
+	/** Same spawn, new run. */
+	restart(runId: string): Promise<LaunchResult | null>;
 }
 
 export interface FleetApi {
 	agents: AgentApi;
-	processes: ProcessApi;
-	tasks: TaskApi;
+	programs: ProgramApi;
+	runs: RunApi;
 	history(under?: string): AgentInfo[];
 	templates(): TemplateInfo[];
 	/** The recent-events ring of one agent (lifecycle payloads only). */
@@ -342,9 +415,9 @@ export interface SwarmServer {
 	readonly port: number;
 	start(): Promise<void>;
 	stop(): Promise<void>;
-	/** Kill the scoped PM2 daemon itself (releases sockets/pids). The
-	 *  `serve` shutdown path calls this after stop(); tests share one
-	 *  process and must NOT call it (they only disconnect). */
+	/** Kill the scoped supervisor (releases sockets/pids). The `serve`
+	 *  shutdown path calls this after stop(); tests sharing one process
+	 *  must NOT call it (they only disconnect). */
 	killDaemon(): Promise<void>;
 	/** THE core — the same ops REST and the CLI speak. Embed away. */
 	api: FleetApi;
@@ -353,11 +426,12 @@ export interface SwarmServer {
 	/** History — every agent ever seen (resumable discovery). */
 	history(): AgentInfo[];
 	templates(): TemplateInfo[];
-	/** Fire due `every`/`at` tasks now (the 60s clock calls this; tests call it directly). */
-	tickTasks(now?: number): number;
-	/** Test-only: mutate a task def in place (overdue setup without a redefine).
-	 *  The daemon never calls this — only tests forcing nextFire into the past. */
-	pokeTask(name: string, patch: Partial<TaskDef>): boolean;
+	/** Fire due schedules now (the 1s clock calls this; tests call it directly). */
+	tickPrograms(now?: number, tickMs?: number): number;
+	/** Test-only: mutate a program def in place (overdue setup without a
+	 *  redefine). The daemon never calls this — only tests forcing nextFire
+	 *  into the past. */
+	pokeProgram(name: string, patch: Partial<ProgramDef>): boolean;
 	/** Dial another daemon and mirror its fleet under a room subtree.
 	 *  Requires a declared name (hermits can't federate). Fire-and-forget:
 	 *  the mount connects, retries, and follows the remote's truth. */
@@ -380,8 +454,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	const layout = homeLayout(home);
 	const templatesDir = opts.templatesDir ?? layout.templatesDir;
 	const sessionsDir = layout.sessionsDir;
-	const processesPath = opts.processesPath ?? layout.processesPath;
-	const tasksPath = opts.tasksPath ?? layout.tasksPath;
+	const programsPath = opts.programsPath ?? join(home, "programs.json");
+	const legacyProcessesPath = opts.processesPath ?? layout.processesPath;
+	const legacyTasksPath = opts.tasksPath ?? layout.tasksPath;
 	const manifestPath = opts.manifestPath ?? layout.manifestPath;
 
 	const bootedAt = Date.now();
@@ -395,146 +470,70 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	const mountNames = new Set<string>();
 	const connections = new Set<Connection>();
 
-	// ---- the only memory: definition files, loaded once, written through ----
-	let processes = loadProcesses(processesPath);
-	let tasks = loadTasks(tasksPath);
-	const persistProcesses = (): void => saveProcesses(processesPath, [...processes.values()]);
-	const persistTasks = (): void => saveTasks(tasksPath, [...tasks.values()]);
+	// ---- the only memory: programs.json, loaded once, written through ----
+	let programs = loadPrograms(programsPath);
+	const persistPrograms = (): void => savePrograms(programsPath, [...programs.values()]);
 
-	/** Migrate fleet.json ONCE (pre-split recipes → remembered processes), then delete it. */
-	const migrateLegacyFleet = (): void => {
-		const recipes = loadLegacyRecipes(manifestPath);
-		if (recipes.length === 0) {
-			// still delete a present-but-empty/known file so the legacy is gone
-			removeLegacyFile(manifestPath);
-			return;
-		}
-		for (const r of recipes) {
-			if (processes.has(r.sessionId)) continue;
-			const now = Date.now();
-			processes.set(r.sessionId, {
-				name: r.sessionId,
-				from: r.template,
-				autorestart: false,
-				status: "running",
-				starts: 0,
-				createdAt: now,
-				updatedAt: now,
-			});
-		}
-		persistProcesses();
-		removeLegacyFile(manifestPath);
+	/** The run ledger — every fork leaves exactly one run. */
+	const runStore = new RunStore({ home });
+	/** Live supervisor children: runId → owning program + label. */
+	const liveRuns = new Map<string, { program?: string; label: string }>();
+	/** In-flight unconfirmed forks per program (memory-only; the durable
+	 *  claim is pendingClaim on the def). */
+	const firing = new Set<string>();
+	/** Open log streams per live run — ended when the run settles. */
+	interface RunStreams {
+		stdout: Writable;
+		stderr: Writable;
+	}
+	const streams = new Map<string, RunStreams>();
+	/** Per-run timeout timers — cleared when the run settles. */
+	const timers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** Retry/respawn timers — tracked so stop() can cancel them. */
+	const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+	/** Dirty-death timestamps per program — the crash-loop guard's memory. */
+	const deathLog = new Map<string, number[]>();
+	/** Respawn counts per program — enforces restart.maxRestarts. */
+	const respawnCount = new Map<string, number>();
+	/** Buffered overlap slots per program (buffer1 = max 1, bufferAll = unbounded). */
+	const buffered = new Map<string, number[]>();
+
+	/** Tracked one-shot timer: stop() cancels everything pending. */
+	const later = (ms: number, fn: () => void): void => {
+		const timer = setTimeout(() => {
+			pendingTimers.delete(timer);
+			fn();
+		}, Math.max(0, ms));
+		timer.unref?.();
+		pendingTimers.add(timer);
 	};
 
-	/** What the daemon does when a supervised child dies — the stores are the
-	 *  memory, PM2 is the muscle. autorestart=true is ALREADY handled by PM2
-	 *  (it restarts with backoff and the definition stays running); here we
-	 *  only record the death when the child is staying dead. */
-	const onChildExit = (label: string, facts: ExitFacts): void => {
-		if (label.startsWith("proc:")) {
-			const name = label.slice("proc:".length);
-			const def = processes.get(name);
-			if (!def) return;
-			// (a) Stale exits never poison the new life: a death from an OLD
-			// life can arrive after stop→start. When the def wants running,
-			// verify liveness before believing the death — a live pid means
-			// the exit is stale. Clean stale exits are ignored; dirty ones
-			// still record facts (diagnostic) without flipping to stopped.
-			if (def.status === "running") {
-				void supervisor.pidOf(label).then((pid) => {
-					const cur = processes.get(name);
-					if (!cur || cur.status !== "running") return;
-					if (pid !== undefined) {
-						if (facts.code !== 0 && facts.code !== null) {
-							cur.lastExit = { ...facts };
-							cur.updatedAt = Date.now();
-							persistProcesses();
-						}
-						return;
-					}
-					cur.pid = undefined;
-					cur.lastExit = { ...facts };
-					cur.status = "stopped";
-					cur.updatedAt = Date.now();
-					persistProcesses();
-				}, () => {
-					// liveness check itself failed (daemon gone mid-shutdown?) —
-					// believe the death: a missed genuine death strands the def
-					// in "running" forever, worse than a stale flip.
-					const cur = processes.get(name);
-					if (!cur || cur.status !== "running") return;
-					cur.pid = undefined;
-					cur.lastExit = { ...facts };
-					cur.status = "stopped";
-					cur.updatedAt = Date.now();
-					persistProcesses();
-				});
-				return;
+	const closeRunStreams = (runId: string): void => {
+		const s = streams.get(runId);
+		if (!s) return;
+		streams.delete(runId);
+		for (const st of [s.stdout, s.stderr]) {
+			try {
+				st.end();
+			} catch {
+				/* caller-owned bytes — never crash the daemon */
 			}
-			def.pid = undefined;
-			def.lastExit = { ...facts };
-			def.updatedAt = Date.now();
-			persistProcesses();
-			return;
-		}
-		if (label.startsWith("task:")) {
-			// `task:<name>#<n>` — record the outcome on the definition, then
-			// drop the PM2 entry (fire-and-die: no entry leak).
-			const rest = label.slice("task:".length);
-			const hash = rest.lastIndexOf("#");
-			const name = hash >= 0 ? rest.slice(0, hash) : rest;
-			const def = tasks.get(name);
-			if (!def) {
-				void supervisor.forget(label);
-				return;
-			}
-			def.lastResult = { at: facts.at, code: facts.code, signal: facts.signal };
-			def.updatedAt = Date.now();
-			persistTasks();
-			void supervisor.forget(label);
 		}
 	};
-
-	const supervisor = new Supervisor({
-		homeDir: home,
-		onExit: onChildExit,
-		onRestart: (label) => {
-			// PM2 restarted the child itself (autorestart=true) — the new life
-			// owns the label. Count it like a refork and persist.
-			if (!label.startsWith("proc:")) return;
-			const def = processes.get(label.slice("proc:".length));
-			if (!def) return;
-			def.starts++;
-			def.updatedAt = Date.now();
-			persistProcesses();
-		},
-	});
-
-	/** The visibility rule. A room is a path prefix; an ancestor sees its
-	 *  descendants; sideways and upward: invisible. */
-	const visible = (mount: string, room: string): boolean =>
-		room === mount || room.startsWith(`${mount}/`);
-
-	/** Target resolution — bare sessionId (index) or full address (contains "/").
-	 *  Full address wins when it names a real entry; else fall back to the index. */
-	const resolve = (target: string): RegistryEntry | null => {
-		if (target.includes("/")) {
-			const hit = registry.get(target);
-			if (hit) return hit;
-		}
-		const addr = bySessionId.get(target);
-		return addr ? (registry.get(addr) ?? null) : null;
-	};
-
 	/** Prompts waiting for a (re)register — the daemon owns that moment. */
 	const pendingPrompts = new Map<
 		string,
 		{ body: Record<string, unknown>; timer: ReturnType<typeof setTimeout> }
 	>();
-	const queuePrompt = (sessionId: string, prompt: string): void => {
+	const queuePrompt = (sessionId: string, prompt: string, timeoutMs = PROMPT_TIMEOUT_MS): void => {
 		const timer = setTimeout(
-			() => pendingPrompts.delete(sessionId),
-			PROMPT_TIMEOUT_MS,
+			() => {
+				pendingPrompts.delete(sessionId);
+				console.warn(
+					`[swarm] prompt for ${sessionId} expired after ${timeoutMs}ms — worker never registered (never silent)`,
+				);
+			},
+			timeoutMs,
 		);
 		timer.unref?.();
 		pendingPrompts.set(sessionId, {
@@ -549,7 +548,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 	let clockTimer: ReturnType<typeof setInterval> | undefined;
 
 	/** The env every forked child inherits from the daemon — where it lives + who to join.
-	 *  SWARM_SPAWN_ID (the parent backlink) is stamped per-fork by the supervisor. */
+	 *  SWARM_SPAWN_ID (the parent backlink = run id) is stamped per-fork by forkRun. */
 	const spawnEnv = (): Record<string, string> => ({
 		SWARM_HOME: home,
 		SWARM_SESSIONS_DIR: sessionsDir,
@@ -694,10 +693,25 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			lastSeen: Date.now(),
 			conn,
 		};
-		registry.set(key, entry);
-		bySessionId.set(frame.sessionId, key);
-		const seen = history.get(key);
-		history.set(key, { ...seen, ...entry, status: "online" });
+	registry.set(key, entry);
+	bySessionId.set(frame.sessionId, key);
+	const seen = history.get(key);
+	history.set(key, { ...seen, ...entry, status: "online" });
+	// run backlink: a worker forked with SWARM_SPAWN_ID=run:<id> reports home —
+	// the run ledger learns its agent best-effort (never breaks register).
+	const spawnIdStr = typeof frame.spawnId === "string" ? frame.spawnId : "";
+	const backlinkRunId = spawnIdStr.startsWith("run:")
+		? spawnIdStr.slice(4)
+		: spawnIdStr.startsWith("run-")
+			? spawnIdStr
+			: "";
+	if (backlinkRunId) {
+		try {
+			runStore.attachAgent(backlinkRunId, frame.sessionId);
+		} catch {
+			/* ledger torn or unknown run — register still wins */
+		}
+	}
 
 		send(conn, {
 			op: "welcome",
@@ -706,8 +720,8 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			registry: snapshot(conn.room),
 		});
 
-		// a queued prompt (process restart / task fire with prompt) is delivered
-		// the moment the worker is back among the living
+		// a queued prompt (launch/exec with context) is delivered the moment
+		// the worker is back among the living
 		const queued = pendingPrompts.get(frame.sessionId);
 		if (queued) {
 			pendingPrompts.delete(frame.sessionId);
@@ -774,82 +788,390 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		if (entry) fanOut(entry, frame.event, frame.payload, conn);
 	};
 
-	/** Resolve a process/task source to an agent file. `file` wins when given;
-	 *  `from` is a template id/file. Null = unknown (the caller 404s). */
-	const resolveAgentFile = (
-		file?: string,
+	/** Resolve a program spawn to something forkable. `file` wins when given
+	 *  (must exist); `cmd` needs no resolution; `from` is a template id/file.
+	 *  Null = unknown (the caller 404s). */
+	const resolveSpawn = (
+		spawn?: ProgramSpawnFrame,
 		from?: string,
-	): { path: string; env?: Record<string, string> } | null => {
-		if (typeof file === "string" && file) {
-			return existsSync(file) ? { path: file } : null;
+	): { file?: string; cmd?: string; args?: string[]; cwd?: string; templateEnv?: Record<string, string> } | null => {
+		if (spawn && "file" in spawn && typeof spawn.file === "string" && spawn.file) {
+			return existsSync(spawn.file) ? { file: spawn.file } : null;
+		}
+		if (spawn && "cmd" in spawn && typeof spawn.cmd === "string" && spawn.cmd) {
+			return { cmd: spawn.cmd, args: spawn.args, cwd: spawn.cwd };
 		}
 		if (typeof from === "string" && from) {
 			const t = findTemplate(templatesDir, from);
-			return t ? { path: t.path, env: t.env } : null;
+			return t ? { file: t.path, templateEnv: t.env } : null;
 		}
 		return null;
 	};
 
-	/** THE one fork path — process start AND task fire share it. Deferred: the
-	 *  caller enqueues this promise — the api stays sync, the fork lands async. */
-	const forkLabeled = (
-		parentLabel: string,
-		internalLabel: string,
-		agentFile: string,
-		templateEnv?: Record<string, string>,
-		prompt?: string,
-		autorestart = false,
-	): Promise<{ sessionId: string; pid?: number }> =>
-		supervisor
-			.fork(agentFile, {
-				label: internalLabel,
-				autorestart,
-				templateEnv,
-				extraEnv: { ...spawnEnv(), SWARM_SPAWN_ID: parentLabel },
-			})
-			.then((r) => {
-				if (prompt) queuePrompt(r.sessionId, prompt);
-				return r;
-			});
+	/** THE one fork path — services, schedules, manual launches and orphan
+	 *  execs all fork here. Sync: the ledger entry is registered, streams are
+	 *  opened, and the supervisor child is born before this returns. */
+	const forkRun = (args: {
+		program?: string;
+		spawn: { file?: string; cmd?: string; args?: string[]; cwd?: string; templateEnv?: Record<string, string> };
+		kind: "service" | "job";
+		origin: RunRecord["trigger"]["origin"];
+		slot?: number;
+		attempt?: number;
+		prompt?: string;
+		promptTimeoutMs?: number;
+		timeoutMs?: number;
+	}): { runId: string; name: string; sessionId: string; pid?: number } => {
+		const prog = args.program ? programs.get(args.program) : undefined;
+		const spawn: ProgramSpawn = args.spawn.file
+			? { file: args.spawn.file }
+			: { cmd: args.spawn.cmd as string, args: args.spawn.args, cwd: args.spawn.cwd };
+		const record = runStore.register({
+			program: args.program,
+			kind: args.kind,
+			spawn,
+			trigger: { origin: args.origin, slot: args.slot, attempt: args.attempt ?? 0 },
+			cwd: args.spawn.cwd,
+		});
+		const paths = runStore.streamPaths(record.id);
+		const stdout = createWriteStream(paths.stdout, { flags: "a" });
+		const stderr = createWriteStream(paths.stderr, { flags: "a" });
+		streams.set(record.id, { stdout, stderr });
+		const base = {
+			label: `run:${record.id}`,
+			// NEVER at supervisor level — the daemon owns restart policy
+			// (kill run + new run law). Supervisor autorestart never fires.
+			autorestart: false as const,
+			templateEnv: args.spawn.templateEnv,
+			extraEnv: { ...spawnEnv(), SWARM_SPAWN_ID: record.id },
+		};
+		const spec: SpawnSpec = args.spawn.file
+			? { ...base, file: args.spawn.file }
+			: { ...base, cmd: args.spawn.cmd as string, args: args.spawn.args, cwd: args.spawn.cwd };
+		let forked: { sessionId: string; pid?: number };
+		try {
+			forked = supervisor.fork(spec, { stdout, stderr });
+		} catch (err) {
+			closeRunStreams(record.id);
+			try {
+				runStore.settle(
+					record.id,
+					{ code: null, signal: null, at: Date.now(), reason: "fork failed" },
+					"failed",
+				);
+			} catch {
+				/* ledger torn — never guess */
+			}
+			throw err;
+		}
+		if (forked.pid !== undefined) {
+			try {
+				runStore.setPid(record.id, forked.pid);
+			} catch {
+				/* ledger torn — the run still lives */
+			}
+		}
+		liveRuns.set(record.id, { program: args.program, label: `run:${record.id}` });
+		if (args.prompt) {
+			queuePrompt(
+				forked.sessionId,
+				args.prompt,
+				args.promptTimeoutMs ?? prog?.promptTimeoutMs ?? PROMPT_TIMEOUT_MS,
+			);
+		}
+		if (typeof args.timeoutMs === "number" && args.timeoutMs >= 0) {
+			const timer = setTimeout(() => onRunTimeout(record.id), args.timeoutMs);
+			timer.unref?.();
+			timers.set(record.id, timer);
+		}
+		return { runId: record.id, name: record.name, sessionId: forked.sessionId, pid: forked.pid };
+	};
 
-	/** Durable claim — the heart of exactly-once. Bump runs, advance nextFire
-	 *  (or consume the one-shot), stamp pendingFire, and PERSIST — all before
-	 *  the fork. `fireClaimed` returns the claim; `fireSettled` clears
-	 *  pendingFire after the fork lands (or converts a failed fork into a
-	 *  logged skip). The claim's slot is the fire identity: crashes between
-	 *  claim and fork leave pendingFire for boot to account as a logged skip. */
-	const fireClaimed = (
-		def: TaskDef,
+	/** Fork a new run from a program's CURRENT definition (respawn/retry/chain/
+	 *  tick/launch all land here). Throws when the spawn is unresolvable. */
+	const forkProgramRun = (
+		prog: ProgramDef,
+		origin: RunRecord["trigger"]["origin"],
+		opts?: { slot?: number; attempt?: number; prompt?: string; timeoutMs?: number },
+	): { runId: string; name: string; sessionId: string; pid?: number } => {
+		const target = resolveSpawn(prog.spawn, prog.from);
+		if (!target) throw new Error(`unresolvable spawn for program: ${prog.name}`);
+		return forkRun({
+			program: prog.name,
+			spawn: target,
+			kind: prog.kind,
+			origin,
+			slot: opts?.slot,
+			attempt: opts?.attempt,
+			prompt: opts?.prompt,
+			promptTimeoutMs: prog.promptTimeoutMs,
+			timeoutMs: opts?.timeoutMs ?? prog.timeoutMs,
+		});
+	};
+
+	/** Launch a chained program (onFailTrigger/onSuccessTrigger). Fire-and-
+	 *  forget by design: a missing chain target is a warn, never a crash. */
+	const chainLaunch = (name: string, via: string): void => {
+		const prog = programs.get(name);
+		if (!prog) {
+			console.warn(`[swarm] chained program ${name} (via ${via}) unknown — logged, never fired`);
+			return;
+		}
+		try {
+			forkProgramRun(prog, "trigger");
+		} catch (err) {
+			console.warn(
+				`[swarm] chained program ${name} (via ${via}) fork failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	};
+
+	/** A run outlived its timeoutMs: stop it, settle as timedOut. */
+	const onRunTimeout = (runId: string): void => {
+		timers.delete(runId);
+		const live = liveRuns.get(runId);
+		if (!live) return;
+		let record: RunRecord;
+		try {
+			record = runStore.get(runId);
+		} catch {
+			liveRuns.delete(runId);
+			return;
+		}
+		if (record.exit != null || record.endedAt != null) {
+			liveRuns.delete(runId);
+			return;
+		}
+		const prog = live.program ? programs.get(live.program) : undefined;
+		if (prog) {
+			prog.counters.timeoutKills++;
+			prog.updatedAt = Date.now();
+			persistPrograms();
+		}
+		liveRuns.delete(runId);
+		closeRunStreams(runId);
+		void supervisor.stop(live.label, prog?.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+		try {
+			runStore.settle(
+				runId,
+				{ code: null, signal: "SIGTERM", at: Date.now(), reason: "timeout" },
+				"timedOut",
+			);
+		} catch {
+			/* ledger torn — never guess */
+		}
+	};
+
+	/** What the daemon does when a supervised child dies: settle the run, then
+	 *  run the policy engine. Intentional stops (kill/timeout paths) settle
+	 *  FIRST and record the death with supervisor.stop (no hook) — so every
+	 *  death landing here is natural. Supervisor-level autorestart is always
+	 *  false, so this hook fires for every final death; the onRestart hook
+	 *  never fires (log? no — it can't). */
+	const onChildExit = (label: string, facts: ExitFacts): void => {
+		if (!label.startsWith("run:")) return;
+		const runId = label.slice("run:".length);
+		const live = liveRuns.get(runId);
+		liveRuns.delete(runId);
+		const timer = timers.get(runId);
+		if (timer) {
+			clearTimeout(timer);
+			timers.delete(runId);
+		}
+		closeRunStreams(runId);
+		let record: RunRecord;
+		try {
+			record = runStore.get(runId);
+		} catch {
+			return;
+		}
+		// A death from an already-settled run (kill/timeout won the race but
+		// the supervisor still reported): never poison the ledger.
+		if (record.exit != null || record.endedAt != null) return;
+		const at = facts.at ?? Date.now();
+		const dirty = facts.code !== 0 || facts.signal !== null;
+		try {
+			record = runStore.settle(
+				runId,
+				{ code: facts.code, signal: facts.signal, at },
+				dirty ? "failed" : "completed",
+			);
+		} catch {
+			return;
+		}
+		const progName = record.program ?? live?.program;
+		const prog = progName ? programs.get(progName) : undefined;
+		if (!prog) return; // orphan (program removed mid-flight) — settle only
+		const now = Date.now();
+		const attempt = record.trigger.attempt ?? 0;
+
+		// NOTE: the schedule already marched at claim time (fireClaimedSlot set
+		// nextFire BEFORE the fork). No advance here — that would skip a slot.
+
+		// (b) retries: nonzero exit/signal → NEW run, attempt+1, backoff.
+		let rescheduled = false;
+		if (dirty && prog.retries && attempt < prog.retries.attempts) {
+			const backoff = prog.retries.backoffMs ?? 0;
+			console.log(
+				`[swarm] run ${runId} (${prog.name}) failed (code ${String(facts.code)} signal ${String(facts.signal)}) — retry attempt ${attempt + 1} in ${backoff}ms`,
+			);
+			later(backoff, () => {
+				const cur = programs.get(prog.name);
+				if (!cur) return;
+				try {
+					forkProgramRun(cur, "restart", { attempt: attempt + 1 });
+				} catch (err) {
+					console.warn(
+						`[swarm] retry for ${cur.name} fork failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			});
+			rescheduled = true;
+		} else if (!dirty) {
+			respawnCount.delete(prog.name);
+		}
+
+		// pause-on-fail + chained triggers.
+		if (dirty && prog.pauseOnFail) {
+			prog.paused = true;
+			prog.notes = [prog.notes, `paused on failure of run ${runId} at ${new Date(now).toISOString()}`]
+				.filter(Boolean)
+				.join("\n");
+		}
+		if (dirty && prog.onFailTrigger) chainLaunch(prog.onFailTrigger, `${prog.name} failure`);
+		if (!dirty && facts.code === 0 && prog.onSuccessTrigger) {
+			chainLaunch(prog.onSuccessTrigger, `${prog.name} success`);
+		}
+		// NOTE: runFailed/runCompleted has no wire fan-out — programs are not
+		// registry addresses, so there is no program channel to fan out on.
+		// The daemon log above is the listener surface (never silent).
+
+		// (c) restart policy → service respawn (kill run + new run law).
+		const policy = prog.restart?.policy ?? "never";
+		const wantsRespawn = policy === "always" || (policy === "on-failure" && dirty);
+		if (
+			wantsRespawn &&
+			!rescheduled &&
+			(prog.kind === "service" || !prog.schedule || prog.schedule.kind === "manual") &&
+			prog.desired === "running"
+		) {
+			const deaths = [...(deathLog.get(prog.name) ?? []), now].filter(
+				(t) => now - t < CRASH_LOOP_WINDOW_MS,
+			);
+			deathLog.set(prog.name, deaths);
+			if (deaths.length >= CRASH_LOOP_DEATHS) {
+				prog.desired = "stopped";
+				prog.notes = [prog.notes, `crash-loop: ${deaths.length} deaths in 60s — desired=stopped at ${new Date(now).toISOString()}`]
+					.filter(Boolean)
+					.join("\n");
+				console.warn(`[swarm] crash-loop: ${prog.name} stopped after ${deaths.length} deaths in 60s`);
+			} else {
+				const max = prog.restart?.maxRestarts;
+				const count = respawnCount.get(prog.name) ?? 0;
+				if (max != null && count >= max) {
+					console.warn(`[swarm] ${prog.name} hit restart.maxRestarts=${max} — no respawn`);
+				} else {
+					respawnCount.set(prog.name, count + 1);
+					const backoff = prog.restart?.backoffMs ?? 5_000;
+					later(backoff, () => {
+						const cur = programs.get(prog.name);
+						if (!cur || cur.desired !== "running") return;
+						try {
+							forkProgramRun(cur, "restart");
+						} catch (err) {
+							console.warn(
+								`[swarm] respawn for ${cur.name} fork failed: ${err instanceof Error ? err.message : String(err)}`,
+							);
+						}
+					});
+				}
+			}
+		}
+
+		// (e) every mutation above lands on disk.
+		prog.updatedAt = now;
+		persistPrograms();
+	};
+
+	const supervisor = new Supervisor({
+		homeDir: home,
+		onExit: onChildExit,
+		// No onRestart: supervisor autorestart is ALWAYS false, so this never
+		// fires. Restart policy lives in onChildExit (kill run + new run law).
+	});
+
+	/** The visibility rule. A room is a path prefix; an ancestor sees its
+	 *  descendants; sideways and upward: invisible. */
+	const visible = (mount: string, room: string): boolean =>
+		room === mount || room.startsWith(`${mount}/`);
+
+	/** Target resolution — bare sessionId (index) or full address (contains "/").
+	 *  Full address wins when it names a real entry; else fall back to the index. */
+	const resolve = (target: string): RegistryEntry | null => {
+		if (target.includes("/")) {
+			const hit = registry.get(target);
+			if (hit) return hit;
+		}
+		const addr = bySessionId.get(target);
+		return addr ? (registry.get(addr) ?? null) : null;
+	};
+
+	/** Durable claim — the heart of exactly-once. Bump runs, stamp the slot,
+	 *  advance nextFire, set pendingClaim, and PERSIST — all before the fork.
+	 *  The caller forks, then clears pendingClaim (+ persists). The claim's
+	 *  slot is the fire identity: crashes between claim and fork leave
+	 *  pendingClaim for boot to account as a logged skip. */
+	const claimSlot = (
+		prog: ProgramDef,
 		slot: number,
 		now: number,
-		origin: "tick" | "fire" | "trigger",
-	): boolean => {
-		if (def.pendingFire) return false;
-		def.runs++;
-		def.lastFire = now;
-		def.lastSlot = slot;
-		if (def.fire === "every" && def.everyMs) {
-			def.nextFire = slot + def.everyMs;
-		} else {
-			if (def.fire === "at") def.at = undefined;
-			def.nextFire = undefined;
-		}
-		if (origin === "trigger") def.lastTrigger = { at: now, run: def.runs };
-		def.pendingFire = { run: def.runs, slot, claimedAt: now, origin };
-		def.updatedAt = now;
-		persistTasks();
-		return true;
-	};
-	const fireSettled = (
-		def: TaskDef,
-		ok: boolean,
-		reason: string,
+		origin: RunRecord["trigger"]["origin"],
+		runId: string,
 	): void => {
-		const slot = def.pendingFire?.slot ?? def.lastSlot ?? Date.now();
-		def.pendingFire = undefined;
-		if (!ok) def.lastSkipped = { slot, at: Date.now(), reason };
-		def.updatedAt = Date.now();
-		persistTasks();
+		prog.counters.runs++;
+		prog.lastSlot = slot;
+		prog.lastFire = now;
+		const draft: ProgramDef = { ...prog };
+		const next = computeNextFire(draft, now);
+		prog.nextFire = next;
+		if (typeof prog.jitterMs === "number" && prog.jitterMs > 0 && next !== undefined) {
+			const jitter = prog.stableJitter
+				? Math.abs(slot) % Math.floor(prog.jitterMs)
+				: Math.floor(Math.random() * prog.jitterMs);
+			prog.nextFire = next + jitter;
+		}
+		prog.pendingClaim = { run: runId, slot, claimedAt: now, origin };
+		prog.updatedAt = now;
+		persistPrograms();
+	};
+	const clearClaim = (prog: ProgramDef, ok: boolean, reason: string): void => {
+		const slot = prog.pendingClaim?.slot ?? prog.lastSlot ?? Date.now();
+		prog.pendingClaim = undefined;
+		if (!ok) prog.lastSkip = { slot, at: Date.now(), reason };
+		prog.updatedAt = Date.now();
+		persistPrograms();
+	};
+
+	const viewOf = (record: RunRecord): RunView => {
+		const live = liveRuns.has(record.id);
+		return {
+			id: record.id,
+			name: record.name,
+			program: record.program,
+			kind: record.kind,
+			state: deriveStatus(record, live),
+			pid: record.pid,
+			cwd: record.cwd,
+			spawn: record.spawn,
+			trigger: record.trigger,
+			startedAt: record.startedAt,
+			endedAt: record.endedAt,
+			uptimeMs: (record.endedAt ?? Date.now()) - record.startedAt,
+			exit: record.exit,
+			logPath: record.logPath,
+			agents: record.agents,
+			lastEvent: record.lastEvent,
+		};
 	};
 
 	// ---------------------------------------------------------------------------
@@ -889,8 +1211,8 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				}
 				// server-side fact, zero agent cooperation needed: tell it it is
 				// dropped (so the join extension tears down without reconnecting),
-				// close the socket, delete the entry. Wild or forked — the
-				// process itself is untouched; that is processes.stop's job.
+				// close the socket, delete the entry. Wild or forked — the run
+				// itself is untouched; that is runs.kill's job.
 				const key = addressOf(swarmName, e.room, e.sessionId);
 				if (e.conn) {
 					send(e.conn, { op: "drop" });
@@ -903,259 +1225,373 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			},
 		},
 
-		processes: {
+		programs: {
 			list() {
-				return [...processes.values()];
+				return [...programs.values()];
 			},
 
 			get(name) {
-				return processes.get(name) ?? null;
-			},
-
-			async start(name, startOpts = {}) {
-				const def = processes.get(name);
-				// Resolve the candidate source FIRST — before ANY map mutation.
-				// Unknown file/template 404s without poisoning the def.
-				const target = resolveAgentFile(
-					startOpts.file ?? def?.file,
-					startOpts.from ?? def?.from,
-				);
-				if (!target) return null;
-				let cur = def;
-				if (!cur) {
-					const now = Date.now();
-					cur = {
-						name,
-						file: startOpts.file,
-						from: startOpts.from,
-						autorestart: startOpts.autorestart ?? false,
-						status: "stopped",
-						starts: 0,
-						createdAt: now,
-						updatedAt: now,
-					};
-					processes.set(name, cur);
-				} else {
-					if (startOpts.file !== undefined) cur.file = startOpts.file;
-					if (startOpts.from !== undefined) cur.from = startOpts.from;
-					if (startOpts.autorestart !== undefined) cur.autorestart = startOpts.autorestart;
-				}
-				cur.status = "running";
-				cur.starts++;
-				cur.updatedAt = Date.now();
-				persistProcesses();
-				const label = `proc:${name}`;
-				const r = await forkLabeled(name, label, target.path, target.env, startOpts.prompt, cur.autorestart);
-				cur.pid = r.pid;
-				cur.updatedAt = Date.now();
-				persistProcesses();
-				return { name, sessionId: r.sessionId, pid: r.pid };
-			},
-
-			save(name, saveOpts = {}) {
-				let def = processes.get(name);
-				const now = Date.now();
-				if (!def) {
-					def = {
-						name,
-						file: saveOpts.file,
-						from: saveOpts.from,
-						autorestart: saveOpts.autorestart ?? false,
-						status: "stopped",
-						starts: 0,
-						createdAt: now,
-						updatedAt: now,
-					};
-					processes.set(name, def);
-				} else {
-					if (saveOpts.file !== undefined) def.file = saveOpts.file;
-					if (saveOpts.from !== undefined) def.from = saveOpts.from;
-					if (saveOpts.autorestart !== undefined) def.autorestart = saveOpts.autorestart;
-					def.updatedAt = now;
-				}
-				persistProcesses();
-				return { ...def };
-			},
-
-			stop(name) {
-				const def = processes.get(name);
-				if (!def) return { ok: false, name };
-				// murder the label — the agent socket is untouched (it drops itself)
-				supervisor.killSync(`proc:${name}`);
-				def.status = "stopped";
-				def.pid = undefined;
-				def.updatedAt = Date.now();
-				persistProcesses();
-				return { ok: true, name };
-			},
-
-			remove(name) {
-				const def = processes.get(name);
-				if (!def) return { ok: false, name };
-				supervisor.killSync(`proc:${name}`);
-				void supervisor.forget(`proc:${name}`);
-				processes.delete(name);
-				persistProcesses();
-				return { ok: true, name };
-			},
-
-			setAutorestart(name, autorestart) {
-				const def = processes.get(name);
-				if (!def) return { ok: false, name };
-				def.autorestart = autorestart;
-				def.updatedAt = Date.now();
-				persistProcesses();
-				return { ok: true, name };
-			},
-
-			async restart(name, restartOpts = {}) {
-				const def = processes.get(name);
-				if (!def) return { ok: false, name };
-				const target = resolveAgentFile(def.file, def.from);
-				if (!target) return { ok: false, name };
-				const label = `proc:${name}`;
-				await supervisor.kill(label);
-				supervisor.killSync(label);
-				const r = await forkLabeled(name, label, target.path, target.env, restartOpts.prompt, def.autorestart);
-				def.status = "running";
-				def.pid = r.pid;
-				def.starts++;
-				def.updatedAt = Date.now();
-				persistProcesses();
-				return { ok: true, name, sessionId: r.sessionId, pid: r.pid };
-			},
-		},
-
-		tasks: {
-			list() {
-				return [...tasks.values()];
-			},
-
-			get(name) {
-				return tasks.get(name) ?? null;
+				const def = programs.get(name);
+				if (!def) return null;
+				const live = [...liveRuns.keys()]
+					.map((id) => {
+						try {
+							return viewOf(runStore.get(id));
+						} catch {
+							return null;
+						}
+					})
+					.filter((v): v is RunView => !!v && v.program === name);
+				return {
+					def,
+					live,
+					history: runStore.history(name, def.keepRuns ?? 50),
+					preview: previewRuns(def, 3),
+				};
 			},
 
 			define(opts) {
-				const { name, fire } = opts;
-				if (!name) return null;
-				if (fire !== "every" && fire !== "at" && fire !== "manual") return null;
-				if (fire === "every" && !(typeof opts.everyMs === "number" && opts.everyMs > 0)) return null;
-				if (fire === "at" && typeof opts.at !== "number") return null;
+				const { name } = opts;
 				const now = Date.now();
-				const prev = tasks.get(name);
-				const def: TaskDef = {
+				const prev = programs.get(name);
+				const candidate: ProgramDef = {
 					name,
-					file: opts.file ?? prev?.file,
+					kind: opts.kind ?? prev?.kind ?? (opts.schedule ? "job" : "service"),
+					spawn: opts.spawn ?? prev?.spawn ?? (opts.from ? { file: opts.from } : { file: "" }),
 					from: opts.from ?? prev?.from,
-					fire,
-					everyMs: fire === "every" ? opts.everyMs : undefined,
-					at: fire === "at" ? opts.at : undefined,
-					paused: false,
-					runs: prev?.runs ?? 0,
-					lastFire: prev?.lastFire,
-					lastSlot: prev?.lastSlot,
-					lastCatchup: prev?.lastCatchup,
-					lastSkipped: prev?.lastSkipped,
-					lastTrigger: prev?.lastTrigger,
-					lastResult: prev?.lastResult,
-					// (b) Redefine mid-claim must not drop the in-flight claim:
-					// preserve pendingFire so the fire still settles exactly
+					desired: opts.desired ?? prev?.desired ?? "stopped",
+					restart: opts.restart ?? prev?.restart ?? { policy: "never" },
+					schedule: opts.schedule ?? prev?.schedule,
+					paused: opts.paused ?? prev?.paused ?? false,
+					overlap: opts.overlap ?? prev?.overlap,
+					allowN: opts.allowN ?? prev?.allowN,
+					timeoutMs: opts.timeoutMs ?? prev?.timeoutMs,
+					catchupWindowMs: opts.catchupWindowMs ?? prev?.catchupWindowMs,
+					missPolicy: opts.missPolicy ?? prev?.missPolicy,
+					retries: opts.retries ?? prev?.retries,
+					pauseOnFail: opts.pauseOnFail ?? prev?.pauseOnFail,
+					jitterMs: opts.jitterMs ?? prev?.jitterMs,
+					stableJitter: opts.stableJitter ?? prev?.stableJitter,
+					minGapMs: opts.minGapMs ?? prev?.minGapMs,
+					onFailTrigger: opts.onFailTrigger ?? prev?.onFailTrigger,
+					onSuccessTrigger: opts.onSuccessTrigger ?? prev?.onSuccessTrigger,
+					triggerToken: opts.triggerToken ?? prev?.triggerToken,
+					promptTimeoutMs: opts.promptTimeoutMs ?? prev?.promptTimeoutMs,
+					killGraceMs: opts.killGraceMs ?? prev?.killGraceMs,
+					keepRuns: opts.keepRuns ?? prev?.keepRuns,
+					notes: opts.notes ?? prev?.notes,
+					counters: prev?.counters ?? {
+						runs: 0,
+						missedCatchup: 0,
+						overlapSkipped: 0,
+						bufferDropped: 0,
+						timeoutKills: 0,
+					},
+					// Redefine mid-claim must not drop the in-flight claim:
+					// preserve pendingClaim so the fire still settles exactly
 					// once (no double-fire window through redefine).
-					pendingFire: prev?.pendingFire,
+					pendingClaim: prev?.pendingClaim,
+					lastSkip: prev?.lastSkip,
 					createdAt: prev?.createdAt ?? now,
 					updatedAt: now,
 				};
-				def.nextFire = computeNextFire(def, now);
-				tasks.set(name, def);
-				persistTasks();
-				return { ...def };
+				// A program without any spawn source can never fork — reject.
+				const hasSpawn =
+					(candidate.spawn && "file" in candidate.spawn && !!candidate.spawn.file) ||
+					(candidate.spawn && "cmd" in candidate.spawn && !!(candidate.spawn as { cmd?: string }).cmd) ||
+					!!candidate.from;
+				if (!hasSpawn) return { error: ["spawn must set file or cmd (or from template)"] };
+				const v = validateProgram(candidate);
+				if (!v.ok) return { error: v.errors };
+				candidate.nextFire = computeNextFire(candidate, now);
+				programs.set(name, candidate);
+				persistPrograms();
+				return candidate;
 			},
 
-			/** Claim a scheduled slot: runs++ + nextFire advanced + persisted
-			 *  BEFORE the fork. A crash after this point leaves pendingFire,
-			 *  which boot converts into a logged skip — never a silent loss,
-			 *  never a refire. */
-			async fire(name, fireOpts = {}) {
-				const def = tasks.get(name);
+			patch(name, patch) {
+				const def = programs.get(name);
 				if (!def) return null;
-				const target = resolveAgentFile(def.file, def.from);
-				if (!target) return null;
-				// Manual fires on a paused task are refused — use `trigger`.
-				if (def.paused) return null;
-				const now = Date.now();
-				const slot = def.nextFire ?? def.at ?? now;
-				if (!fireClaimed(def, slot, now, "fire")) return null;
-				let r: { sessionId: string; pid?: number };
-				try {
-					const parent = `task:${name}#${def.runs}`;
-					r = await forkLabeled(parent, parent, target.path, target.env, fireOpts.prompt);
-				} catch {
-					fireSettled(def, false, "fire fork failed");
-					return null;
+				const merged: ProgramDef = {
+					...def,
+					...patch,
+					name: def.name,
+					counters: def.counters,
+					createdAt: def.createdAt,
+					updatedAt: Date.now(),
+				} as ProgramDef;
+				const v = validateProgram(merged);
+				if (!v.ok) return { error: v.errors };
+				if (patch.schedule !== undefined) {
+					merged.nextFire = computeNextFire(merged, Date.now());
 				}
-				fireSettled(def, true, "");
-				return { name, run: def.runs, sessionId: r.sessionId, pid: r.pid };
+				programs.set(name, merged);
+				persistPrograms();
+				return merged;
 			},
 
-			/** Paused-immune manual run: claim runs++ + persist BEFORE the fork
-			 *  (schedule fields' nextFire/at never move), at-most-once via pendingFire. */
-			async trigger(name, triggerOpts = {}) {
-				const def = tasks.get(name);
+			async launch(name, launchOpts = {}) {
+				const def = programs.get(name);
 				if (!def) return null;
-				const target = resolveAgentFile(def.file, def.from);
-				if (!target) return null;
-				if (def.pendingFire) return { busy: true, name };
-				const now = Date.now();
-				// Trigger rides the claim so the fire identity advances uniformly —
-				// but the schedule is untouched, so restore the slot math after.
-				const keepNext = def.nextFire;
-				const keepAt = def.at;
-				if (!fireClaimed(def, now, now, "trigger")) return { busy: true, name };
-				def.nextFire = keepNext;
-				def.at = keepAt;
-				persistTasks();
-				let r: { sessionId: string; pid?: number };
+				if (firing.has(name)) return { busy: true as const, name };
+				firing.add(name);
 				try {
-					const parent = `task:${name}#${def.runs}`;
-					r = await forkLabeled(
-						parent,
-						parent,
-						target.path,
-						target.env,
-						triggerOpts.context ?? triggerOpts.prompt,
-					);
+					// launch forks now, schedule untouched (no claim to clear —
+					// the tick path owns pendingClaim).
+					const forked = forkProgramRun(def, "launch", {
+						prompt: launchOpts.context ?? launchOpts.prompt,
+					});
+					if (launchOpts.waitMs !== undefined) {
+						try {
+							const settled = await runStore.wait(forked.runId, {
+								timeoutMs: launchOpts.waitMs,
+							});
+							return { ...forked, settled };
+						} catch {
+							return { ...forked };
+						}
+					}
+					return { ...forked };
 				} catch {
-					fireSettled(def, false, "trigger fork failed");
-					return null;
+					return { error: [`unknown program / unresolvable spawn: ${name}`] };
+				} finally {
+					firing.delete(name);
 				}
-				fireSettled(def, true, "");
-				return { name, run: def.runs, sessionId: r.sessionId, pid: r.pid };
-			},
-
-			pause(name, paused = true) {
-				const def = tasks.get(name);
-				if (!def) return { ok: false, name };
-				def.paused = paused;
-				def.updatedAt = Date.now();
-				persistTasks();
-				return { ok: true, name };
-			},
-
-			resume(name) {
-				const def = tasks.get(name);
-				if (!def) return { ok: false, name };
-				def.paused = false;
-				def.updatedAt = Date.now();
-				persistTasks();
-				return { ok: true, name };
 			},
 
 			remove(name) {
-				if (!tasks.has(name)) return { ok: false, name };
-				// in-flight runs keep running — fire-and-die, the daemon forgets only the definition
-				tasks.delete(name);
-				persistTasks();
+				if (!programs.has(name)) return { ok: false, name };
+				// in-flight runs keep running — the daemon forgets only the
+				// definition; exits settle as orphans.
+				programs.delete(name);
+				persistPrograms();
 				return { ok: true, name };
+			},
+
+			preview(name, n = 3) {
+				const def = programs.get(name);
+				if (!def) return null;
+				return { name, fires: previewRuns(def, n ?? 3) };
+			},
+
+			logs(name, tailBytes = PROGRAM_LOGS_MAX) {
+				const def = programs.get(name);
+				if (!def) return null;
+				const cap = Math.max(0, tailBytes ?? PROGRAM_LOGS_MAX);
+				// newest first, accumulate to the cap, then emit newest-last.
+				const hist = runStore.history(name, def.keepRuns ?? 50);
+				const parts: string[] = [];
+				let used = 0;
+				for (const r of hist) {
+					let text = "";
+					try {
+						const path = runStore.streamPaths(r.id).stdout;
+						const size = statSync(path).size;
+						const from = Math.max(0, size - Math.max(0, cap - used));
+						const fd = openSync(path, "r");
+						try {
+							const buf = Buffer.alloc(Math.max(0, size - from));
+							readSync(fd, buf, 0, buf.length, from);
+							text = buf.toString("utf8");
+						} finally {
+							closeSync(fd);
+						}
+					} catch {
+						text = "";
+					}
+					if (!text) continue;
+					const sep = `--- run ${r.id} (${deriveStatus(r, liveRuns.has(r.id))}) ---\n`;
+					const chunk = sep + text;
+					if (used + chunk.length > cap && parts.length > 0) break;
+					parts.push(chunk);
+					used += chunk.length;
+					if (used >= cap) break;
+				}
+				parts.reverse();
+				return { name, text: parts.join("\n").slice(-cap) };
+			},
+		},
+
+		runs: {
+			async exec(execOpts) {
+				const target = resolveSpawn(execOpts.spawn);
+				if (!target) throw new Error("unresolvable spawn: file must exist");
+				const forked = forkRun({
+					spawn: target,
+					kind: "job",
+					origin: "exec",
+					prompt: execOpts.context,
+					timeoutMs: execOpts.timeoutMs,
+				});
+				if (execOpts.name) {
+					// Friendly-name override: rename the ledger entry in place.
+					try {
+						const rec = runStore.get(forked.runId);
+						(rec as { name: string }).name = execOpts.name;
+						runStore.setState(forked.runId, rec.state);
+					} catch {
+						/* ledger torn — the run still lives */
+					}
+				}
+				if (execOpts.waitMs !== undefined) {
+					try {
+						const settled = await runStore.wait(forked.runId, {
+							timeoutMs: execOpts.waitMs,
+						});
+						return { ...forked, settled };
+					} catch {
+						return { ...forked };
+					}
+				}
+				return { ...forked };
+			},
+
+			get(id) {
+				try {
+					return viewOf(runStore.get(id));
+				} catch {
+					return null;
+				}
+			},
+
+			list(filter) {
+				let rows = runStore.snapshot();
+				if (filter?.program !== undefined) rows = rows.filter((r) => r.program === filter.program);
+				let views = rows.map(viewOf);
+				if (filter?.state !== undefined) views = views.filter((v) => v.state === filter.state);
+				views.sort((a, b) => b.startedAt - a.startedAt);
+				const limit = filter?.limit ?? 100;
+				return views.slice(0, Math.max(0, limit));
+			},
+
+			logs(id, logOpts) {
+				try {
+					return runStore.logs(id, {
+						stream: logOpts?.stream,
+						tailBytes: logOpts?.tailBytes,
+						offset: logOpts?.offset,
+					});
+				} catch {
+					return null;
+				}
+			},
+
+			wait(id, waitOpts) {
+				return runStore.wait(id, {
+					match: waitOpts?.match,
+					timeoutMs: waitOpts?.timeoutMs,
+				});
+			},
+
+			kill(id, killOpts = {}) {
+				let record: RunRecord;
+				try {
+					record = runStore.get(id);
+				} catch {
+					return { ok: false, id };
+				}
+				if (record.exit != null || record.endedAt != null) return { ok: false, id };
+				const live = liveRuns.get(id);
+				const prog = live?.program ? programs.get(live.program) : undefined;
+				const grace = killOpts.force
+					? 0
+					: (killOpts.graceMs ?? prog?.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
+				liveRuns.delete(id);
+				const timer = timers.get(id);
+				if (timer) {
+					clearTimeout(timer);
+					timers.delete(id);
+				}
+				closeRunStreams(id);
+				if (live) void supervisor.stop(live.label, grace);
+				try {
+					runStore.settle(
+						id,
+						{
+							code: null,
+							signal: killOpts.force ? "SIGKILL" : "SIGTERM",
+							at: Date.now(),
+							reason: "killed",
+						},
+						"cancelled",
+					);
+				} catch {
+					/* ledger torn — never guess */
+				}
+				return { ok: true, id };
+			},
+
+			signal(id, signal) {
+				let record: RunRecord;
+				try {
+					record = runStore.get(id);
+				} catch {
+					return null;
+				}
+				if (record.exit != null || record.endedAt != null) return { ok: false, id };
+				if (!signal || record.pid == null) return { ok: false, id };
+				try {
+					process.kill(record.pid, signal as NodeJS.Signals);
+				} catch {
+					return { ok: false, id };
+				}
+				return { ok: true, id };
+			},
+
+			save(runId, name, kind) {
+				let record: RunRecord;
+				try {
+					record = runStore.get(runId);
+				} catch {
+					return null;
+				}
+				if (programs.has(name)) return { error: [`program already exists: ${name}`] };
+				const now = Date.now();
+				const candidate: ProgramDef = {
+					name,
+					kind: kind ?? record.kind,
+					spawn: record.spawn,
+					desired: "stopped",
+					restart: { policy: "never" },
+					paused: false,
+					counters: { runs: 0, missedCatchup: 0, overlapSkipped: 0, bufferDropped: 0, timeoutKills: 0 },
+					createdAt: now,
+					updatedAt: now,
+				};
+				const v = validateProgram(candidate);
+				if (!v.ok) return { error: v.errors };
+				candidate.nextFire = computeNextFire(candidate, now);
+				programs.set(name, candidate);
+				persistPrograms();
+				return candidate;
+			},
+
+			prune(olderThanMs, keep) {
+				return runStore.prune({ olderThanMs, keep });
+			},
+
+			async restart(runId) {
+				let record: RunRecord;
+				try {
+					record = runStore.get(runId);
+				} catch {
+					return null;
+				}
+				const prog = record.program ? programs.get(record.program) : undefined;
+				try {
+					if (prog) return { ...(await forkProgramRun(prog, "restart")) };
+					const target = resolveSpawn(record.spawn);
+					if (!target) return null;
+					return {
+						...(await forkRun({
+							spawn: target,
+							kind: record.kind,
+							origin: "restart",
+						})),
+					};
+				} catch {
+					return null;
+				}
 			},
 		},
 
@@ -1207,99 +1643,220 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		},
 	};
 
-	/** Fire every due `every`/`at` task (unless paused). Durable: each slot is
-	 *  claimed (runs++ + nextFire advanced + persisted) BEFORE the fork, so a
-	 *  crash can't refire. Late-within-grace fires late; past-grace collapses
-	 *  missed `every` slots into ONE catch-up fire with a logged reason;
-	 *  past-grace `at` one-shots log a skip instead of forking. Deferred:
-	 *  forks land async; count is claimed fires. */
-	const tickTasks = (now: number = Date.now()): number => {
+	/** Estimate missed slots between a due slot and now (for catch-up
+	 *  accounting). `every` divides the gap; `cron`/`at` collapse to one. */
+	const estimateMissed = (prog: ProgramDef, slot: number, now: number): number => {
+		const s = prog.schedule;
+		if (s?.kind === "every" && typeof s.everyMs === "number" && s.everyMs > 0) {
+			return Math.max(1, Math.round((now - slot) / s.everyMs));
+		}
+		return 1;
+	};
+
+	/** Fire every due schedule (unless paused). Durable: each slot is claimed
+	 *  (runs++ + nextFire advanced + pendingClaim persisted) BEFORE the fork,
+	 *  so a crash can't refire. Late-within-window fires late; past-window
+	 *  collapses per missPolicy (fireOnce = one catch-up fire, skip = logged
+	 *  skip). Deferred: forks land sync (supervisor.fork is sync); stops for
+	 *  cancel/restart are initiated async and the old runs settle as cancelled
+	 *  immediately — the new run forks regardless. Returns claimed fires. */
+	const tickPrograms = (now: number = Date.now(), _tickMs = TICK_MS): number => {
 		let fired = 0;
-		for (const def of tasks.values()) {
-			if (def.paused) continue;
-			if (def.pendingFire) continue;
-			if (def.fire === "every") {
-				if (def.nextFire === undefined) {
-					def.nextFire = computeNextFire(def, now);
+		for (const prog of programs.values()) {
+			const s = prog.schedule;
+			if (!s || s.kind === "manual" || prog.paused) continue;
+			if (typeof s.maxRuns === "number" && prog.counters.runs >= s.maxRuns) continue;
+			if (typeof s.stopAt === "number" && now > s.stopAt) continue;
+			if (typeof s.startAt === "number" && now < s.startAt) continue;
+			if (prog.pendingClaim) continue;
+
+			// Drain buffered slots first: capacity freed since the overlap.
+			const liveIds = [...liveRuns.entries()]
+				.filter(([, v]) => v.program === prog.name)
+				.map(([id]) => id);
+			const queued = buffered.get(prog.name) ?? [];
+			if (liveIds.length === 0 && queued.length > 0) {
+				const slot = queued.shift() as number;
+				if (queued.length === 0) buffered.delete(prog.name);
+				fireClaimedSlot(prog, slot, now, "tick");
+				fired++;
+				continue;
+			}
+
+			let slot = prog.nextFire ?? computeNextFire(prog, now);
+			if (slot === undefined) {
+				prog.nextFire = undefined;
+				continue;
+			}
+			if (now < slot) {
+				prog.nextFire = slot;
+				continue;
+			}
+
+			// minGap: the last fire is too recent — hold the slot, don't advance.
+			if (typeof prog.minGapMs === "number" && prog.lastFire != null && now - prog.lastFire < prog.minGapMs) {
+				continue;
+			}
+
+			// catch-up: late within the window fires late; past it collapses.
+			const window = catchupWindowFor(prog);
+			if (now - slot > window) {
+				const missed = estimateMissed(prog, slot, now);
+				if ((prog.missPolicy ?? "fireOnce") === "skip") {
+					prog.counters.missedCatchup += missed;
+					prog.lastSlot = slot;
+					prog.lastSkip = {
+						slot,
+						at: now,
+						reason: `${missed} slot${missed === 1 ? "" : "s"} missed (late ${Math.round((now - slot) / 1000)}s > window ${Math.round(window / 1000)}s) — logged skip`,
+					};
+					prog.nextFire = computeNextFire({ ...prog }, now);
+					prog.updatedAt = now;
+					persistPrograms();
 					continue;
 				}
-				if (now < def.nextFire) continue;
-				const grace = taskGraceFor(def.everyMs);
-				const lateBy = now - def.nextFire;
-				if (lateBy <= grace) {
-					const slot = def.nextFire;
-					if (!fireClaimed(def, slot, now, "tick")) continue;
-					const target = resolveAgentFile(def.file, def.from);
-					if (!target) {
-						fireSettled(def, false, "tick fork failed: unknown agent file");
+				prog.counters.missedCatchup += Math.max(0, missed - 1);
+				slot = now;
+			}
+
+			// overlap gate.
+			const overlap = prog.overlap ?? "skip";
+			if (liveIds.length > 0) {
+				if (overlap === "allow") {
+					// fork regardless
+				} else if (overlap === "allowN") {
+					if (liveIds.length >= (prog.allowN ?? 1)) {
+						skipOverlapped(prog, slot, now, "allowN room exhausted");
 						continue;
 					}
-					const run = def.runs;
-					const parent = `task:${def.name}#${run}`;
-					forkLabeled(parent, parent, target.path, target.env).then(
-						() => fireSettled(def, true, ""),
-						() => fireSettled(def, false, "tick fork failed"),
+				} else if (overlap === "buffer1" || overlap === "bufferAll") {
+					const q = buffered.get(prog.name) ?? [];
+					if (overlap === "buffer1" && q.length >= 1) {
+						prog.counters.bufferDropped++;
+						prog.updatedAt = now;
+						persistPrograms();
+					} else {
+						q.push(slot);
+						buffered.set(prog.name, q);
+					}
+					prog.lastSlot = slot;
+					prog.nextFire = computeNextFire({ ...prog }, now);
+					prog.updatedAt = now;
+					persistPrograms();
+					continue;
+				} else if (overlap === "cancel" || overlap === "restart") {
+					const grace = prog.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+					for (const id of liveIds) {
+						liveRuns.delete(id);
+						const t = timers.get(id);
+						if (t) {
+							clearTimeout(t);
+							timers.delete(id);
+						}
+						closeRunStreams(id);
+						void supervisor.stop(`run:${id}`, grace);
+						try {
+							runStore.settle(
+								id,
+								{ code: null, signal: "SIGTERM", at: now, reason: `overlap ${overlap}` },
+								"cancelled",
+							);
+						} catch {
+							/* ledger torn — never guess */
+						}
+					}
+					console.log(
+						`[swarm] ${prog.name}: overlap ${overlap} — cancelled ${liveIds.length} live run(s), forking regardless`,
 					);
-					fired++;
 				} else {
-					// Past grace: collapse every missed slot since nextFire into
-					// ONE fire now (the catch-up), with the miss logged on the def.
-					const missed = Math.max(1, Math.floor(lateBy / (def.everyMs ?? lateBy)));
-					const slot = now;
-					def.lastCatchup = {
-						slot,
-						missed,
-						at: now,
-						reason: `${missed} slot${missed === 1 ? "" : "s"} missed (late ${Math.round(lateBy / 1000)}s > grace ${Math.round(grace / 1000)}s) — one catch-up fire`,
-					};
-					if (!fireClaimed(def, slot, now, "tick")) continue;
-					const target = resolveAgentFile(def.file, def.from);
-					if (!target) {
-						fireSettled(def, false, "tick fork failed: unknown agent file");
-						continue;
-					}
-					const run = def.runs;
-					const parent = `task:${def.name}#${run}`;
-					forkLabeled(parent, parent, target.path, target.env).then(
-						() => fireSettled(def, true, ""),
-						() => fireSettled(def, false, "tick fork failed"),
-					);
-					fired++;
-				}
-			} else if (def.fire === "at") {
-				if (def.at !== undefined && now >= def.at) {
-					const dueAt = def.at;
-					// `at` slots are punctual one-shots: past-grace they log a
-					// skip instead of forking a stale moment (never silent).
-					if (now - dueAt > TASK_GRACE_MIN_MS) {
-						def.at = undefined;
-						def.nextFire = undefined;
-						def.lastSkipped = {
-							slot: dueAt,
-							at: now,
-							reason: `at slot missed by ${Math.round((now - dueAt) / 1000)}s past grace — logged skip`,
-						};
-						def.updatedAt = now;
-						persistTasks();
-						continue;
-					}
-					if (!fireClaimed(def, dueAt, now, "tick")) continue;
-					const target = resolveAgentFile(def.file, def.from);
-					if (!target) {
-						fireSettled(def, false, "tick fork failed: unknown agent file");
-						continue;
-					}
-					const run = def.runs;
-					const parent = `task:${def.name}#${run}`;
-					forkLabeled(parent, parent, target.path, target.env).then(
-						() => fireSettled(def, true, ""),
-						() => fireSettled(def, false, "tick fork failed"),
-					);
-					fired++;
+					// skip (default): count it, advance, never fork.
+					skipOverlapped(prog, slot, now, "live run in progress");
+					continue;
 				}
 			}
+
+			if (fireClaimedSlot(prog, slot, now, "tick")) fired++;
 		}
 		return fired;
+	};
+
+	/** Count an overlapped slot without forking (skip gate). */
+	const skipOverlapped = (prog: ProgramDef, slot: number, now: number, reason: string): void => {
+		prog.counters.overlapSkipped++;
+		prog.lastSlot = slot;
+		prog.lastSkip = { slot, at: now, reason: `overlap skip — ${reason}` };
+		prog.nextFire = computeNextFire({ ...prog }, now);
+		prog.updatedAt = now;
+		persistPrograms();
+	};
+
+	/** Claim a slot (persisted BEFORE the fork), fork, clear the claim.
+	 *  A failed fork converts into a logged skip — never silent, never refired. */
+	const fireClaimedSlot = (
+		prog: ProgramDef,
+		slot: number,
+		now: number,
+		origin: RunRecord["trigger"]["origin"],
+	): boolean => {
+		const target = resolveSpawn(prog.spawn, prog.from);
+		if (!target) {
+			prog.counters.runs++;
+			prog.lastSlot = slot;
+			prog.nextFire = computeNextFire({ ...prog }, now);
+			prog.lastSkip = { slot, at: now, reason: "tick fork failed: unresolvable spawn" };
+			prog.updatedAt = now;
+			persistPrograms();
+			return false;
+		}
+		// Register first (durable ledger entry), then claim, then fork.
+		let forked: { runId: string; name: string; sessionId: string; pid?: number };
+		try {
+			const spawn: ProgramSpawn = target.file
+				? { file: target.file }
+				: { cmd: target.cmd as string, args: target.args, cwd: target.cwd };
+			const record = runStore.register({
+				program: prog.name,
+				kind: prog.kind,
+				spawn,
+				trigger: { origin, slot, attempt: 0 },
+				cwd: target.cwd,
+			});
+			claimSlot(prog, slot, now, origin, record.id);
+			const paths = runStore.streamPaths(record.id);
+			const stdout = createWriteStream(paths.stdout, { flags: "a" });
+			const stderr = createWriteStream(paths.stderr, { flags: "a" });
+			streams.set(record.id, { stdout, stderr });
+			const base = {
+				label: `run:${record.id}`,
+				autorestart: false as const,
+				templateEnv: target.templateEnv,
+				extraEnv: { ...spawnEnv(), SWARM_SPAWN_ID: record.id },
+			};
+			const spec: SpawnSpec = target.file
+				? { ...base, file: target.file }
+				: { ...base, cmd: target.cmd as string, args: target.args, cwd: target.cwd };
+			const r = supervisor.fork(spec, { stdout, stderr });
+			if (r.pid !== undefined) {
+				try {
+					runStore.setPid(record.id, r.pid);
+				} catch {
+					/* ledger torn — the run still lives */
+				}
+			}
+			liveRuns.set(record.id, { program: prog.name, label: `run:${record.id}` });
+			if (typeof prog.timeoutMs === "number" && prog.timeoutMs >= 0) {
+				const timer = setTimeout(() => onRunTimeout(record.id), prog.timeoutMs);
+				timer.unref?.();
+				timers.set(record.id, timer);
+			}
+			forked = { runId: record.id, name: record.name, sessionId: r.sessionId, pid: r.pid };
+		} catch {
+			clearClaim(prog, false, "tick fork failed");
+			return false;
+		}
+		clearClaim(prog, true, "");
+		void forked;
+		return true;
 	};
 
 	// ---------------------------------------------------------------------------
@@ -1493,133 +2050,181 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				if (!hasPerm(conn, "drop")) break;
 				result(conn, frame, "drop", api.agents.drop(frame.sessionId, conn.room));
 				return;
-			case "proc_start":
-				if (!hasPerm(conn, "proc_start")) break;
-				api.processes.start(frame.name, {
-					file: frame.file,
-					from: frame.from,
-					autorestart: frame.autorestart,
+			case "program_define":
+				if (!hasPerm(conn, "program_define")) break;
+				{
+					const r = api.programs.define({ ...frame, name: frame.name });
+					if ("error" in r) fail(conn, frame, "program_define", r.error.join("; "));
+					else result(conn, frame, "program_define", r);
+				}
+				return;
+			case "program_patch":
+				if (!hasPerm(conn, "program_patch")) break;
+				{
+					const r = api.programs.patch(frame.name, frame.patch);
+					if (!r) fail(conn, frame, "program_patch", `unknown program: ${frame.name}`);
+					else if ("error" in r) fail(conn, frame, "program_patch", r.error.join("; "));
+					else result(conn, frame, "program_patch", r);
+				}
+				return;
+			case "program_launch": {
+				// Watchdog path: when the frame token matches the program's
+				// triggerToken, program_launch is honored WITHOUT the admin
+				// role. REST/CLI honor the same convention (see rest.ts/cli.ts).
+				const def = programs.get(frame.name);
+				const tokenOk =
+					!!def?.triggerToken && !!frame.token && frame.token === def.triggerToken;
+				if (!tokenOk && !hasPerm(conn, "program_launch")) break;
+				if (!def) {
+					fail(conn, frame, "program_launch", `unknown program: ${frame.name}`);
+					return;
+				}
+				api.programs.launch(frame.name, {
+					context: frame.context,
 					prompt: frame.prompt,
+					waitMs: frame.waitMs,
 				}).then(
 					(r) => {
-						if (!r) fail(conn, frame, "proc_start", `unknown template/file: ${frame.from ?? frame.file ?? "(none)"}`);
-						else result(conn, frame, "proc_start", r);
+						if (!r) fail(conn, frame, "program_launch", `unknown program / unresolvable spawn: ${frame.name}`);
+						else if ("error" in r) fail(conn, frame, "program_launch", r.error.join("; "));
+						else if ("busy" in r && r.busy)
+							fail(conn, frame, "program_launch", `program ${frame.name} already firing (at-most-once)`);
+						else result(conn, frame, "program_launch", r);
 					},
-					(err) => fail(conn, frame, "proc_start", err instanceof Error ? err.message : String(err)),
+					(err) => fail(conn, frame, "program_launch", err instanceof Error ? err.message : String(err)),
 				);
 				return;
-			case "proc_save":
-				if (!hasPerm(conn, "proc_save")) break;
+			}
+			case "program_remove":
+				if (!hasPerm(conn, "program_remove")) break;
+				result(conn, frame, "program_remove", api.programs.remove(frame.name));
+				return;
+			case "program_list":
+				if (!hasPerm(conn, "program_list")) break;
+				result(conn, frame, "program_list", api.programs.list());
+				return;
+			case "program_get":
+				if (!hasPerm(conn, "program_get")) break;
 				{
-					const r = api.processes.save(frame.name, {
-						file: frame.file,
-						from: frame.from,
-						autorestart: frame.autorestart,
-					});
-					if (!r) fail(conn, frame, "proc_save", `cannot save process: ${frame.name}`);
-					else result(conn, frame, "proc_save", r);
+					const r = api.programs.get(frame.name);
+					if (!r) fail(conn, frame, "program_get", `unknown program: ${frame.name}`);
+					else result(conn, frame, "program_get", r);
 				}
 				return;
-			case "proc_stop":
-				if (!hasPerm(conn, "proc_stop")) break;
-				result(conn, frame, "proc_stop", api.processes.stop(frame.name));
+			case "program_preview":
+				if (!hasPerm(conn, "program_preview")) break;
+				{
+					const r = api.programs.preview(frame.name, frame.n);
+					if (!r) fail(conn, frame, "program_preview", `unknown program: ${frame.name}`);
+					else result(conn, frame, "program_preview", r);
+				}
 				return;
-			case "proc_remove":
-				if (!hasPerm(conn, "proc_remove")) break;
-				result(conn, frame, "proc_remove", api.processes.remove(frame.name));
+			case "program_logs":
+				if (!hasPerm(conn, "program_logs")) break;
+				{
+					const r = api.programs.logs(frame.name, frame.tailBytes);
+					if (!r) fail(conn, frame, "program_logs", `unknown program: ${frame.name}`);
+					else result(conn, frame, "program_logs", r);
+				}
 				return;
-			case "proc_set_autorestart":
-				if (!hasPerm(conn, "proc_set_autorestart")) break;
-				result(conn, frame, "proc_set_autorestart", api.processes.setAutorestart(frame.name, frame.autorestart));
+			case "run_exec":
+				if (!hasPerm(conn, "run_exec")) break;
+				if (!frame.spawn || (!("file" in frame.spawn) && !("cmd" in frame.spawn))) {
+					fail(conn, frame, "run_exec", "spawn must set file or cmd");
+					return;
+				}
+				api.runs.exec({
+					spawn: frame.spawn,
+					waitMs: frame.waitMs,
+					timeoutMs: frame.timeoutMs,
+					name: frame.name,
+					context: frame.context,
+				}).then(
+					(r) => result(conn, frame, "run_exec", r),
+					(err) => fail(conn, frame, "run_exec", err instanceof Error ? err.message : String(err)),
+				);
 				return;
-			case "proc_restart":
-				if (!hasPerm(conn, "proc_restart")) break;
-				api.processes.restart(frame.name, { prompt: frame.prompt }).then(
+			case "run_get":
+				if (!hasPerm(conn, "run_get")) break;
+				{
+					const r = api.runs.get(frame.runId);
+					if (!r) fail(conn, frame, "run_get", `unknown run: ${frame.runId}`);
+					else result(conn, frame, "run_get", r);
+				}
+				return;
+			case "run_list":
+				if (!hasPerm(conn, "run_list")) break;
+				result(
+					conn,
+					frame,
+					"run_list",
+					api.runs.list({ program: frame.program, state: frame.state, limit: frame.limit }),
+				);
+				return;
+			case "run_logs":
+				if (!hasPerm(conn, "run_logs")) break;
+				{
+					const r = api.runs.logs(frame.runId, {
+						stream: frame.stream,
+						tailBytes: frame.tailBytes,
+						offset: frame.offset,
+					});
+					if (!r) fail(conn, frame, "run_logs", `unknown run: ${frame.runId}`);
+					else result(conn, frame, "run_logs", r);
+				}
+				return;
+			case "run_wait":
+				if (!hasPerm(conn, "run_wait")) break;
+				api.runs.wait(frame.runId, { match: frame.match, timeoutMs: frame.timeoutMs }).then(
+					(r) => result(conn, frame, "run_wait", r),
+					(err) => fail(conn, frame, "run_wait", err instanceof Error ? err.message : String(err)),
+				);
+				return;
+			case "run_kill":
+				if (!hasPerm(conn, "run_kill")) break;
+				{
+					const r = api.runs.kill(frame.runId, { graceMs: frame.graceMs, force: frame.force });
+					if (!r.ok) fail(conn, frame, "run_kill", `unknown run or already settled: ${frame.runId}`);
+					else result(conn, frame, "run_kill", r);
+				}
+				return;
+			case "run_signal":
+				if (!hasPerm(conn, "run_signal")) break;
+				{
+					const r = api.runs.signal(frame.runId, frame.signal);
+					if (!r) fail(conn, frame, "run_signal", `unknown run: ${frame.runId}`);
+					else if (!r.ok) fail(conn, frame, "run_signal", `signal failed: ${frame.runId}`);
+					else result(conn, frame, "run_signal", r);
+				}
+				return;
+			case "run_save":
+				if (!hasPerm(conn, "run_save")) break;
+				{
+					const r = api.runs.save(frame.runId, frame.name, frame.kind);
+					if (!r) fail(conn, frame, "run_save", `unknown run: ${frame.runId}`);
+					else if ("error" in r) fail(conn, frame, "run_save", r.error.join("; "));
+					else result(conn, frame, "run_save", r);
+				}
+				return;
+			case "run_prune":
+				if (!hasPerm(conn, "run_prune")) break;
+				result(conn, frame, "run_prune", api.runs.prune(frame.olderThanMs, frame.keep));
+				return;
+			case "run_restart":
+				if (!hasPerm(conn, "run_restart")) break;
+				api.runs.restart(frame.runId).then(
 					(r) => {
-						if (!r.ok) fail(conn, frame, "proc_restart", `unknown process / missing agent file: ${frame.name}`);
-						else result(conn, frame, "proc_restart", r);
+						if (!r) fail(conn, frame, "run_restart", `unknown run / unresolvable spawn: ${frame.runId}`);
+						else result(conn, frame, "run_restart", r);
 					},
-					(err) => fail(conn, frame, "proc_restart", err instanceof Error ? err.message : String(err)),
+					(err) => fail(conn, frame, "run_restart", err instanceof Error ? err.message : String(err)),
 				);
-				return;
-			case "proc_list":
-				if (!hasPerm(conn, "proc_list")) break;
-				result(conn, frame, "proc_list", api.processes.list());
-				return;
-			case "proc_get":
-				if (!hasPerm(conn, "proc_get")) break;
-				{
-					const r = api.processes.get(frame.name);
-					if (!r) fail(conn, frame, "proc_get", `unknown process: ${frame.name}`);
-					else result(conn, frame, "proc_get", r);
-				}
-				return;
-			case "task_define":
-				if (!hasPerm(conn, "task_define")) break;
-				{
-					const r = api.tasks.define({
-						name: frame.name,
-						file: frame.file,
-						from: frame.from,
-						fire: frame.fire,
-						everyMs: frame.everyMs,
-						at: frame.at,
-					});
-					if (!r) fail(conn, frame, "task_define", `bad task definition: ${frame.name}`);
-					else result(conn, frame, "task_define", r);
-				}
-				return;
-			case "task_fire":
-				if (!hasPerm(conn, "task_fire")) break;
-				api.tasks.fire(frame.name, { prompt: frame.prompt }).then(
-					(rr) => {
-						if (!rr) fail(conn, frame, "task_fire", `unknown task / missing agent file / paused (use trigger): ${frame.name}`);
-						else result(conn, frame, "task_fire", rr);
-					},
-					(err) => fail(conn, frame, "task_fire", err instanceof Error ? err.message : String(err)),
-				);
-				return;
-			case "task_trigger":
-				if (!hasPerm(conn, "task_trigger")) break;
-				api.tasks.trigger(frame.name, { context: frame.context, prompt: frame.prompt }).then(
-					(rr) => {
-						if (!rr) fail(conn, frame, "task_trigger", `unknown task / missing agent file: ${frame.name}`);
-						else if ("busy" in rr && rr.busy)
-							fail(conn, frame, "task_trigger", `task ${frame.name} already firing (at-most-once)`);
-						else result(conn, frame, "task_trigger", rr);
-					},
-					(err) => fail(conn, frame, "task_trigger", err instanceof Error ? err.message : String(err)),
-				);
-				return;
-			case "task_pause":
-				if (!hasPerm(conn, "task_pause")) break;
-				result(conn, frame, "task_pause", api.tasks.pause(frame.name, frame.paused));
-				return;
-			case "task_resume":
-				if (!hasPerm(conn, "task_resume")) break;
-				result(conn, frame, "task_resume", api.tasks.resume(frame.name));
-				return;
-			case "task_remove":
-				if (!hasPerm(conn, "task_remove")) break;
-				result(conn, frame, "task_remove", api.tasks.remove(frame.name));
-				return;
-			case "task_list":
-				if (!hasPerm(conn, "task_list")) break;
-				result(conn, frame, "task_list", api.tasks.list());
-				return;
-			case "task_get":
-				if (!hasPerm(conn, "task_get")) break;
-				{
-					const r = api.tasks.get(frame.name);
-					if (!r) fail(conn, frame, "task_get", `unknown task: ${frame.name}`);
-					else result(conn, frame, "task_get", r);
-				}
 				return;
 			case "broadcast":
 				if (!hasPerm(conn, "broadcast")) break;
 				{
 					// blast radius = caller's mount ∩ explicit room scope ∩ online WORKERS.
-					// Agents only — processes/tasks are definitions, not listeners.
+					// Agents only — programs/runs are definitions/ledger, not listeners.
 					const scope = frame.room
 						? (normalizeRoom(frame.room) ?? ROOT_ROOM)
 						: ROOT_ROOM;
@@ -1663,58 +2268,86 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		api,
 
 		async start() {
-			migrateLegacyFleet();
-			// Boot reconciliation: a crash between claim and fork leaves
-			// pendingFire on the def. That slot is NEVER refired and NEVER
-			// silent — it lands as a logged skip, and the schedule marches on.
+			// The home lock FIRST — a second daemon on the same home refuses.
+			acquireHomeLock(home);
+			// Migrate processes.json + tasks.json → programs.json ONCE (when
+			// programs.json is absent). Legacy files are KEPT — user data is
+			// never deleted silently; they just aren't read again.
+			if (!existsSync(programsPath)) {
+				const legacyProcesses = loadProcesses(legacyProcessesPath);
+				const legacyTasks = loadTasks(legacyTasksPath);
+				if (legacyProcesses.size > 0 || legacyTasks.size > 0) {
+					for (const p of migrateLegacy(legacyProcesses, legacyTasks)) {
+						if (!programs.has(p.name)) programs.set(p.name, p);
+					}
+					persistPrograms();
+				}
+			}
+			// Boot reconciliation: runs left live-but-unclaimed (the daemon
+			// died mid-run). Pids don't survive daemon death reliably — nudge
+			// the recorded pid best-effort, then mark interrupted + log.
+			{
+				const now = Date.now();
+				for (const r of runStore.snapshot()) {
+					const terminal = r.exit != null || r.endedAt != null;
+					if (terminal || (r.state !== "starting" && r.state !== "running")) continue;
+					if (r.pid != null) {
+						try {
+							process.kill(r.pid, "SIGTERM");
+						} catch {
+							/* pid gone or foreign — best-effort only */
+						}
+					}
+					try {
+						runStore.setState(r.id, "interrupted");
+					} catch {
+						/* ledger torn — never guess */
+					}
+					console.log(`[swarm] boot: run ${r.id} (${r.name}) marked interrupted (daemon died mid-run) — at ${new Date(now).toISOString()}`);
+				}
+			}
+			// A crash between claim and fork leaves pendingClaim on the def.
+			// That slot is NEVER refired and NEVER silent — it lands as a
+			// logged skip, and the schedule marches on.
 			{
 				let dirty = false;
 				const now = Date.now();
-				for (const def of tasks.values()) {
-					if (!def.pendingFire) continue;
-					const slot = def.pendingFire.slot;
-					const origin = def.pendingFire.origin;
-					const run = def.pendingFire.run;
-					def.pendingFire = undefined;
-					def.lastSkipped = {
+				for (const def of programs.values()) {
+					if (!def.pendingClaim) continue;
+					const slot = def.pendingClaim.slot;
+					const origin = def.pendingClaim.origin;
+					def.pendingClaim = undefined;
+					def.lastSkip = {
 						slot,
 						at: now,
-						reason: `daemon ${origin === "tick" ? "restarted" : origin} mid-fire (run #${run}) — slot claimed before the fork, never confirmed; logged skip, no refire`,
+						reason: `daemon ${origin} mid-fire — slot claimed before the fork, never confirmed; logged skip, no refire`,
 					};
+					def.nextFire = computeNextFire({ ...def }, now);
 					def.updatedAt = now;
 					dirty = true;
 				}
-				if (dirty) persistTasks();
+				if (dirty) persistPrograms();
 			}
-			for (const def of processes.values()) {
-				if (def.status !== "running") continue;
-				const target = resolveAgentFile(def.file, def.from);
-				if (!target) {
-					def.status = "stopped";
-					continue;
-				}
+			// Resubmit desired=running services (fresh runs, origin boot).
+			for (const def of programs.values()) {
+				if (def.kind !== "service" || def.desired !== "running" || def.paused) continue;
 				try {
-					const r = await supervisor.fork(target.path, {
-						label: `proc:${def.name}`,
-						autorestart: def.autorestart,
-						templateEnv: target.env,
-						extraEnv: { ...spawnEnv(), SWARM_SPAWN_ID: def.name },
-					});
-					def.pid = r.pid;
-					def.starts++;
-				} catch {
-					def.status = "stopped";
+					forkProgramRun(def, "boot");
+				} catch (err) {
+					console.warn(
+						`[swarm] boot: service ${def.name} fork failed: ${err instanceof Error ? err.message : String(err)} — desired stays running`,
+					);
 				}
 			}
-			persistProcesses();
-			// the task clock — fires due `every`/`at` tasks unless paused
+			persistPrograms();
+			// the program clock — fires due schedules unless paused
 			clockTimer = setInterval(() => {
 				try {
-					tickTasks();
+					tickPrograms();
 				} catch {
 					/* the clock is a courtesy, never a contract */
 				}
-			}, TASK_TICK_MS);
+			}, TICK_MS);
 			clockTimer.unref?.();
 			httpServer = createServer();
 			// the second door — same server, same port, same tokens, same ops
@@ -1801,6 +2434,10 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				clearInterval(clockTimer);
 				clockTimer = undefined;
 			}
+			for (const t of pendingTimers) clearTimeout(t);
+			pendingTimers.clear();
+			for (const t of timers.values()) clearTimeout(t);
+			timers.clear();
 			for (const stop of mountStoppers) stop();
 			mountStoppers.clear();
 			for (const conn of connections) {
@@ -1821,9 +2458,12 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			});
 			wss = undefined;
 			httpServer = undefined;
-			// clean shutdown: stop every child, then detach from the scoped daemon
+			// clean shutdown: stop every child, then detach from the supervisor.
+			// Live runs get settled by the exit events if they land in time;
+			// stragglers are marked interrupted at the next boot.
 			await supervisor.stopAll();
 			supervisor.disconnect();
+			releaseHomeLock(home);
 		},
 		async killDaemon() {
 			await supervisor.killDaemon();
@@ -1841,15 +2481,15 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			return scanTemplates(templatesDir);
 		},
 
-		tickTasks(now?: number) {
-			return tickTasks(now);
+		tickPrograms(now?: number, tickMs?: number) {
+			return tickPrograms(now, tickMs);
 		},
 
-		pokeTask(name, patch) {
-			const def = tasks.get(name);
+		pokeProgram(name, patch) {
+			const def = programs.get(name);
 			if (!def) return false;
 			Object.assign(def, patch);
-			persistTasks();
+			persistPrograms();
 			return true;
 		},
 
