@@ -9,9 +9,10 @@
 //   swarm agents [--server ws://...]
 //   swarm agents get <sessionId>               [--server ws://...]
 //   swarm agents drop <sessionId>             [--server ws://...]  (close socket + forget)
+//   swarm listen (--session <id> | --run <id-or-name> | --program <name>) [--server ws://...]
 //   swarm programs list|get|define|patch|launch|remove|preview|logs
 //   swarm runs list|get|logs|wait|kill|signal|save|restart|prune
-//   swarm exec [--wait-ms N] [--detach] -- <cmd> [args...]
+//   swarm exec [--wait-ms N] [--detach] [--cwd DIR] -- <cmd> [args...]
 //   swarm send <sessionId> <text>              [--server ws://...]
 //   swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset>
 //   swarm history | templates | events <sessionId>
@@ -32,9 +33,11 @@ import WebSocket from "ws";
 const HELP = `usage:
   swarm serve [--dir HOME] [--port N] [--addr H] [--templates DIR]
               [--name N] [--token <role>=<tok>]... [--connect ws://B [--as ALIAS]]...
-  swarm agents [--server ws://H:P]
+  swarm agents [--status online|offline] [--mode worker|peer|admin]
+               [--agent-id ID] [--room PATH] [--server ws://H:P]
   swarm agents get <sessionId> [--server ws://H:P]
   swarm agents drop <sessionId> [--server ws://H:P]
+  swarm listen (--session <id> | --run <id-or-name> | --program <name>) [--server ws://H:P]
   swarm programs list [--server ws://H:P]
   swarm programs get <name> [--server ws://H:P]
   swarm programs define <name> [--kind service|job]
@@ -43,9 +46,11 @@ const HELP = `usage:
       [--schedule-cron EXPR] [--schedule-every-ms N] [--schedule-at ISO|epoch]
       [--timezone TZ] [--overlap skip|allow|allowN|buffer1|bufferAll|cancel|restart]
       [--allow-n N] [--timeout-ms N] [--paused] [--notes TEXT]
+      [--json '{...}']  (--json provides defaults, explicit flags override)
   swarm programs patch <name> [--paused true|false] [--desired running|stopped]
       [--notes TEXT] [--restart never|always|on-failure]
       [--schedule-cron EXPR] [--schedule-every-ms N] [--schedule-at ISO|epoch]
+      [--json '{...}']  (--json provides defaults, explicit flags override)
   swarm programs launch <name> [--context TEXT] [--prompt TEXT] [--wait-ms N] [--token TOK]
   swarm programs remove <name> | preview <name> [--n N] | logs <name> [--tail-bytes N]
   swarm runs list [--program P] [--state S] [--limit N]
@@ -53,7 +58,7 @@ const HELP = `usage:
   swarm runs wait <id> [--match PAT] [--timeout-ms N] | kill <id> [--grace-ms N] [--force]
   swarm runs signal <id> <sig> | save <id> <name> [--kind service|job]
   swarm runs restart <id> | prune [--older-than-ms N] [--keep N]
-  swarm exec [--wait-ms N] [--timeout-ms N] [--name NAME] [--detach] -- <cmd> [args...]
+  swarm exec [--wait-ms N] [--timeout-ms N] [--name NAME] [--detach] [--cwd DIR] -- <cmd> [args...]
   swarm send <sessionId> <text> [--server ws://H:P]
   swarm control <sessionId> <stop|abort|pause|wake|shutdown|reset> [--server ws://H:P]
   swarm history | swarm templates [--server ws://H:P]
@@ -140,6 +145,7 @@ function client(
 	operatorToken?: string,
 ): {
 	send(frame: unknown): Promise<unknown>;
+	onEvent(cb: (frame: { op: string; target?: string; event?: string; payload?: unknown }) => void): void;
 	close(): void;
 } {
 	const ws = new WebSocket(server);
@@ -149,6 +155,7 @@ function client(
 	>();
 	let seq = 0;
 	const queue: (() => void)[] = [];
+	const listeners: ((frame: { op: string; target?: string; event?: string; payload?: unknown }) => void)[] = [];
 	ws.on("open", () => {
 		// the operator registers as admin — in open mode the claim is trusted;
 		// with tokens the operator passes --token admin=<tok>
@@ -165,10 +172,20 @@ function client(
 		queue.forEach((f) => f());
 	});
 	ws.on("message", (data: unknown) => {
-		let frame: { op: string; id?: string; data?: unknown; error?: string };
+		let frame: { op: string; id?: string; data?: unknown; error?: string } & Record<string, unknown>;
 		try {
 			frame = JSON.parse((data as Buffer).toString()) as typeof frame;
 		} catch {
+			return;
+		}
+		if (frame.op === "event") {
+			for (const cb of listeners) {
+				try {
+					cb(frame as { op: string; target?: string; event?: string; payload?: unknown });
+				} catch {
+					/* ignore */
+				}
+			}
 			return;
 		}
 		if (frame.id && pending.has(frame.id)) {
@@ -188,6 +205,9 @@ function client(
 			if (ws.readyState === WebSocket.OPEN) go();
 			else queue.push(go);
 			return promise;
+		},
+		onEvent(cb: (frame: { op: string; target?: string; event?: string; payload?: unknown }) => void): void {
+			listeners.push(cb);
 		},
 		close() {
 			try {
@@ -332,10 +352,21 @@ async function main(): Promise<void> {
 			const sub = a1 ?? "list";
 			const c = client(targetServer(args).url, opToken(args));
 			if (sub === "list") {
-				const rows = (await c.send({ op: "agents_list" })) as Parameters<
-					typeof printAgentRow
-				>[0][];
-				for (const r of rows) printAgentRow(r);
+				type AgentRow = Parameters<typeof printAgentRow>[0] & { mode?: string; room?: string };
+				const rows = (await c.send({ op: "agents_list" })) as AgentRow[];
+				const status = flag(args, "status");
+				if (status !== undefined && status !== "online" && status !== "offline") die(HELP);
+				const mode = flag(args, "mode");
+				if (mode !== undefined && mode !== "worker" && mode !== "peer" && mode !== "admin") die(HELP);
+				const agentId = flag(args, "agent-id");
+				const room = flag(args, "room");
+				for (const r of rows) {
+					if (status && r.status !== status) continue;
+					if (mode && r.mode !== mode) continue;
+					if (agentId && r.agentId !== agentId) continue;
+					if (room && r.room !== room) continue;
+					printAgentRow(r);
+				}
 			} else if (sub === "get") {
 				if (!rest[0]) die(HELP);
 				printJson(await c.send({ op: "agents_get", sessionId: rest[0] }));
@@ -393,34 +424,44 @@ async function main(): Promise<void> {
 					}
 					const overlap = flag(args, "overlap");
 					if (overlap !== undefined && !["skip", "allow", "allowN", "buffer1", "bufferAll", "cancel", "restart"].includes(overlap)) die(HELP);
-					printJson(
-						await c.send({
-							op: "program_define",
-							name,
-							...(kind ? { kind } : {}),
-							...(file ? { spawn: { file } } : {}),
-							...(cmd ? { spawn: { cmd, ...(extraArgs.length ? { args: extraArgs } : {}) } } : {}),
-							...(from ? { from } : {}),
-							...(desired ? { desired } : {}),
-							...(restartFlag ? { restart: { policy: restartFlag } } : {}),
-							...(cron !== undefined || everyMs !== undefined || at !== undefined
-								? {
-										schedule: {
-											kind: cron !== undefined ? "cron" : everyMs !== undefined ? "every" : "at",
-											...(cron !== undefined ? { expr: cron } : {}),
-											...(everyMs !== undefined ? { everyMs } : {}),
-											...(at !== undefined ? { at } : {}),
-											...(timezone ? { timezone } : {}),
-										},
-									}
-								: {}),
-							...(overlap ? { overlap } : {}),
-							...(num("allow-n") !== undefined ? { allowN: num("allow-n") } : {}),
-							...(num("timeout-ms") !== undefined ? { timeoutMs: num("timeout-ms") } : {}),
-							...(args.flags.has("paused") ? { paused: true } : {}),
-							...(flag(args, "notes") ? { notes: flag(args, "notes") } : {}),
-						}),
-					);
+					const jsonRaw = flag(args, "json");
+					let jsonDefaults: Record<string, unknown> = {};
+					if (jsonRaw !== undefined) {
+						try {
+							const parsed: unknown = JSON.parse(jsonRaw);
+							if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) die(`--json must be a JSON object`);
+							jsonDefaults = parsed as Record<string, unknown>;
+						} catch (e) {
+							if (e instanceof Error && e.message.startsWith("--json")) die(e.message);
+							const detail = e instanceof Error ? e.message : String(e);
+							die(`--json is not valid JSON: ${detail}`);
+						}
+					}
+					const flagFields: Record<string, unknown> = {
+						...(kind ? { kind } : {}),
+						...(file ? { spawn: { file } } : {}),
+						...(cmd ? { spawn: { cmd, ...(extraArgs.length ? { args: extraArgs } : {}) } } : {}),
+						...(from ? { from } : {}),
+						...(desired ? { desired } : {}),
+						...(restartFlag ? { restart: { policy: restartFlag } } : {}),
+						...(cron !== undefined || everyMs !== undefined || at !== undefined
+							? {
+									schedule: {
+										kind: cron !== undefined ? "cron" : everyMs !== undefined ? "every" : "at",
+										...(cron !== undefined ? { expr: cron } : {}),
+										...(everyMs !== undefined ? { everyMs } : {}),
+										...(at !== undefined ? { at } : {}),
+										...(timezone ? { timezone } : {}),
+									},
+								}
+							: {}),
+						...(overlap ? { overlap } : {}),
+						...(num("allow-n") !== undefined ? { allowN: num("allow-n") } : {}),
+						...(num("timeout-ms") !== undefined ? { timeoutMs: num("timeout-ms") } : {}),
+						...(args.flags.has("paused") ? { paused: true } : {}),
+						...(flag(args, "notes") ? { notes: flag(args, "notes") } : {}),
+					};
+					printJson(await c.send({ op: "program_define", name, ...jsonDefaults, ...flagFields }));
 					break;
 				}
 				case "patch": {
@@ -471,8 +512,22 @@ async function main(): Promise<void> {
 							};
 						}
 					}
-					if (Object.keys(patch).length === 0) die(HELP);
-					printJson(await c.send({ op: "program_patch", name, patch }));
+					const jsonRaw = flag(args, "json");
+					let jsonPatch: Record<string, unknown> = {};
+					if (jsonRaw !== undefined) {
+						try {
+							const parsed: unknown = JSON.parse(jsonRaw);
+							if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) die(`--json must be a JSON object`);
+							jsonPatch = parsed as Record<string, unknown>;
+						} catch (e) {
+							if (e instanceof Error && e.message.startsWith("--json")) die(e.message);
+							const detail = e instanceof Error ? e.message : String(e);
+							die(`--json is not valid JSON: ${detail}`);
+						}
+					}
+					const merged: Record<string, unknown> = { ...jsonPatch, ...patch };
+					if (Object.keys(merged).length === 0) die(HELP);
+					printJson(await c.send({ op: "program_patch", name, patch: merged }));
 					break;
 				}
 				case "launch": {
@@ -617,13 +672,50 @@ async function main(): Promise<void> {
 			printJson(
 				await c.send({
 					op: "run_exec",
-					spawn: { cmd: cmdParts[0]!, ...(cmdParts.length > 1 ? { args: cmdParts.slice(1) } : {}) },
+					spawn: { cmd: cmdParts[0]!, ...(cmdParts.length > 1 ? { args: cmdParts.slice(1) } : {}), ...(flag(args, "cwd") ? { cwd: flag(args, "cwd") } : {}) },
 					waitMs,
 					...(flag(args, "timeout-ms") ? { timeoutMs: Number(flag(args, "timeout-ms")) } : {}),
 					...(flag(args, "name") ? { name: flag(args, "name") } : {}),
 				}),
 			);
 			c.close();
+			return;
+		}
+		case "listen": {
+			const sessionId = flag(args, "session");
+			const runId = flag(args, "run");
+			const program = flag(args, "program");
+			const chosen = [sessionId, runId, program].filter((v): v is string => typeof v === "string");
+			if (chosen.length !== 1) die(HELP);
+			const c = client(targetServer(args).url, opToken(args));
+			c.onEvent((frame) => {
+				console.log(JSON.stringify(frame));
+			});
+			await c.send({
+				op: "listen",
+				...(sessionId ? { sessionId } : {}),
+				...(runId ? { runId } : {}),
+				...(program ? { program } : {}),
+				on: true,
+			});
+			const off = {
+				op: "listen",
+				...(sessionId ? { sessionId } : {}),
+				...(runId ? { runId } : {}),
+				...(program ? { program } : {}),
+				on: false,
+			};
+			const cleanup = (): void => {
+				void c.send(off).catch(() => {});
+				setTimeout(() => {
+					c.close();
+					process.exit(0);
+				}, 100);
+			};
+			process.once("SIGINT", cleanup);
+			process.once("SIGTERM", cleanup);
+			// stream forever — Ctrl-C sends {on:false} best-effort via close
+			await new Promise<void>(() => {});
 			return;
 		}
 		case "events": {
@@ -699,5 +791,5 @@ async function main(): Promise<void> {
 
 void main().catch((err) => {
 	console.error(`[swarm] ${err instanceof Error ? err.message : String(err)}`);
-	process.exitCode ??= 1;
+	process.exit(process.exitCode ?? 1);
 });
