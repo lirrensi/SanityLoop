@@ -27,11 +27,10 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import type { ProgramSpawn, RunRecord, RunState } from "./stores.ts";
+import { readHostStartTime, type ProgramSpawn, type RunRecord, type RunState } from "./stores.ts";
 
 export type { RunRecord, RunState } from "./stores.ts";
 export type { ProgramSpawn } from "./stores.ts";
-
 export interface RegisterArgs {
 	program?: string;
 	kind: "service" | "job";
@@ -209,7 +208,8 @@ type LegacyRunJson = Record<string, unknown>;
 
 /** Normalize a persisted meta.json into the canonical shape. */
 function normalize(raw: RunRecord | LegacyRunJson, metaPath: string): RunRecord {
-	const r = raw as RunRecord & {
+type W = RunRecord & { watchers?: unknown; notified?: unknown };
+	const r = raw as W & {
 		started_at?: number;
 		finished_at?: number;
 		sessionId?: string;
@@ -217,6 +217,7 @@ function normalize(raw: RunRecord | LegacyRunJson, metaPath: string): RunRecord 
 		state?: string;
 		spawn?: unknown;
 		trigger?: unknown;
+		hostStartTime?: unknown;
 	};
 	if (typeof r.startedAt !== "number" && typeof r.started_at === "number") r.startedAt = r.started_at;
 	delete r.started_at;
@@ -234,9 +235,19 @@ function normalize(raw: RunRecord | LegacyRunJson, metaPath: string): RunRecord 
 	}
 	delete r.sessionId;
 	if (typeof r.logPath !== "string" || !r.logPath) r.logPath = dirname(metaPath);
+	// hostStartTime passes through only as a finite number; anything else is dropped.
+	if (typeof r.hostStartTime !== "number" || !Number.isFinite(r.hostStartTime)) delete r.hostStartTime;
+	// run watchers (Hermes session boundary): persist subscribed sessionIds so a
+	// reconnect can replay the terminal event exactly once. notified tracks who
+	// already got it — completion delivered once. Anything non-string is dropped.
+	// (Stored on the ledger meta; typed via a local extension so stores.ts stays
+	// the PIDs unit's append-only surface.)
+	if (!Array.isArray(r.watchers)) (r as W).watchers = [];
+	else (r as W).watchers = (r.watchers as unknown[]).filter((s) => typeof s === "string");
+	if (!Array.isArray(r.notified)) (r as W).notified = [];
+	else (r as W).notified = (r.notified as unknown[]).filter((s) => typeof s === "string");
 	return r as RunRecord;
 }
-
 /** Terminal states kept on disk: completed/failed by exit, plus timeout/cancel. */
 const TERMINAL: Record<string, true> = { completed: true, failed: true, timedOut: true, cancelled: true };
 
@@ -322,6 +333,9 @@ export class RunStore {
 	setPid(id: string, pid: number): RunRecord {
 		return this.mutate(id, (r) => {
 			r.pid = pid;
+			const start = readHostStartTime(pid);
+			if (start !== undefined) r.hostStartTime = start;
+			else delete r.hostStartTime;
 			if (r.state === "starting") r.state = "running";
 		});
 	}
@@ -335,6 +349,36 @@ export class RunStore {
 	attachAgent(id: string, agentId: string): RunRecord {
 		return this.mutate(id, (r) => {
 			if (!r.agents.includes(agentId)) r.agents.push(agentId);
+		});
+	}
+
+	/** Subscribe a sessionId to this run's terminal event (persisted; WS-only v1). */
+	addWatcher(id: string, sessionId: string): RunRecord {
+		return this.mutate(id, (r) => {
+			const w = r as RunRecord & { watchers?: string[] };
+			if (!Array.isArray(w.watchers)) w.watchers = [];
+			if (typeof sessionId === "string" && sessionId && !w.watchers.includes(sessionId)) {
+				w.watchers.push(sessionId);
+			}
+		});
+	}
+
+	/** Unsubscribe a sessionId from this run. */
+	removeWatcher(id: string, sessionId: string): RunRecord {
+		return this.mutate(id, (r) => {
+			const w = r as RunRecord & { watchers?: string[] };
+			if (Array.isArray(w.watchers)) w.watchers = w.watchers.filter((s) => s !== sessionId);
+		});
+	}
+
+	/** Mark the terminal event delivered to a sessionId (exactly-once on reconnect). */
+	markNotified(id: string, sessionId: string): RunRecord {
+		return this.mutate(id, (r) => {
+			const w = r as RunRecord & { notified?: string[] };
+			if (!Array.isArray(w.notified)) w.notified = [];
+			if (typeof sessionId === "string" && sessionId && !w.notified.includes(sessionId)) {
+				w.notified.push(sessionId);
+			}
 		});
 	}
 

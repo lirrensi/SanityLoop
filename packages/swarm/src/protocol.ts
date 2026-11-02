@@ -8,9 +8,13 @@
 //   server → worker:  input, control (the same doors a human REPL would use),
 //                     drop (you are gone — teardown, never reconnect)
 //   peer   → server:  agents_list, agents_get, listen, input, control
+//                     listen targets ONE of: agent (sessionId) XOR run (runId)
+//                     XOR program (program name) — run/program completions fan
+//                     out as events with target = run id (run watcher v1)
 //   admin  → server:  everything above + program_*/run_* ops, drop (agent removal),
 //                     broadcast
-// server → anyone:  welcome, event (relayed streams), result, error, pong, closed
+// server → anyone:  welcome, event (relayed streams + run completions), result,
+//                   error, pong, closed
 //
 // ONE API, MANY SURFACES: the daemon's ops are exposed verbatim over WS frames
 // (here), REST routes (server/rest.ts) and the CLI (a WS client). input/listen
@@ -42,9 +46,18 @@ export const LIFECYCLE_EVENTS = [
 	"error",
 ] as const;
 
+/** Terminal run events the daemon emits to run/program watchers — never
+ *  reported by workers, only fanned out on settle (target = run id).
+ *  completed = exit 0, failed = dirty exit, interrupted = every other
+ *  terminal landing (timeout/kill/cancel/boot-interrupt). Runs are global
+ *  (no rooms): subscribers are already admin/peer by PERMS on listen, so
+ *  fan-out requires nothing extra. WS-only v1: no REST/CLI surface. */
+export const RUN_EVENTS = ["runCompleted", "runFailed", "runInterrupted"] as const;
+
 export type SwarmEvent =
 	| (typeof STREAM_EVENTS)[number]
-	| (typeof LIFECYCLE_EVENTS)[number];
+	| (typeof LIFECYCLE_EVENTS)[number]
+	| (typeof RUN_EVENTS)[number];
 
 /** The three hats. Enforcement is the server's job (tokens), not tool-absence. */
 export type SwarmRole = "worker" | "peer" | "admin";
@@ -109,7 +122,12 @@ export interface AgentsGetFrame {
 export interface ListenFrame {
 	op: "listen";
 	id?: string;
-	sessionId: string;
+	/** Agent target — the original voice subscription. */
+	sessionId?: string;
+	/** Run target — XOR with sessionId/program. Admin/peer only (PERMS). */
+	runId?: string;
+	/** Program target — all runs of one program. XOR with sessionId/runId. */
+	program?: string;
 	on: boolean;
 }
 

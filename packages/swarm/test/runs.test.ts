@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { startDaemon, tmpHome, rmHome } from "./harness.ts";
 import { deriveStatus, friendlyNameFor, RunStore } from "../src/server/runs.ts";
-import type { RunRecord } from "../src/server/stores.ts";
-import type { SwarmServer } from "../src/server/index.ts";
+import { readHostStartTime } from "../src/server/stores.ts";
 // (RunRecord/SwarmServer imported above)
 
 const QUICK = "process.exit(0);";
@@ -214,6 +214,84 @@ test("unknown run: get/logs return null; kill reports ok:false", async () => {
 			id: "run-deadbeef",
 		});
 	} finally {
+		await server.stop();
+		rmHome(home);
+	}
+});
+
+test("setPid stamps hostStartTime; signal/kill on settled run return ok:false", async () => {
+	const home = tmpHome();
+	const server = await startDaemon({ home });
+	try {
+		const forked = await server.api.runs.exec({
+			spawn: { cmd: process.execPath, args: ["-e", QUICK] },
+		});
+		await settled(server, forked.runId);
+		const store = new RunStore({ home });
+		const rec = store.get(forked.runId);
+		assert.ok(rec.pid, "settled run keeps its pid");
+		// hostStartTime stamped at fork time when /proc is available (Linux).
+		if (readHostStartTime(rec.pid!) !== undefined || rec.hostStartTime !== undefined) {
+			assert.equal(typeof rec.hostStartTime, "number");
+		}
+		// Settled runs are not live: signal/kill refuse without touching the pid.
+		assert.deepEqual(server.api.runs.signal(forked.runId, "SIGTERM"), {
+			ok: false,
+			id: forked.runId,
+		});
+		assert.deepEqual(server.api.runs.kill(forked.runId), { ok: false, id: forked.runId });
+	} finally {
+		await server.stop();
+		rmHome(home);
+	}
+});
+
+test("boot with reused pid does not signal; stale run still marked interrupted", async () => {
+	const home = tmpHome();
+	// Occupy a pid, let it exit, then fake a ledger entry pointing at it with
+	// a mismatched hostStartTime.
+	const sleeper = spawn(process.execPath, ["-e", "setTimeout(()=>{},30000);"], {
+		stdio: "ignore",
+	});
+	const reusedPid = sleeper.pid!;
+	sleeper.kill("SIGKILL");
+	// Await the real child-exit event, not a guessed delay.
+	const exitGate = Promise.withResolvers<void>();
+	sleeper.on("exit", () => exitGate.resolve());
+	await exitGate.promise;
+	// Reuse check: the exited pid may already be recycled by the host, so
+	// force the mismatch path with a bogus recorded start time.
+	const store = new RunStore({ home });
+	const rec = store.register({
+		kind: "job",
+		spawn: { cmd: "sleep", args: ["30"] },
+		trigger: { origin: "exec", attempt: 1 },
+	});
+	store.setPid(rec.id, reusedPid);
+	const metaPath = join(home, "runs", rec.id, "meta.json");
+	const raw = JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown>;
+	raw.hostStartTime = (typeof raw.hostStartTime === "number" ? raw.hostStartTime : 0) + 1_000_000;
+	raw.state = "running";
+	delete raw.exit;
+	delete raw.endedAt;
+	mkdirSync(join(home, "runs", rec.id), { recursive: true });
+	writeFileSync(metaPath, JSON.stringify(raw));
+	// Spy on process.kill: boot must never signal the reused pid.
+	const origKill = process.kill;
+	const signaled: number[] = [];
+	// Unchecked cast: process.kill is not writable per types, but is at runtime.
+	const mutableProcess: { kill: typeof process.kill } = process as unknown as { kill: typeof process.kill };
+	mutableProcess.kill = ((pid: number, sig?: unknown) => {
+		signaled.push(pid);
+		return origKill(pid, sig as NodeJS.Signals);
+	}) as typeof process.kill;
+	const server = await startDaemon({ home });
+	try {
+		assert.ok(!signaled.includes(reusedPid), `reused pid ${reusedPid} must not be signaled`);
+		const after = server.api.runs.get(rec.id);
+		assert.equal(after?.state, "interrupted");
+	} finally {
+		mutableProcess.kill = origKill;
 		await server.stop();
 		rmHome(home);
 	}

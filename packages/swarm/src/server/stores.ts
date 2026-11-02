@@ -172,6 +172,10 @@ export interface RunRecord {
 	kind: "service" | "job";
 	state: RunState;
 	pid?: number;
+	/** Linux process start time (field 22 of /proc/<pid>/stat) captured when
+	 *  the pid was assigned. Guards boot reconciliation against pid reuse:
+	 *  a mismatched start time means the pid now belongs to someone else. */
+	hostStartTime?: number;
 	cwd?: string;
 	spawn: ProgramSpawn;
 	trigger: {
@@ -689,5 +693,23 @@ export function loadLegacyRecipes(manifestPath: string): LegacyRecipe[] {
 	} catch {
 		console.warn(`[swarm] skipping torn legacy fleet.json (no migration): ${manifestPath}`);
 		return [];
+	}
+}
+
+/** Host start time of a pid (field 22 of /proc/<pid>/stat, in clock ticks).
+ *  Used to detect pid reuse across daemon restarts. Returns undefined on
+ *  non-Linux platforms or any read/parse error — never throws. */
+export function readHostStartTime(pid: number): number | undefined {
+	try {
+		if (!Number.isInteger(pid) || pid <= 0) return undefined;
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		// comm (field 2) may contain spaces/parens — cut after the last ')'.
+		const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+		// Fields after comm: state is field 3, starttime is field 22 → index 19.
+		if (after.length < 20) return undefined;
+		const starttime = Number(after[19]);
+		return Number.isFinite(starttime) ? starttime : undefined;
+	} catch {
+		return undefined;
 	}
 }

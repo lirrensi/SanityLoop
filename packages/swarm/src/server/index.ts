@@ -85,6 +85,7 @@ import {
 	loadTasks,
 	migrateLegacy,
 	previewRuns,
+	readHostStartTime,
 	savePrograms,
 	validateProgram,
 	type ProgramDef,
@@ -774,6 +775,47 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		}
 	};
 
+	/** Map a settled record to its run event: completed = exit 0; failed =
+	 *  dirty exit (nonzero/signal); interrupted = every other terminal landing
+	 *  (timeout/kill/cancel/boot-interrupt — all settle with null/odd states). */
+	const runEventFor = (record: RunRecord): "runCompleted" | "runFailed" | "runInterrupted" => {
+		if (record.state === "completed") return "runCompleted";
+		if (record.state === "failed") return "runFailed";
+		// Defensive: a zero-exit record landing outside completed still reads
+		// completed; any other exit-carrying record reads failed.
+		if (record.exit?.code === 0) return "runCompleted";
+		if (record.exit != null) return "runFailed";
+		return "runInterrupted";
+	};
+
+	/** The terminal-event frame for a run — shared by live fan-out + replay. */
+	const runEventFrame = (record: RunRecord): { op: "event"; target: string; event: string; payload: unknown } => ({
+		op: "event",
+		target: record.id,
+		event: runEventFor(record),
+		payload: { runId: record.id, program: record.program, exit: record.exit, name: record.name },
+	});
+
+	/** Fan a run terminal event to `run:<id>` / `program:<name>` subscribers.
+	 *  Runs are global/admin-only: subscribers are already admin/peer by PERMS
+	 *  on listen, so no room check (documented). Direct send loop — no mirrors.
+	 *  Marks every receiving session notified (completion delivered once).
+	 *  Never throws — ledger torn is best-effort. */
+	const fanOutRun = (record: RunRecord): void => {
+		const frame = runEventFrame(record);
+		const runKey = `run:${record.id}`;
+		const progKey = record.program ? `program:${record.program}` : undefined;
+		for (const sub of connections) {
+			if (!sub.subscribed.has(runKey) && !(progKey && sub.subscribed.has(progKey))) continue;
+			if (!sub.sessionId) continue;
+			send(sub, frame);
+			try {
+				runStore.markNotified(record.id, sub.sessionId);
+			} catch {
+				/* ledger torn — the frame already went out */
+			}
+		}
+	};
 	const onReport = (
 		conn: Connection,
 		frame: { event: string; payload?: unknown },
@@ -952,11 +994,12 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 		closeRunStreams(runId);
 		void supervisor.stop(live.label, prog?.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
 		try {
-			runStore.settle(
+			const settled = runStore.settle(
 				runId,
 				{ code: null, signal: "SIGTERM", at: Date.now(), reason: "timeout" },
 				"timedOut",
 			);
+			fanOutRun(settled);
 		} catch {
 			/* ledger torn — never guess */
 		}
@@ -996,6 +1039,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				{ code: facts.code, signal: facts.signal, at },
 				dirty ? "failed" : "completed",
 			);
+			fanOutRun(record);
 		} catch {
 			return;
 		}
@@ -1491,6 +1535,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					return { ok: false, id };
 				}
 				if (record.exit != null || record.endedAt != null) return { ok: false, id };
+				// Kill-by-pid is forbidden: only live supervisor children may be
+				// stopped. A settled/interrupted/unknown run is a no-op, never a kill.
+				if (!liveRuns.has(id)) return { ok: false, id };
 				const live = liveRuns.get(id);
 				const prog = live?.program ? programs.get(live.program) : undefined;
 				const grace = killOpts.force
@@ -1505,7 +1552,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 				closeRunStreams(id);
 				if (live) void supervisor.stop(live.label, grace);
 				try {
-					runStore.settle(
+					const settled = runStore.settle(
 						id,
 						{
 							code: null,
@@ -1515,6 +1562,7 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 						},
 						"cancelled",
 					);
+					fanOutRun(settled);
 				} catch {
 					/* ledger torn — never guess */
 				}
@@ -1529,6 +1577,9 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					return null;
 				}
 				if (record.exit != null || record.endedAt != null) return { ok: false, id };
+				// Signal-by-pid is forbidden: only live supervisor children may
+				// be signaled. Settled/interrupted runs return ok:false, no kill.
+				if (!liveRuns.has(id)) return { ok: false, id };
 				if (!signal || record.pid == null) return { ok: false, id };
 				try {
 					process.kill(record.pid, signal as NodeJS.Signals);
@@ -1756,11 +1807,12 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 						closeRunStreams(id);
 						void supervisor.stop(`run:${id}`, grace);
 						try {
-							runStore.settle(
+							const settled = runStore.settle(
 								id,
 								{ code: null, signal: "SIGTERM", at: now, reason: `overlap ${overlap}` },
 								"cancelled",
 							);
+							fanOutRun(settled);
 						} catch {
 							/* ledger torn — never guess */
 						}
@@ -2001,19 +2053,89 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 			case "listen":
 				if (!hasPerm(conn, "listen")) break;
 				{
-					// resolve to the registry ADDRESS — the fan-out speaks addresses
-					const e = resolve(frame.sessionId);
-					if (e) {
+					const targets = [frame.sessionId, frame.runId, frame.program].filter(
+						(t): t is string => typeof t === "string" && t.length > 0,
+					);
+					// listen targets: agent XOR run XOR program (XOR enforced —
+					// mixed frames are a caller bug, rejected loudly).
+					if (targets.length !== 1) {
+						fail(conn, frame, "listen", "listen targets exactly one of: sessionId, runId, program");
+						return;
+					}
+					if (frame.sessionId !== undefined) {
+						// resolve to the registry ADDRESS — the fan-out speaks addresses
+						const e = resolve(frame.sessionId as string);
+						if (!e) {
+							fail(conn, frame, "listen", `unknown worker: ${frame.sessionId}`);
+							return;
+						}
 						const key = addressOf(swarmName, e.room, e.sessionId);
 						if (frame.on) conn.subscribed.add(key);
 						else conn.subscribed.delete(key);
+						result(conn, frame, "listen", { on: frame.on, sessionId: frame.sessionId });
+						return;
 					}
+					if (frame.program !== undefined) {
+						if (!programs.has(frame.program as string)) {
+							fail(conn, frame, "listen", `unknown program: ${frame.program}`);
+							return;
+						}
+						// Runs are global/admin-only: no room check — subscribers
+						// are already admin/peer by PERMS on listen. WS-only v1.
+						const key = `program:${frame.program}`;
+						if (frame.on) conn.subscribed.add(key);
+						else conn.subscribed.delete(key);
+						result(conn, frame, "listen", { on: frame.on, program: frame.program });
+						return;
+					}
+					// run target: validate via the ledger (id or friendly name).
+					let record: RunRecord;
+					try {
+						record = runStore.get(frame.runId as string);
+					} catch {
+						fail(conn, frame, "listen", `unknown run: ${frame.runId}`);
+						return;
+					}
+					const key = `run:${record.id}`;
+					const watching = conn.sessionId;
+					if (frame.on) {
+						conn.subscribed.add(key);
+						// Persistent watchers: the Hermes session boundary —
+						// completion delivered once. Re-listens replay the
+						// terminal event iff this session was never notified.
+						if (watching) {
+							try {
+								runStore.addWatcher(record.id, watching);
+								record = runStore.get(record.id);
+							} catch {
+								/* ledger torn — volatile sub still wins */
+							}
+							type WatchState = { notified?: string[] };
+							const notified = (record as RunRecord & WatchState).notified ?? [];
+							const settled =
+								record.exit != null || record.endedAt != null || record.state === "interrupted";
+							if (settled && !notified.includes(watching)) {
+								send(conn, runEventFrame(record));
+								try {
+									runStore.markNotified(record.id, watching);
+								} catch {
+									/* ledger torn — the frame already went out */
+								}
+							}
+						}
+					} else {
+						conn.subscribed.delete(key);
+						if (watching) {
+							try {
+								runStore.removeWatcher(record.id, watching);
+							} catch {
+								/* ledger torn — volatile unsub still wins */
+							}
+						}
+					}
+					result(conn, frame, "listen", { on: frame.on, runId: record.id });
+					return;
 				}
-				result(conn, frame, "listen", {
-					on: frame.on,
-					sessionId: frame.sessionId,
-				});
-				return;
 			case "events":
 				if (!hasPerm(conn, "events")) break;
 				{
@@ -2283,35 +2405,45 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					persistPrograms();
 				}
 			}
-			// Boot reconciliation: runs left live-but-unclaimed (the daemon
-			// died mid-run). Pids don't survive daemon death reliably — nudge
-			// the recorded pid best-effort, then mark interrupted + log.
-			{
-				const now = Date.now();
-				for (const r of runStore.snapshot()) {
-					const terminal = r.exit != null || r.endedAt != null;
-					if (terminal || (r.state !== "starting" && r.state !== "running")) continue;
-					if (r.pid != null) {
+		// Boot reconciliation: runs left live-but-unclaimed (the daemon
+		// died mid-run). The recorded pid may have been reused by the host —
+		// compare host start times before signaling; on mismatch (or when
+		// the start time is unreadable) skip the signal, still mark
+		// interrupted + log.
+		{
+			const now = Date.now();
+			for (const r of runStore.snapshot()) {
+				const terminal = r.exit != null || r.endedAt != null;
+				if (terminal || (r.state !== "starting" && r.state !== "running")) continue;
+				if (r.pid != null) {
+					const current = readHostStartTime(r.pid);
+					const same = current !== undefined && r.hostStartTime !== undefined && current === r.hostStartTime;
+					if (same) {
 						try {
 							process.kill(r.pid, "SIGTERM");
 						} catch {
 							/* pid gone or foreign — best-effort only */
 						}
+					} else {
+						console.log(`[swarm] boot: run ${r.id} (${r.name}) pid ${r.pid} reused or unreadable — not signaled — at ${new Date(now).toISOString()}`);
 					}
-					try {
-						runStore.setState(r.id, "interrupted");
-					} catch {
-						/* ledger torn — never guess */
-					}
-					console.log(`[swarm] boot: run ${r.id} (${r.name}) marked interrupted (daemon died mid-run) — at ${new Date(now).toISOString()}`);
 				}
+				let interrupted: RunRecord | undefined;
+				try {
+					interrupted = runStore.setState(r.id, "interrupted");
+				} catch {
+					/* ledger torn — never guess */
+				}
+				if (interrupted) fanOutRun(interrupted);
+				console.log(`[swarm] boot: run ${r.id} (${r.name}) marked interrupted (daemon died mid-run) — at ${new Date(now).toISOString()}`);
 			}
+		}
 			// A crash between claim and fork leaves pendingClaim on the def.
 			// That slot is NEVER refired and NEVER silent — it lands as a
 			// logged skip, and the schedule marches on.
 			{
 				let dirty = false;
-				const now = Date.now();
+				const now2 = Date.now();
 				for (const def of programs.values()) {
 					if (!def.pendingClaim) continue;
 					const slot = def.pendingClaim.slot;
@@ -2319,11 +2451,11 @@ export function createSwarmServer(opts: SwarmServerOptions = {}): SwarmServer {
 					def.pendingClaim = undefined;
 					def.lastSkip = {
 						slot,
-						at: now,
+						at: now2,
 						reason: `daemon ${origin} mid-fire — slot claimed before the fork, never confirmed; logged skip, no refire`,
 					};
-					def.nextFire = computeNextFire({ ...def }, now);
-					def.updatedAt = now;
+					def.nextFire = computeNextFire({ ...def }, now2);
+					def.updatedAt = now2;
 					dirty = true;
 				}
 				if (dirty) persistPrograms();
