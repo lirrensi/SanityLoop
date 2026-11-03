@@ -2,8 +2,8 @@
 node_type: overview
 title: Philosophy — why this exists and why it had to be easy
 status: active
-updated: 2026-08-22
-tags: [philosophy, origin, sdk, ease]
+updated: 2026-11-03
+tags: [philosophy, origin, sdk, ease, specialists]
 confidence: decided
 links:
   codifies_into: [/overview/product.md]
@@ -44,6 +44,38 @@ And because profiles are files, you can have infinitely many of them: a writer,
 a coder, a tester — not just different prompts but entirely different tool
 sets. Nothing ties your projects together through one global config that makes
 every work life inseparable from the others.
+
+And because it is just a file, **the harness travels with the project**. The
+reviewer lives in the repo root, the deploy worker in `infra/`, the mining
+specialist in `analytics/` — each checked in next to the code it serves,
+carrying exactly what its job needs and nothing else.
+
+## Specialists, not skills
+
+A skill still lives inside your generalist's environment — same prompt, same
+tool list, same context brawl, and a prompt that has to fight your everyday dev
+prompt for attention. A file here is a whole custom harness: its own prompt,
+its own tools, its own skills, its own MCP servers with their own credentials
+and env vars, its own storage folder.
+
+That flips the cost math. Tools too heavy to keep loaded in a generalist — a
+warm browser, a full diff suite, a mining rig — are free in a specialist,
+because they *will* be used; the worker boots already holding them. The
+reviewer's prompt never fights your dev prompt because they never share a room.
+
+And least privilege falls out for free. A worker can only touch what its file
+hands it, so each repo — each folder, each subpackage — gets an agent with
+access to only what it should have and nothing else. The coordination is less
+polished than a central product, but it is effective because it is specialized:
+a specialist that starts equipped beats a generalist that has to go find its
+tools.
+
+Scale changes nothing about the file. One specialist alone is the degenerate
+case. Many different specialists reporting to one hub is a heterogeneous
+fleet — reviewer, deployer, miner side by side, each still answering to its
+own file. Many copies of the same specialist is a homogeneous fleet — ten
+miners chewing ten shards of one job. Joining is one import; the hub observes
+and coordinates but never owns. A fleet is just specialists, plural.
 
 ## Easy means changeable, not configurable
 
@@ -95,12 +127,11 @@ The design earned its shape by being run, not by being specified:
 
 ## Where it is heading
 
-Two directions follow from the same idea, both in progress rather than
-promises:
+One direction already here, one still forming — both follow from the same idea:
 
-- **The fleet.** Agents anywhere can join a swarm hub with one extension. The
-  hub observes and coordinates, but it does not own them — an agent that joined
-  still originated from its own file and answers to its own definition.
+- **The fleet — specialists, plural.** Not a second idea: the swarm hub is
+  what specialists join when they want coordination. Heterogeneous or
+  homogeneous, one extension, owned by nothing but their own files.
 - **UI as a function of state.** Since the object explains everything, an
   interface is just a renderer over it — detachable, reattachable, replaceable,
   with no special protocol beyond reading state and posting inputs.

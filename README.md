@@ -16,7 +16,7 @@ SanityLoop is a small agent SDK you bring into any of your apps — so you keep 
 
 A tiny core — a stupid loop that sends a prompt, runs some tools, repeats — plus a shelf of optional modules. You compose an agent in **one file**: import the classes, wire what you need, call `run()`. That file is your entire harness. Import it from your app, run it directly as a script, or compile it into a portable distribution. Whatever you want.
 
-Because the definition lives in a file you own, you can copy it anywhere, change half a prompt or a single tool, and it just works. Owning the file means owning the agent.
+Because the definition lives in a file you own, you can copy it anywhere, change half a prompt or a single tool, and it just works. Owning the file means owning the agent. And because it's just a file, **the harness travels with your project** — checked into the repo, sitting in the folder it serves, carrying exactly what that job needs and nothing else.
 
 ## Why it exists
 
@@ -31,6 +31,7 @@ So the promise here is simple:
 - **Maximum customizability from day 0**, because the core is just a simple stupid loop.
 - **Everything is an extension.** Even the ability to send signals *into* the loop is an extension. Input, interrupts, permissions, storage, UI — all Lego.
 - **Isolation by default.** Where things are stored, whether they're stored at all, which session touches which cache — you decide, per run.
+- **Specialists, not skills.** A skill still lives inside your generalist's environment and fights its prompt for attention. A file here is a whole custom harness: own prompt, own tools, own skills, own MCP servers with their own credentials — pre-equipped for one job, least-privilege by construction, one per repo, folder, or subpackage if you want.
 
 ## What it is NOT
 
@@ -38,10 +39,12 @@ Because disappointment is preventable:
 
 - **Not a finished product.** No flagship app, no polished TUI, no batteries-included assistant — and that is the point, not an apology. A "complete product" means making decisions on your behalf, then making more when people disagree, then maintaining all of them forever. This hands you bricks instead of verdicts. If it's less pretty than a funded launch page, that was the trade.
 - **Not human-first — worker-first.** The intended interface isn't you at a chat window; it's *your existing harness*. An agent that runs headless from cron once a day, embedded in your app, or shipped inside a repo to do one job there — without retrofitting somebody else's SDK with your config, your preferences, your rules. The REPL exists so you can *feel* the loop; it is not the destination.
-- **Not a generalist with baggage.** A security audit after every commit should be a tiny agent file: two skills, one MCP server, a focused prompt — not a general agent hauling ten servers' worth of context it will never use. On batteries-included harnesses, even the skills won't isolate away. Here, a narrow agent stays narrow because the file says so.
+- **Not a generalist with baggage.** A skill still lives inside your regular environment — same prompt, same tool list, same context brawl. A file here is a specialist: your code reviewer boots already holding its diff tools, your bug hunter boots with the browser already warm — tools you'd never afford to keep loaded in a generalist, free here because they *will* be used. No reviewer prompt fighting your dev prompt, no ten MCP servers riding along for one job. A narrow agent stays narrow because the file says so.
 - **Not anti-TUI.** These blocks could absolutely carry an entire coding agent with a proper terminal UI — everything swaps, so it would behave beautifully. But that product is monumental work, and it is explicitly not the goal. If someone builds it on these bricks: wonderful, go ahead.
 
 Stated positively, the paradigm underneath is the **self-executing agent**. The usual pattern is one central agent with skills slapped into it — and the baggage still rides in the middle. Here the entire agent is a file, exactly like a skill is a file: open it, modify it in place, rerun it. An email processor stays an email processor — isolated, focused, and unable to pollute its neighbors — because each run loads, stores, and shares only what its file says.
+
+Concretely: **the harness travels with the project.** Drop a reviewer file in the repo root, a deploy worker in `infra/`, a data-mining specialist in `analytics/` — each with its own env vars, its own MCP credentials, its own tool list, its own storage folder. Least privilege falls out for free: a worker can only touch what its file hands it. No polished central UI will ever beat that on its own turf — a specialist that starts equipped beats a generalist that has to go find its tools.
 
 ## The template
 
@@ -176,7 +179,7 @@ Same blocks, different shapes:
 - A **long-lived worker** — stays open, restarts on demand, runs from cron.
 - An **entire coding agent** — TUI, permissions, compaction, skills, the works — like `pi` or `opencode`, except it's yours.
 - **Multi-agent orchestration** — spawn agents that talk to each other.
-- A **swarm** — an organization of agents joining a hub from anywhere, reporting state and taking commands without being owned by it ([`swarm`](packages/swarm/)).
+- A **swarm** — specialists, plural: the same files joining a hub from anywhere, heterogeneous (reviewer + deployer + miner) or homogeneous (ten copies of one worker on one job), reporting state and taking commands without being owned by it ([`swarm`](packages/swarm/)).
 
 ## Start in three steps
 
@@ -187,7 +190,7 @@ Same blocks, different shapes:
 
 ## Patterns
 
-> Higher-level recipes — combinations of the blocks aimed at a specific *outcome*, not just a shape. Pattern 1 to start; the list grows as we find more.
+> Higher-level recipes — combinations of the blocks aimed at a specific *outcome*, not just a shape. Two to start; the list grows as we find more.
 
 ### Pattern 1 — The single-file, self-hosting agent
 
@@ -243,6 +246,25 @@ Wire it for redistribution with a one-line `package.json` bin, then it's live:
 Now `npx your-org/my-agent` — after a publish, or straight from source with `npx github:your-org/my-agent` — fetches the package and its dependencies on the fly and runs the single bin; no local `npm install` required. Keep the source as one `.ts` file (run with `node --experimental-strip-types`, or compile to a `.js` bin): either way it stays one file you own, hostable and redistributable. **One file is the whole product, and it carries its own onboarding.**
 
 (Inside a running loop you can pull the same *ask-and-remember* move for any decision with  [`@sanityloop/extras/ask-question`](packages/extras/ask-question/) — park an await, answer from any channel, persist the result.)
+
+### Pattern 2 — The traveling specialist
+
+Pattern 1 is one file, one product. Pattern 2 is one file **per job, checked in next to the code it serves** — the harness travels with the project instead of living in your global install.
+
+The shape: a repo (or folder, or subpackage) carries its own worker files. `reviewer.ts` in the root with diff tools and read-only fs. `infra/deployer.ts` with shell access and deploy credentials nobody else sees. `analytics/miner.ts` with the browser already warm and the data MCP wired in. Each boots pre-equipped — prompt, tools, skills, MCP servers, env vars, storage folder — and each can only touch what its file hands it, so least privilege falls out for free.
+
+Why not a skill in your regular agent? Because the skill still lives in the generalist's room: same prompt brawl, same bloated tool list, same context you'd never afford to load a mining rig into. The specialist never fights that fight — the tools that would be cumbersome in a generalist are free here because they *will* be used, and the reviewer prompt never argues with your dev prompt because they never share a run.
+
+```text
+my-repo/
+├── reviewer.ts          # read-only fs + diff tools, own prompt
+├── infra/
+│   └── deployer.ts      # shell + deploy creds, own storage
+└── analytics/
+    └── miner.ts         # browser + data MCP, own env
+```
+
+Each file is Pattern 1 applied narrowly: copy the template, delete everything the job doesn't need, bake in what it does, check it in. No polished central UI needs to coordinate them — and when coordination helps, the same files join a swarm hub with one import, heterogeneous or homogeneous, still owned by nothing but their own definitions. A specialist that starts equipped beats a generalist that has to go find its tools — and a fleet of them is just specialists, plural.
 
 ---
 ## The building blocks
