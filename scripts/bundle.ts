@@ -337,7 +337,14 @@ function stageSwarm(): void {
           erasableSyntaxOnly: true,
           skipLibCheck: true,
           types: ["node"],
-          paths: { "@sanityloop/core": ["../../../packages/core/src/index.ts"] },
+          paths: {
+            "@sanityloop/core": ["../../../packages/core/src/index.ts"],
+            // croner nests under packages/swarm/node_modules (never hoisted —
+            // nothing else wants it), ws hoists to the root. Point at the
+            // TYPE declarations so the gate gets types, not any-typed JS.
+            croner: ["../../../packages/swarm/node_modules/croner/dist/croner.d.ts"],
+            ws: ["../../../node_modules/@types/ws/index.d.ts"],
+          },
         },
         include: ["src/**/*.ts", "bin/**/*.js"],
       },
