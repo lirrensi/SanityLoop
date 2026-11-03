@@ -1,9 +1,9 @@
 name: CI
 
-# Gate, not a museum. Runs on every push/PR to main.
-# `npm run verify` IS the gate: typecheck → unit → e2e → templates → live.
-# tmux is installed so the REPL stream-delivery guard (repl-tmux) RUNS instead
-# of silently skipping — a skipped guard is a dead guard.
+# Lean gate: docs + type + the hermetic unit-core slice (no PTY/tmux/sockets/
+# kill-9 — the Git runner is not the place for chaos drills). The full board
+# (`npm run verify`: unit → e2e → templates → live) runs locally and under
+# `act -j gate-full`.
 on:
   push:
     branches: [main]
@@ -13,7 +13,24 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    # Job-level so the live tier can see it.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (clean, reproducible)
+        run: npm ci
+
+      - name: Verify (docs → type → unit-core)
+        run: npm run verify -- --tier=docs,type,unit-core
+
+  gate-full:
+    # The whole board, for `act` and manual dispatch — never blocks a push.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
@@ -30,5 +47,5 @@ jobs:
       - name: Install (clean, reproducible)
         run: npm ci
 
-      - name: Verify (type → unit → e2e → templates → live)
+      - name: Verify (full board)
         run: npm run verify

@@ -1,11 +1,13 @@
 // scripts/verify.ts — THE ONE COMMAND. `npm run verify` runs every tier and
-// prints the board: docs → typecheck → unit → e2e → templates → live (opt-in).
+// prints the board: docs → type → unit-core → unit → e2e → templates → live.
 // Exit 0 = everything green (skips are honest, never silent). Exit 1 = red.
 //
 //   npm run verify                  everything runnable here (live tiers skip without keys)
-///  npm run verify -- --tier=unit    only unit (comma: docs,type,unit,e2e,templates,live)
+///  npm run verify -- --tier=unit    only unit (comma: docs,type,unit-core,unit,e2e,templates,live)
 //   npm run verify -- --with-live    attempt live tiers (needs keys / local model)
 //   npm run verify -- --json         machine output only
+// CI runs the hermetic slice only: --tier=docs,type,unit-core (no PTY/tmux/
+// sockets/kill-9 — the full board is for local runs and `act`).
 //
 // Tiers never fake: a tier that cannot run reports SKIP + reason. The JSON
 // report lands at .agents/reports/verify-latest.json (docs point AT it —
@@ -98,6 +100,31 @@ async function tierType(): Promise<TierResult> {
         tier: "type", ms: Date.now() - t0, tests: 0, pass: 0, fail: 0, skipped: 0,
         status: r.code === 0 ? "pass" : "fail",
         detail: r.code === 0 ? "tsc clean" : r.out.split("\n").filter((l) => l.includes("error TS")).slice(0, 5).join("\n"),
+    };
+}
+
+async function tierUnitCore(): Promise<TierResult> {
+    // The CI tier: hermetic, no PTY/tmux/sockets/kill-9. Core loop + swarm
+    // muscle/model/wire + the essential extras every agent imports.
+    const t0 = Date.now();
+    const shards = [
+        "packages/core/test/**/*.test.ts",
+        "packages/swarm/test/supervisor.test.ts",
+        "packages/swarm/test/runs.test.ts",
+        "packages/swarm/test/programs.test.ts",
+        "packages/swarm/test/protocol.test.ts",
+        "packages/swarm/test/server.test.ts",
+        "packages/extras/base-storage/test/**/*.test.ts",
+        "packages/extras/inputs/test/**/*.test.ts",
+        "packages/extras/quit-on-end/test/**/*.test.ts",
+    ];
+    const r = await run("node", [...NODE_FLAGS, "--test", "--test-force-exit", ...shards], { timeoutMs: 600_000 });
+    const c = parseCounts(r.out);
+    const failing = failingDetail(r.out);
+    return {
+        tier: "unit-core", ms: Date.now() - t0, tests: c.tests, pass: c.pass, fail: c.fail, skipped: c.skipped,
+        status: c.fail > 0 || r.code !== 0 ? "fail" : "pass",
+        detail: c.fail > 0 ? failing : `${c.pass}/${c.tests} pass${c.skipped > 0 ? `, ${c.skipped} skipped` : ""}`,
     };
 }
 
@@ -272,6 +299,7 @@ async function tierDocs(): Promise<TierResult> {
 const TIERS: Array<{ name: string; run: () => Promise<TierResult> }> = [
     { name: "docs", run: tierDocs },
     { name: "type", run: tierType },
+    { name: "unit-core", run: tierUnitCore },
     { name: "unit", run: tierUnit },
     { name: "e2e", run: tierE2e },
     { name: "templates", run: tierTemplates },
