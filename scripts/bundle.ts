@@ -21,6 +21,7 @@
 //   node scripts/bundle.ts --clean      <- remove .publish before staging
 // ============================================================================
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import { dirname, join, relative } from "node:path";
 
 const ROOT = process.cwd();
@@ -304,17 +305,46 @@ function stageCore(): void {
   if (existsSync(readme)) cpSync(readme, join(coreDir, "README.md"));
 }
 
-// Swarm rides its OWN train: copy src + bin as-is, keep its own package.json
-// (own version, own deps incl. croner+ws, bin field — no rewrite needed: its
-// only @sanityloop dep is core, which stays external). Gate tsconfig resolves
-// core + croner + ws from the workspace so publish.ts can typecheck the stage.
+// Swarm rides its OWN train: COMPILE src/*.ts → dist/*.mjs (type-stripped —
+// Node refuses to strip files under node_modules, ERR_UNSUPPORTED_NODE_MODULES_
+// TYPE_STRIPPING, so shipping raw .ts would brick the installed `swarm` bin).
+// Internal relative imports are rewritten .ts → .mjs. The bin launcher and
+// exports map point at dist; src is NOT shipped. Gate tsconfig resolves core +
+// croner + ws from the workspace so publish.ts can typecheck the SOURCES.
 function stageSwarm(): void {
   const swarmDir = join(STAGE, "swarm");
   if (existsSync(swarmDir)) rmSync(swarmDir, { recursive: true, force: true });
-  mkdirSync(swarmDir, { recursive: true });
-  cpSync(join(ROOT, "packages", "swarm", "src"), join(swarmDir, "src"), { recursive: true });
+  mkdirSync(join(swarmDir, "dist"), { recursive: true });
+  const compile = (dir: string, rel: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        compile(p, `${rel}${e.name}/`);
+        continue;
+      }
+      if (!e.name.endsWith(".ts")) continue;
+      const src = read(p);
+      const stripped: string = stripTypeScriptTypes(src, { mode: "strip" });
+      // internal relative imports: "./x.ts" → "./x.mjs" (bare + node: untouched)
+      const compiled = stripped.replace(
+        /((?:from\s+|import\s*\(\s*)["']\.[^"']*?)\.ts(["'])/g,
+        "$1.mjs$2",
+      );
+      const out = join(swarmDir, "dist", rel, e.name.replace(/\.ts$/, ".mjs"));
+      mkdirSync(dirname(out), { recursive: true });
+      writeFileSync(out, compiled);
+    }
+  };
+  compile(join(ROOT, "packages", "swarm", "src"), "");
   cpSync(join(ROOT, "packages", "swarm", "bin"), join(swarmDir, "bin"), { recursive: true });
-  const pkg = json(join(ROOT, "packages", "swarm", "package.json"));
+  const pkg = json(join(ROOT, "packages", "swarm", "package.json")) as Record<string, unknown>;
+  // installed layout: dist + bin (src stays in the repo, never ships)
+  pkg.exports = {
+    ".": "./dist/index.mjs",
+    "./server": "./dist/server/index.mjs",
+    "./join": "./dist/join/index.mjs",
+  };
+  pkg.files = ["dist", "bin"];
   writeFileSync(join(swarmDir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
   const readme = join(ROOT, "packages", "swarm", "README.md");
   if (existsSync(readme)) cpSync(readme, join(swarmDir, "README.md"));
@@ -346,7 +376,7 @@ function stageSwarm(): void {
             ws: ["../../../node_modules/@types/ws/index.d.ts"],
           },
         },
-        include: ["src/**/*.ts", "bin/**/*.js"],
+        include: ["../../../packages/swarm/src/**/*.ts"],
       },
       null,
       2,
