@@ -31,6 +31,9 @@ interface TierResult {
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
 const NODE_FLAGS = ["--experimental-strip-types", "--experimental-transform-types"];
+// Node 22's default test reporter is TAP; 24's is spec. The parsers below
+// read the spec shapes (✔/✖/ℹ) — pin it so every tier parses on both.
+const TEST_FLAGS = [...NODE_FLAGS, "--test", "--test-force-exit", "--test-reporter=spec"];
 const args = process.argv.slice(2);
 const onlyTiers = new Set(
     (args.find((a) => a.startsWith("--tier="))?.slice("--tier=".length).split(",") ?? []).map((s) => s.trim()).filter(Boolean),
@@ -118,7 +121,7 @@ async function tierUnitCore(): Promise<TierResult> {
         "packages/extras/inputs/test/**/*.test.ts",
         "packages/extras/quit-on-end/test/**/*.test.ts",
     ];
-    const r = await run("node", [...NODE_FLAGS, "--test", "--test-force-exit", ...shards], { timeoutMs: 600_000 });
+    const r = await run("node", [...TEST_FLAGS, ...shards], { timeoutMs: 600_000 });
     const c = parseCounts(r.out);
     const failing = failingDetail(r.out);
     return {
@@ -147,7 +150,7 @@ async function tierE2e(): Promise<TierResult> {
     const files = readdirSync(join(ROOT, "test", "e2e"))
         .filter((f) => f.endsWith(".test.ts") && !f.endsWith(".optin.test.ts"))
         .map((f) => join("test", "e2e", f));
-    const r = await run("node", [...NODE_FLAGS, "--test", "--test-force-exit", ...files], { timeoutMs: 900_000 });
+    const r = await run("node", [...TEST_FLAGS, ...files], { timeoutMs: 900_000 });
     const c = parseCounts(r.out);
     const failing = failingDetail(r.out);
     return {
@@ -247,7 +250,7 @@ async function tierLive(): Promise<TierResult> {
             }
         }
         if (key !== undefined || env.SANITYLOOP_E2E_KEY !== undefined) {
-            const r = await run("node", [...NODE_FLAGS, "--test", "--test-force-exit", "test/e2e/real-provider.optin.test.ts"], {
+            const r = await run("node", [...TEST_FLAGS, "test/e2e/real-provider.optin.test.ts"], {
                 timeoutMs: 900_000, env,
             });
             const c = parseCounts(r.out);
@@ -264,7 +267,7 @@ async function tierLive(): Promise<TierResult> {
         notes.push("real-provider: SKIP (no key)");
     }
     if (realworld || withLive) {
-        const r = await run("node", [...NODE_FLAGS, "--test", "--test-force-exit", "test/e2e/mcp-realworld.optin.test.ts"], {
+        const r = await run("node", [...TEST_FLAGS, "test/e2e/mcp-realworld.optin.test.ts"], {
             timeoutMs: 900_000, env: realworld ? {} : { SANITYLOOP_MCP_REALWORLD: "1" },
         });
         const c = parseCounts(r.out);
